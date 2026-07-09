@@ -4,6 +4,7 @@
   "newsgroup": "alt.binaries.backup",
   "verification_interval_days": 90,
   "scan_interval_seconds": 300,
+  "backup_interval_seconds": 300,
   "usenet_hosts": [
     {
       "name": "eweka-read",

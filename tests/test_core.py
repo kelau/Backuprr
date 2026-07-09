@@ -4,11 +4,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from backuprr import __version__
 from backuprr.backup import decode_chunk, encode_chunk, post_next
 from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
-from backuprr.monitor import CatalogMonitor
+from backuprr.monitor import BackupMonitor, CatalogMonitor
 from backuprr.queueing import enqueue_unbacked, prioritize
 from backuprr.scanner import scan_all
 
@@ -43,6 +44,9 @@ class CoreTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp.cleanup()
+
+    def test_version_is_incremented_for_changes(self):
+        self.assertEqual(__version__, "0.2.1")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -200,6 +204,7 @@ class CoreTests(unittest.TestCase):
                 "newsgroup": "alt.binaries.example",
                 "verification_interval_days": 30,
                 "scan_interval_seconds": 15,
+                "backup_interval_seconds": 20,
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
                 "encryption_passphrase_env": "BACKUPRR_SECRET",
@@ -222,6 +227,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.newsgroup, "alt.binaries.example")
         self.assertEqual(self.config.verification_interval_days, 30)
         self.assertEqual(self.config.scan_interval_seconds, 15)
+        self.assertEqual(self.config.backup_interval_seconds, 20)
         self.assertTrue(self.config.zip_subfolders)
         self.assertTrue(self.config.encrypt_bodies)
         self.assertEqual(self.config.endpoints, [str(self.root / "media")])
@@ -279,6 +285,7 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             row = conn.execute("SELECT relative_path FROM files").fetchone()
         self.assertEqual(row["relative_path"], "episode.mkv")
+        self.assertEqual(self.db.stats()["queue_queued"], 1)
 
     def test_catalog_monitor_reports_task_state(self):
         monitor = CatalogMonitor(self.db, self.config)
@@ -289,7 +296,25 @@ class CoreTests(unittest.TestCase):
         monitor.scan_once()
         tasks = monitor.tasks()
         self.assertEqual(tasks[0]["runs"], 1)
+        self.assertIn("last_run", tasks[0])
+        self.assertIn("last_run_duration", tasks[0])
+        self.assertIn("time_until_next_run", tasks[0])
+        self.assertNotIn("last_started_at", tasks[0])
         self.assertIn("files cataloged", tasks[0]["last_result"])
+
+    def test_backup_monitor_posts_next_queued_file(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        monitor = BackupMonitor(self.db, self.config)
+        with patch("backuprr.backup.UsenetClient", FakePostClient):
+            self.assertIsNotNone(monitor.post_once())
+        tasks = monitor.tasks()
+        self.assertEqual(tasks[0]["name"], "Usenet backup worker")
+        self.assertIn("posted file id", tasks[0]["last_result"])
 
 
 if __name__ == "__main__":

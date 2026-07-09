@@ -47,7 +47,7 @@ class UsenetClient:
             raise RuntimeError("NNTP connection not open")
         message_id = f"<{uuid.uuid4().hex}@backuprr.local>"
         msg = email.message.EmailMessage()
-        msg["From"] = "backuprr@localhost"
+        msg["From"] = "Backuprr <backuprr@backuprr.local>"
         msg["Newsgroups"] = newsgroup
         msg["Subject"] = subject
         msg["Message-ID"] = message_id
@@ -91,4 +91,3 @@ class DryRunUsenetClient:
             self.articles[article.message_id] = body
             posted.append(article)
         return posted
-

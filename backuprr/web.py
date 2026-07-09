@@ -4,10 +4,10 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
-from .backup import post_next, verify_due_chunks
+from .backup import verify_due_chunks
 from .config import Config, update_config
 from .db import Database
-from .monitor import CatalogMonitor
+from .monitor import BackupMonitor, CatalogMonitor
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
 
@@ -21,6 +21,7 @@ class Handler(BaseHTTPRequestHandler):
     config_path: str
     db: Database
     monitor: CatalogMonitor
+    backup_monitor: BackupMonitor
 
     def log_message(self, fmt: str, *args: Any) -> None:
         self.db.log("verbose", "web.access", fmt % args)
@@ -53,6 +54,7 @@ class Handler(BaseHTTPRequestHandler):
                     "version": __version__,
                     "stats": self.db.stats(),
                     "scan_interval_seconds": self.config.scan_interval_seconds,
+                    "backup_interval_seconds": self.config.backup_interval_seconds,
                 }
             )
         elif parsed.path == "/api/files":
@@ -75,7 +77,7 @@ class Handler(BaseHTTPRequestHandler):
                 ).fetchall()
             self.send_json(rowdicts(rows))
         elif parsed.path == "/api/tasks":
-            self.send_json(self.monitor.tasks())
+            self.send_json(self.monitor.tasks() + self.backup_monitor.tasks())
         elif parsed.path == "/api/settings":
             self.send_json(self.config.public_dict())
         else:
@@ -94,8 +96,11 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/queue/move":
                 move(self.db, int(data["file_id"]), int(data["position"]))
                 self.send_json({"ok": True})
+            elif parsed.path == "/api/files/queue":
+                self.db.queue_file(int(data["file_id"]), priority=int(data.get("priority", 100)), reason="manual")
+                self.send_json({"ok": True})
             elif parsed.path == "/api/post-next":
-                self.send_json({"file_id": post_next(self.db, self.config)})
+                self.send_json({"file_id": self.backup_monitor.post_once()})
             elif parsed.path == "/api/verify":
                 self.send_json({"verified": verify_due_chunks(self.db, self.config, force=bool(data.get("force")))})
             elif parsed.path == "/api/restore":
@@ -123,13 +128,16 @@ def run_web(config: Config, db: Database, host: str, port: int) -> None:
     Handler.config_path = str(config.source_path or (config.base_dir / "config.json"))
     Handler.db = db
     Handler.monitor = CatalogMonitor(db, config)
+    Handler.backup_monitor = BackupMonitor(db, config)
     Handler.monitor.start()
+    Handler.backup_monitor.start()
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Backuprr {__version__} listening on http://{host}:{port}")
     try:
         server.serve_forever()
     finally:
         Handler.monitor.stop()
+        Handler.backup_monitor.stop()
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -170,6 +178,15 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .host-row h3 { margin:0 0 10px; font-size:14px; }
 .host-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
 .danger { color:var(--bad); }
+.tree { background:#fff; border:1px solid var(--line); border-radius:8px; padding:8px; }
+.tree ul { list-style:none; margin:0; padding-left:20px; }
+.tree li { margin:2px 0; }
+.tree-row { display:flex; align-items:center; gap:8px; min-height:32px; padding:4px 6px; border-radius:6px; }
+.tree-row:hover { background:#f2f6f6; }
+.tree-name { flex:1; overflow-wrap:anywhere; }
+.tree-meta { color:var(--muted); font-size:12px; }
+.icon-btn { width:32px; height:32px; display:inline-grid; place-items:center; padding:0; }
+.folder > .tree-row { font-weight:600; }
 .hidden { display:none; }
 .muted { color:var(--muted); }
 .error { color:var(--bad); }
@@ -187,6 +204,7 @@ pre { white-space:pre-wrap; background:#fff; border:1px solid var(--line); paddi
 const pages = ["Status","Files","Search","Log","Queue","Tasks","Restore","Settings","About"];
 let page = "Status";
 let settingsCache = null;
+let fileRowsCache = [];
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
@@ -205,7 +223,10 @@ async function render(){
   const s = await api("/api/status"); document.getElementById("version").textContent = "v"+s.version;
   c.innerHTML = `<div class="toolbar"><button class="primary" onclick="post('/api/scan').then(render)">Scan</button><button onclick="post('/api/queue/enqueue-unbacked').then(render)">Queue unbacked</button><button onclick="post('/api/verify',{force:true}).then(render)">Verify now</button></div><div class="stats">${Object.entries(s.stats).map(([k,v])=>`<div class="stat"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}</div>`;
  }
- if(page==="Files"){ c.innerHTML = table(await api("/api/files"), ["id","relative_path","size","state","updated_at","sha256"]); }
+ if(page==="Files"){
+  fileRowsCache = await api("/api/files?limit=5000");
+  c.innerHTML = `<div class="toolbar"><button onclick="render()">&#8635;</button><button class="primary" onclick="post('/api/post-next').then(render)">&#9658; Post next</button></div>${fileTree(fileRowsCache)}`;
+ }
  if(page==="Search"){
   c.innerHTML = `<div class="toolbar"><input id="q" placeholder="Search files"><button onclick="search()">Search</button></div><div id="results"></div>`;
  }
@@ -223,9 +244,9 @@ async function render(){
   table(rows, ["file_id","position","priority","status","reason","path","size","state"]);
  }
  if(page==="Tasks"){
-  const rows = await api("/api/tasks");
+ const rows = await api("/api/tasks");
   c.innerHTML = `<div class="toolbar"><button onclick="render()">Refresh</button><button class="primary" onclick="post('/api/scan').then(render)">Run catalog scan</button></div>`+
-  table(rows, ["name","kind","status","interval_seconds","last_started_at","last_finished_at","next_run_at","runs","last_result","last_error"]);
+  table(rows, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"]);
  }
  if(page==="Restore"){
   c.innerHTML = `<div class="toolbar"><input id="restorePath" placeholder="File or folder path"><input id="restoreDest" placeholder="Optional destination"><label><input id="restoreFolder" type="checkbox"> Folder</label><button class="primary" onclick="restore()">Restore</button></div><pre id="restoreOut"></pre>`;
@@ -238,6 +259,51 @@ async function loadLog(){
  const limit = encodeURIComponent(document.getElementById("logLimit").value);
  document.getElementById("logRows").innerHTML = table(await api(`/api/log?limit=${limit}&${levels}`), ["id","ts","level","event_type","message","file_id"]);
 }
+function fileTree(rows){
+ const root = { dirs:{}, files:[] };
+ for(const row of rows){
+  const parts = String(row.relative_path || row.path || "").split(/[\\/]+/).filter(Boolean);
+  let node = root;
+  for(const part of parts.slice(0, -1)){
+   node.dirs[part] = node.dirs[part] || { dirs:{}, files:[] };
+   node = node.dirs[part];
+  }
+  node.files.push({...row, display_name: parts[parts.length - 1] || row.path});
+ }
+ return `<div class="tree"><ul>${treeNode(root, "")}</ul></div>`;
+}
+function treeNode(node, prefix){
+ const dirs = Object.keys(node.dirs).sort((a,b)=>a.localeCompare(b));
+ const dirHtml = dirs.map(name => `<li class="folder"><div class="tree-row"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span class="tree-meta">${countFiles(node.dirs[name])} files</span></div><ul>${treeNode(node.dirs[name], prefix ? prefix+"/"+name : name)}</ul></li>`).join("");
+ const fileHtml = node.files.sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name))).map(file => fileRow(file)).join("");
+ return dirHtml + fileHtml;
+}
+function countFiles(node){
+ return node.files.length + Object.values(node.dirs).reduce((total, child) => total + countFiles(child), 0);
+}
+function fileRow(file){
+ const stateClass = file.state === "deleted" ? "error" : "muted";
+ return `<li><div class="tree-row">
+  <span>&#128196;</span>
+  <span class="tree-name">${esc(file.display_name)}</span>
+  <span class="tree-meta">${esc(file.size)} bytes</span>
+  <span class="tree-meta ${stateClass}">${esc(file.state)}</span>
+  <button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>
+  <button class="icon-btn" title="Restore file" onclick="restoreCatalogFile(${Number(file.id)})">&#8635;</button>
+ </div></li>`;
+}
+async function queueFile(fileId){
+ const out = await post("/api/files/queue", { file_id:fileId });
+ if(!out.ok) alert(out.error || "Unable to queue file");
+ await render();
+}
+async function restoreCatalogFile(fileId){
+ const file = fileRowsCache.find(row => Number(row.id) === Number(fileId));
+ if(!file) return;
+ const dest = prompt("Restore destination, blank for original location", "");
+ const out = await post("/api/restore", { path:file.path, dest:dest || null });
+ alert(out.error || `Restored to ${out.target}`);
+}
 async function search(){ document.getElementById("results").innerHTML = table(await api("/api/search?q="+encodeURIComponent(document.getElementById("q").value)), ["id","relative_path","size","state","updated_at"]); }
 async function restore(){ const out = await post("/api/restore",{path:restorePath.value,dest:restoreDest.value,folder:restoreFolder.checked}); restoreOut.textContent = JSON.stringify(out,null,2); }
 function settingsForm(s){
@@ -246,6 +312,7 @@ function settingsForm(s){
   <label class="field"><span>Article size bytes</span><input id="setArticleSize" type="number" min="1" value="${esc(s.article_size)}"></label>
   <label class="field"><span>Verify interval days</span><input id="setVerifyDays" type="number" min="1" value="${esc(s.verification_interval_days)}"></label>
   <label class="field"><span>Catalog scan interval seconds</span><input id="setScanInterval" type="number" min="1" value="${esc(s.scan_interval_seconds || 300)}"></label>
+  <label class="field"><span>Backup task interval seconds</span><input id="setBackupInterval" type="number" min="1" value="${esc(s.backup_interval_seconds || 300)}"></label>
   <label class="field"><span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
   <label><input id="setZip" type="checkbox" ${s.zip_subfolders?"checked":""}> Zip subfolders</label>
   <label><input id="setEncrypt" type="checkbox" ${s.encrypt_bodies?"checked":""}> Encrypt article bodies</label>
@@ -309,6 +376,7 @@ async function saveSettings(){
   article_size: Number(setArticleSize.value),
   verification_interval_days: Number(setVerifyDays.value),
   scan_interval_seconds: Number(setScanInterval.value),
+  backup_interval_seconds: Number(setBackupInterval.value),
   zip_subfolders: setZip.checked,
   encrypt_bodies: setEncrypt.checked,
   encryption_passphrase_env: setPassEnv.value,

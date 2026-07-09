@@ -9,6 +9,7 @@ a CLI and an AJAX-enabled Web UI.
 - SQLite catalog of watched endpoints and all files below them.
 - Automatic catalog scans on service startup, after endpoint changes, and on a
   configurable interval.
+- Automatic queueing of unbacked files and scheduled Usenet backup posting.
 - File state tracking: discovered, changed, queued, posting, backed up,
   verifying, missing chunks, failed, and restored.
 - Verbose event log persisted in the database.
@@ -53,6 +54,7 @@ direct provider username/password used for NNTP authentication:
   "newsgroup": "alt.binaries.backup",
   "verification_interval_days": 90,
   "scan_interval_seconds": 300,
+  "backup_interval_seconds": 300,
   "usenet_hosts": [
     {
       "name": "eweka-read",
