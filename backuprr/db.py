@@ -260,8 +260,16 @@ class Database:
                 """
             ).fetchone()
 
-    def list_queue(self, include_done: bool = False) -> List[sqlite3.Row]:
-        where = "" if include_done else "WHERE q.status != 'done' AND f.state != 'backed_up'"
+    def list_queue(self, include_done: bool = False, status: Optional[str] = None, limit: int = 200, offset: int = 0) -> List[sqlite3.Row]:
+        where_parts = []
+        params: List[Any] = []
+        if status:
+            where_parts.append("q.status = ?")
+            params.append(status)
+        elif not include_done:
+            where_parts.append("q.status != 'done'")
+            where_parts.append("f.state != 'backed_up'")
+        where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         with self.connect() as conn:
             return conn.execute(
                 f"""
@@ -269,8 +277,33 @@ class Database:
                 JOIN files f ON f.id = q.file_id
                 {where}
                 ORDER BY q.priority ASC, q.position ASC
+                LIMIT ? OFFSET ?
                 """
+                ,
+                (*params, limit, offset),
             ).fetchall()
+
+    def queue_count(self, include_done: bool = False, status: Optional[str] = None) -> int:
+        where_parts = []
+        params: List[Any] = []
+        if status:
+            where_parts.append("q.status = ?")
+            params.append(status)
+        elif not include_done:
+            where_parts.append("q.status != 'done'")
+            where_parts.append("f.state != 'backed_up'")
+        where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        with self.connect() as conn:
+            return int(
+                conn.execute(
+                    f"""
+                    SELECT COUNT(*) FROM queue q
+                    JOIN files f ON f.id = q.file_id
+                    {where}
+                    """,
+                    params,
+                ).fetchone()[0]
+            )
 
     def cleanup_completed_queue(self) -> int:
         with self.connect() as conn:
@@ -288,6 +321,46 @@ class Database:
     def set_queue_status(self, file_id: int, status: str) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE queue SET status=?, updated_at=? WHERE file_id=?", (status, utcnow(), file_id))
+
+    def boost_queue_priority(self, file_id: int, amount: int = 10, reason: str = "manual-priority") -> None:
+        should_queue = False
+        with self.connect() as conn:
+            file_row = conn.execute("SELECT state FROM files WHERE id=?", (file_id,)).fetchone()
+            if not file_row or file_row["state"] in {"backed_up", "deleted"}:
+                return
+            queue_row = conn.execute("SELECT priority FROM queue WHERE file_id=?", (file_id,)).fetchone()
+            if not queue_row:
+                should_queue = True
+            else:
+                conn.execute(
+                    "UPDATE queue SET priority=?, status=CASE WHEN status='done' THEN 'queued' ELSE status END, updated_at=? WHERE file_id=?",
+                    (max(0, int(queue_row["priority"]) - amount), utcnow(), file_id),
+                )
+                conn.execute(
+                    "UPDATE files SET state=CASE WHEN state IN ('posting', 'backed_up') THEN state ELSE 'queued' END, updated_at=? WHERE id=?",
+                    (utcnow(), file_id),
+                )
+        if should_queue:
+            self.queue_file(file_id, priority=90, reason=reason)
+
+    def boost_folder_priority(self, folder_path: str, amount: int = 10) -> int:
+        raw = folder_path.rstrip("\\/")
+        alt = raw.replace("/", "\\")
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM files
+                WHERE state NOT IN ('backed_up', 'deleted')
+                  AND (path LIKE ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?)
+                ORDER BY relative_path
+                """,
+                (raw + "%", raw, raw + "/%", alt, alt + "\\%"),
+            ).fetchall()
+        for row in rows:
+            self.boost_queue_priority(int(row["id"]), amount=amount, reason="folder-priority")
+        if rows:
+            self.log("info", "queue.priority", f"Boosted queue priority for {len(rows)} files under {folder_path}")
+        return len(rows)
 
     def add_chunk(self, file_id: int, chunk_index: int, message_id: str, size: int, sha256: str, subject: str) -> None:
         with self.connect() as conn:
@@ -340,17 +413,55 @@ class Database:
         with self.connect() as conn:
             return conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
-    def list_events(self, levels: Optional[List[str]] = None, limit: int = 300) -> List[sqlite3.Row]:
+    def list_events(
+        self,
+        levels: Optional[List[str]] = None,
+        limit: int = 300,
+        event_types: Optional[List[str]] = None,
+        exclude_event_types: Optional[List[str]] = None,
+    ) -> List[sqlite3.Row]:
         allowed_levels = {"error", "warning", "info", "verbose"}
         selected = [level for level in (levels or []) if level in allowed_levels]
-        with self.connect() as conn:
-            if not selected:
-                return conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        clauses = []
+        params: List[Any] = []
+        if selected:
             placeholders = ",".join("?" for _ in selected)
+            clauses.append(f"level IN ({placeholders})")
+            params.extend(selected)
+        if event_types:
+            placeholders = ",".join("?" for _ in event_types)
+            clauses.append(f"event_type IN ({placeholders})")
+            params.extend(event_types)
+        if exclude_event_types:
+            placeholders = ",".join("?" for _ in exclude_event_types)
+            clauses.append(f"event_type NOT IN ({placeholders})")
+            params.extend(exclude_event_types)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
             return conn.execute(
-                f"SELECT * FROM events WHERE level IN ({placeholders}) ORDER BY id DESC LIMIT ?",
-                (*selected, limit),
+                f"SELECT * FROM events {where} ORDER BY id DESC LIMIT ?",
+                (*params, limit),
             ).fetchall()
+
+    def event_types(self) -> List[str]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT DISTINCT event_type FROM events ORDER BY event_type").fetchall()
+            return [str(row["event_type"]) for row in rows]
+
+    def change_token(self) -> Dict[str, Any]:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                  (SELECT COALESCE(MAX(updated_at), '') FROM files) AS files_updated,
+                  (SELECT COALESCE(MAX(updated_at), '') FROM queue) AS queue_updated,
+                  (SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type != 'web.access') AS event_id,
+                  (SELECT COUNT(*) FROM chunks) AS chunks_total,
+                  (SELECT COUNT(*) FROM files) AS files_total,
+                  (SELECT COUNT(*) FROM queue) AS queue_total
+                """
+            ).fetchone()
+            return dict(row)
 
     def search_files(self, term: str, limit: int = 200) -> List[sqlite3.Row]:
         with self.connect() as conn:
@@ -401,7 +512,12 @@ class Database:
                 **{f"files_{row['state']}": row["count"] for row in states},
                 **{f"queue_{row['status']}": row["count"] for row in queue},
                 "files_total": conn.execute("SELECT COUNT(*) FROM files").fetchone()[0],
+                "files_bytes_total": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state != 'deleted'").fetchone()[0],
+                "files_bytes_backed_up": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state='backed_up'").fetchone()[0],
+                "files_bytes_queued": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state='queued'").fetchone()[0],
+                "files_bytes_posting": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state='posting'").fetchone()[0],
                 "chunks_total": conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
+                "chunks_bytes_total": conn.execute("SELECT COALESCE(SUM(size), 0) FROM chunks").fetchone()[0],
             }
 
 

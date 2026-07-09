@@ -46,7 +46,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.3")
+        self.assertEqual(__version__, "0.2.4")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -241,6 +241,23 @@ class CoreTests(unittest.TestCase):
         all_rows = self.db.list_events([])
         self.assertEqual(len(all_rows), 3)
 
+    def test_log_filtering_by_event_type_and_exclusion(self):
+        self.db.log("verbose", "web.access", "GET /api/status")
+        self.db.log("info", "scan", "scan message")
+        self.db.log("info", "queue", "queue message")
+        scan_rows = self.db.list_events(["info", "verbose"], event_types=["scan"])
+        self.assertEqual([row["event_type"] for row in scan_rows], ["scan"])
+        visible_rows = self.db.list_events(["info", "verbose"], exclude_event_types=["web.access"])
+        self.assertNotIn("web.access", [row["event_type"] for row in visible_rows])
+        self.assertIn("scan", self.db.event_types())
+
+    def test_change_token_ignores_web_access_events(self):
+        first = self.db.change_token()["event_id"]
+        self.db.log("verbose", "web.access", "GET /api/status")
+        self.assertEqual(self.db.change_token()["event_id"], first)
+        self.db.log("info", "scan", "scan message")
+        self.assertGreater(self.db.change_token()["event_id"], first)
+
     def test_speed_samples_include_posted_chunks(self):
         media = self.root / "media"
         media.mkdir()
@@ -253,6 +270,23 @@ class CoreTests(unittest.TestCase):
         self.db.add_chunk(file_id, 0, "<chunk@example.test>", 120, "abc", "[hidden]")
         samples = self.db.speed_samples(minutes=5, bucket_seconds=60)
         self.assertTrue(any(sample["upload_bps"] > 0 for sample in samples))
+
+    def test_queue_pagination_and_folder_priority(self):
+        media = self.root / "media"
+        folder = media / "season"
+        folder.mkdir(parents=True)
+        (folder / "one.mkv").write_bytes(b"one")
+        (folder / "two.mkv").write_bytes(b"two")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        self.assertEqual(self.db.queue_count(), 2)
+        self.assertEqual(len(self.db.list_queue(limit=1)), 1)
+        changed = self.db.boost_folder_priority("season")
+        self.assertEqual(changed, 2)
+        with self.db.connect() as conn:
+            priorities = [row["priority"] for row in conn.execute("SELECT priority FROM queue ORDER BY file_id").fetchall()]
+        self.assertEqual(priorities, [90, 90])
 
     def test_update_config_from_settings_payload(self):
         update_config(

@@ -38,16 +38,34 @@ def restore_file(db: Database, config: Config, source_path: str, dest: Optional[
 
 def restore_folder(db: Database, config: Config, folder_path: str, dest: Optional[str] = None) -> int:
     restored = 0
-    folder = str(Path(folder_path).resolve())
+    raw_folder = str(folder_path).rstrip("\\/")
+    alt_folder = raw_folder.replace("/", "\\")
+    folder = str(Path(folder_path).resolve()) if Path(folder_path).is_absolute() else raw_folder
     with db.connect() as conn:
-        rows = conn.execute("SELECT path FROM files WHERE path LIKE ? ORDER BY path", (folder + "%",)).fetchall()
+        rows = conn.execute(
+            """
+            SELECT path, relative_path FROM files
+            WHERE path LIKE ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?
+            ORDER BY relative_path
+            """,
+            (
+                folder + "%",
+                raw_folder,
+                raw_folder + "/%",
+                alt_folder,
+                alt_folder + "\\%",
+            ),
+        ).fetchall()
     for row in rows:
         source = row["path"]
         target = None
         if dest:
-            relative = Path(source).relative_to(folder)
+            if Path(folder).is_absolute():
+                relative = Path(source).relative_to(folder)
+            else:
+                relative_text = str(row["relative_path"]).replace("\\", "/")
+                relative = Path(relative_text).relative_to(raw_folder.replace("\\", "/"))
             target = str(Path(dest) / relative)
         restore_file(db, config, source, target)
         restored += 1
     return restored
-

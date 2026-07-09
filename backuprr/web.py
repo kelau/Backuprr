@@ -1,4 +1,5 @@
 import json
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -60,6 +61,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif parsed.path == "/api/speed":
             self.send_json(self.db.speed_samples(int(query.get("minutes", ["30"])[0]), int(query.get("bucket", ["60"])[0])))
+        elif parsed.path == "/api/events/stream":
+            self.stream_changes()
         elif parsed.path == "/api/files":
             self.send_json(rowdicts(self.db.list_rows("files", int(query.get("limit", ["200"])[0]))))
         elif parsed.path == "/api/search":
@@ -68,11 +71,19 @@ class Handler(BaseHTTPRequestHandler):
             levels = query.get("level", [])
             if not levels and query.get("levels"):
                 levels = [item for group in query.get("levels", []) for item in group.split(",")]
-            self.send_json(rowdicts(self.db.list_events(levels, int(query.get("limit", ["300"])[0]))))
+            event_types = query.get("event_type", [])
+            exclude_event_types = query.get("exclude_event_type", [])
+            self.send_json(rowdicts(self.db.list_events(levels, int(query.get("limit", ["300"])[0]), event_types, exclude_event_types)))
+        elif parsed.path == "/api/log/event-types":
+            self.send_json(self.db.event_types())
         elif parsed.path == "/api/queue":
             self.db.cleanup_completed_queue()
-            include_done = query.get("include_done", ["0"])[0] in {"1", "true", "yes"}
-            self.send_json(rowdicts(self.db.list_queue(include_done=include_done)))
+            page = max(1, int(query.get("page", ["1"])[0]))
+            page_size = max(1, min(100, int(query.get("page_size", ["10"])[0])))
+            status = query.get("status", [None])[0]
+            offset = (page - 1) * page_size
+            rows = self.db.list_queue(status=status, limit=page_size, offset=offset)
+            self.send_json({"rows": rowdicts(rows), "page": page, "page_size": page_size, "total": self.db.queue_count(status=status)})
         elif parsed.path == "/api/tasks":
             self.send_json(self.monitor.tasks() + self.backup_monitor.tasks())
         elif parsed.path == "/api/settings":
@@ -96,6 +107,11 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/files/queue":
                 self.db.queue_file(int(data["file_id"]), priority=int(data.get("priority", 100)), reason="manual")
                 self.send_json({"ok": True})
+            elif parsed.path == "/api/files/priority":
+                self.db.boost_queue_priority(int(data["file_id"]), amount=int(data.get("amount", 10)))
+                self.send_json({"ok": True})
+            elif parsed.path == "/api/folders/priority":
+                self.send_json({"changed": self.db.boost_folder_priority(data["path"], amount=int(data.get("amount", 10)))})
             elif parsed.path == "/api/post-next":
                 self.send_json({"file_id": self.backup_monitor.post_once()})
             elif parsed.path == "/api/verify":
@@ -118,6 +134,24 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.db.log("error", "web.error", f"{parsed.path}: {exc}")
             self.send_json({"error": str(exc)}, 500)
+
+    def stream_changes(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        last_payload = ""
+        try:
+            while True:
+                payload = json.dumps(self.db.change_token(), default=str)
+                if payload != last_payload:
+                    self.wfile.write(f"event: change\ndata: {payload}\n\n".encode("utf-8"))
+                    self.wfile.flush()
+                    last_payload = payload
+                time.sleep(1)
+        except (BrokenPipeError, ConnectionError):
+            return
 
 
 def run_web(config: Config, db: Database, host: str, port: int) -> None:
@@ -185,6 +219,9 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .progress-track { height:16px; background:#edf1f2; border-radius:999px; overflow:hidden; }
 .progress-fill { height:100%; background:var(--accent); border-radius:999px; transition:width .2s ease; }
 .refresh-note { margin-left:auto; }
+.push-note { margin-left:auto; }
+.section-title { margin:16px 0 8px; font-size:16px; }
+.pagination { display:flex; gap:8px; align-items:center; margin:8px 0 14px; }
 .form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; margin-bottom:12px; }
 .field { display:grid; gap:5px; }
 .field span { color:var(--muted); font-size:12px; font-weight:600; }
@@ -222,61 +259,76 @@ let page = "Status";
 let settingsCache = null;
 let fileRowsCache = [];
 let logLevelSelection = ["error","warning","info","verbose"];
+let logEventTypeSelection = [];
+let logExcludeWebAccess = true;
 let logLimitSelection = "300";
-let refreshTimer = null;
-const refreshPages = new Set(["Status","Files","Log","Queue","Tasks"]);
-const refreshIntervals = { Status:5000, Files:10000, Log:5000, Queue:5000, Tasks:3000 };
+let eventSource = null;
+let lastChangeToken = null;
+let activeQueuePage = 1;
+let completedQueuePage = 1;
+const queuePageSize = 10;
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
+function jsString(v){ return JSON.stringify(String(v ?? "")).replace(/</g, "\\u003c"); }
 function table(rows, cols){
  if(!rows.length) return "<p class='muted'>No rows.</p>";
  return `<table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>`+
- rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(r[c])}</td>`).join("")}</tr>`).join("")+"</tbody></table>";
+ rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(formatCell(c, r[c]))}</td>`).join("")}</tr>`).join("")+"</tbody></table>";
+}
+function formatCell(col, value){
+ return ["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total"].includes(col) ? formatBytes(value) : value;
 }
 function nav(){
  document.getElementById("nav").innerHTML = pages.map(p=>`<button class="${p===page?"active":""}" onclick="page='${p}';render()"> ${p}</button>`).join("");
 }
-function scheduleRefresh(){
- if(refreshTimer) clearInterval(refreshTimer);
- refreshTimer = null;
- if(refreshPages.has(page)){
-  refreshTimer = setInterval(() => refreshPage(), refreshIntervals[page] || 5000);
- }
+function connectChanges(){
+ if(eventSource) return;
+ eventSource = new EventSource("/api/events/stream");
+ eventSource.addEventListener("change", event => {
+  const token = JSON.parse(event.data);
+  const previous = lastChangeToken;
+  lastChangeToken = token;
+  if(previous) refreshPageForChanges(previous, token);
+ });
+ eventSource.onerror = () => { document.querySelectorAll(".push-state").forEach(el => el.textContent = "Waiting for change stream"); };
 }
-function refreshLabel(){
- return refreshPages.has(page) ? `<span class="muted refresh-note">Partial refresh ${Math.round((refreshIntervals[page] || 5000)/1000)}s</span>` : "";
+function pushLabel(){
+ return `<span class="muted push-note push-state">Live updates on change</span>`;
 }
 async function render(){
  nav();
- scheduleRefresh();
+ connectChanges();
  const c = document.getElementById("content");
  if(page==="Status"){
   c.innerHTML = `<div id="statusPanel"></div>`;
   await updateStatusPage();
  }
  if(page==="Files"){
-  c.innerHTML = `<div class="toolbar"><button onclick="updateFilesPage()">&#8635;</button><button class="primary" onclick="post('/api/post-next').then(updateFilesPage)">&#9658; Post next</button><label><input id="showDeletedFiles" type="checkbox" onchange="updateFilesPage()"> Show deleted</label>${refreshLabel()}</div><div id="filesTree"></div>`;
+  c.innerHTML = `<div class="toolbar"><button onclick="updateFilesPage()">&#8635;</button><label><input id="showDeletedFiles" type="checkbox" onchange="updateFilesPage()"> Show deleted</label>${pushLabel()}</div><div id="filesTree"></div>`;
   await updateFilesPage();
  }
  if(page==="Search"){
   c.innerHTML = `<div class="toolbar"><input id="q" placeholder="Search files"><button onclick="search()">Search</button></div><div id="results"></div>`;
  }
  if(page==="Log"){
+  const eventTypes = await api("/api/log/event-types");
   const levels = ["error","warning","info","verbose"];
   c.innerHTML = `<div class="toolbar">
    ${levels.map(level=>`<label><input class="logLevel" type="checkbox" value="${level}" ${logLevelSelection.includes(level) ? "checked" : ""}> ${level}</label>`).join("")}
+   <select id="logEventType"><option value="">All event types</option>${eventTypes.map(type=>`<option value="${esc(type)}" ${logEventTypeSelection.includes(type) ? "selected" : ""}>${esc(type)}</option>`).join("")}</select>
+   <label><input id="hideWebAccess" type="checkbox" ${logExcludeWebAccess ? "checked" : ""}> Hide web.access</label>
    <select id="logLimit"><option ${logLimitSelection==="100"?"selected":""}>100</option><option ${logLimitSelection==="300"?"selected":""}>300</option><option ${logLimitSelection==="1000"?"selected":""}>1000</option></select>
-   <button onclick="loadLog()">Apply</button>${refreshLabel()}
+   <button onclick="loadLog()">Apply</button>${pushLabel()}
   </div><div id="logRows"></div>`;
   await updateLogPage();
  }
  if(page==="Queue"){
-  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(updateQueuePage)">Apply filter</button><button class="primary" onclick="post('/api/post-next').then(updateQueuePage)">Post next</button><label><input id="showDoneQueue" type="checkbox" onchange="updateQueuePage()"> Show completed</label>${refreshLabel()}</div><div id="queueRows"></div>`;
+  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(updateQueuePage)">Apply filter</button><button class="primary" onclick="post('/api/post-next').then(updateQueuePage)">Post next</button>${pushLabel()}</div><h2 class="section-title">Active</h2><div id="activeQueueRows"></div><h2 class="section-title">Completed</h2><div id="completedQueueRows"></div>`;
   await updateQueuePage();
  }
  if(page==="Tasks"){
-  c.innerHTML = `<div class="toolbar"><button onclick="updateTasksPage()">Refresh</button><button class="primary" onclick="post('/api/scan').then(updateTasksPage)">Run catalog scan</button>${refreshLabel()}</div><div id="taskRows"></div>`;
+  c.innerHTML = `<div class="toolbar"><button onclick="updateTasksPage()">Refresh</button><button class="primary" onclick="post('/api/scan').then(updateTasksPage)">Run catalog scan</button>${pushLabel()}</div><div id="taskRows"></div>`;
   await updateTasksPage();
  }
  if(page==="Restore"){
@@ -285,12 +337,17 @@ async function render(){
  if(page==="Settings"){ settingsCache = await api("/api/settings"); c.innerHTML = settingsForm(settingsCache); }
  if(page==="About"){ c.innerHTML = `<h1>Backuprr</h1><p>Version <span id="aboutVersion"></span></p><p>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
 }
-async function refreshPage(){
- if(page==="Status") await updateStatusPage();
- if(page==="Files") await updateFilesPage();
- if(page==="Log") await updateLogPage(false);
- if(page==="Queue") await updateQueuePage();
- if(page==="Tasks") await updateTasksPage();
+async function refreshPageForChanges(previous, token){
+ const filesChanged = previous.files_updated !== token.files_updated || previous.files_total !== token.files_total;
+ const queueChanged = previous.queue_updated !== token.queue_updated || previous.queue_total !== token.queue_total;
+ const eventsChanged = previous.event_id !== token.event_id;
+ const chunksChanged = previous.chunks_total !== token.chunks_total;
+ if(page==="Status" && (filesChanged || queueChanged || chunksChanged)) await updateStatusPage();
+ if(page==="Files" && filesChanged) await updateFilesPage();
+ if(page==="Log" && eventsChanged) await updateLogPage(false);
+ if(page==="Queue" && (queueChanged || filesChanged)) await updateQueuePage();
+ if(page==="Tasks" && eventsChanged) await updateTasksPage();
+ document.querySelectorAll(".push-state").forEach(el => el.textContent = "Updated after change");
 }
 async function updateStatusPage(){
  const s = await api("/api/status");
@@ -301,16 +358,29 @@ async function updateStatusPage(){
  if(panel) panel.innerHTML = statusDashboard(s, tasks, speed);
 }
 async function updateFilesPage(){
+ const openFolders = new Set(Array.from(document.querySelectorAll("#filesTree details[data-path][open]")).map(item => item.dataset.path));
  fileRowsCache = await api("/api/files?limit=5000");
  const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
  const target = document.getElementById("filesTree");
- if(target) target.innerHTML = fileTree(fileRowsCache, showDeleted);
+ if(target){
+  target.innerHTML = fileTree(fileRowsCache, showDeleted);
+  target.querySelectorAll("details[data-path]").forEach(details => {
+   if(openFolders.has(details.dataset.path)) details.open = true;
+  });
+ }
 }
 async function updateQueuePage(){
- const includeDone = !!document.getElementById("showDoneQueue")?.checked;
- const rows = await api(`/api/queue?include_done=${includeDone ? "1" : "0"}`);
- const target = document.getElementById("queueRows");
- if(target) target.innerHTML = table(rows, ["file_id","position","priority","status","reason","path","size","state"]);
+ const active = await api(`/api/queue?page=${activeQueuePage}&page_size=${queuePageSize}`);
+ const done = await api(`/api/queue?status=done&page=${completedQueuePage}&page_size=${queuePageSize}`);
+ const activeTarget = document.getElementById("activeQueueRows");
+ const doneTarget = document.getElementById("completedQueueRows");
+ if(activeTarget) activeTarget.innerHTML = pagedTable(active, "activeQueuePage", ["file_id","position","priority","status","reason","path","size","state"]);
+ if(doneTarget) doneTarget.innerHTML = pagedTable(done, "completedQueuePage", ["file_id","position","priority","status","reason","path","size","state"]);
+}
+function pagedTable(result, pageVar, cols){
+ const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || queuePageSize)));
+ const pageNo = Number(result.page || 1);
+ return table(result.rows || [], cols) + `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);updateQueuePage()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${Number(result.total || 0)} rows</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;updateQueuePage()">Next</button></div>`;
 }
 async function updateTasksPage(){
  const rows = await api("/api/tasks");
@@ -325,6 +395,11 @@ function statusDashboard(status, tasks, speed){
  const posting = Number(stats.files_posting || 0);
  const deleted = Number(stats.files_deleted || 0);
  const chunks = Number(stats.chunks_total || 0);
+ const totalBytes = Number(stats.files_bytes_total || 0);
+ const backedBytes = Number(stats.files_bytes_backed_up || 0);
+ const queuedBytes = Number(stats.files_bytes_queued || 0);
+ const postingBytes = Number(stats.files_bytes_posting || 0);
+ const chunkBytes = Number(stats.chunks_bytes_total || 0);
  const doneQueue = Number(stats.queue_done || 0);
  const queuedQueue = Number(stats.queue_queued || 0);
  const postingQueue = Number(stats.queue_posting || 0);
@@ -334,19 +409,20 @@ function statusDashboard(status, tasks, speed){
   .filter(task => task.status !== "running" && task.time_until_next_run)
   .sort((a,b) => secondsFromLabel(a.time_until_next_run) - secondsFromLabel(b.time_until_next_run))[0];
  return `<div class="dashboard">
-  <div class="toolbar"><button class="primary" onclick="post('/api/scan').then(render)">&#8635; Scan now</button><button onclick="post('/api/queue/enqueue-unbacked').then(render)">&#10133; Queue unbacked</button><button onclick="post('/api/verify',{force:true}).then(render)">&#10003; Verify chunks</button>${refreshLabel()}</div>
+  <div class="toolbar"><button class="primary" onclick="post('/api/scan').then(updateStatusPage)">&#8635; Scan now</button><button onclick="post('/api/queue/enqueue-unbacked').then(updateStatusPage)">&#10133; Queue unbacked</button><button onclick="post('/api/verify',{force:true}).then(updateStatusPage)">&#10003; Verify chunks</button>${pushLabel()}</div>
   <div class="hero-status">
    <h2>${esc(activeTask ? `${activeTask.name} is running` : "Backuprr is standing by")}</h2>
    <div class="muted">${esc(activeTask ? activeTask.last_result || "Working through the current task" : nextTask ? `Next: ${nextTask.name} in ${nextTask.time_until_next_run}` : "No scheduled task time reported")}</div>
    <div class="progress-track"><div class="progress-fill" style="width:${protectedPct}%"></div></div>
-   <div>${protectedPct}% backed up &middot; ${backed} of ${total} files protected &middot; ${queued + posting} waiting or posting &middot; ${chunks} chunks posted</div>
+   <div>${protectedPct}% backed up &middot; ${backed} of ${total} files protected (${formatBytes(backedBytes)} of ${formatBytes(totalBytes)}) &middot; ${queued + posting} waiting or posting (${formatBytes(queuedBytes + postingBytes)}) &middot; ${chunks} chunks posted (${formatBytes(chunkBytes)})</div>
   </div>
   <div class="task-strip">${tasks.map(taskCard).join("")}</div>
   <div class="stats">
    ${statCard("Files", total)}
-   ${statCard("Backed up", backed)}
-   ${statCard("Queued", queued)}
-   ${statCard("Posting", posting)}
+   ${statCard("Data", formatBytes(totalBytes))}
+   ${statCard("Backed up", `${backed} / ${formatBytes(backedBytes)}`)}
+   ${statCard("Queued", `${queued} / ${formatBytes(queuedBytes)}`)}
+   ${statCard("Posting", `${posting} / ${formatBytes(postingBytes)}`)}
    ${statCard("Deleted", deleted)}
    ${statCard("Chunks", chunks)}
   </div>
@@ -423,10 +499,14 @@ function secondsFromLabel(label){
 }
 async function updateLogPage(saveSelection=true){
  logLevelSelection = Array.from(document.querySelectorAll(".logLevel:checked")).map(input => input.value);
+ logEventTypeSelection = Array.from(document.querySelectorAll("#logEventType")).map(input => input.value).filter(Boolean);
+ logExcludeWebAccess = !!document.getElementById("hideWebAccess")?.checked;
  logLimitSelection = document.getElementById("logLimit").value;
  const levels = logLevelSelection.map(level => "level="+encodeURIComponent(level)).join("&");
+ const eventTypes = logEventTypeSelection.map(type => "event_type="+encodeURIComponent(type)).join("&");
+ const exclude = logExcludeWebAccess ? "exclude_event_type=web.access" : "";
  const limit = encodeURIComponent(logLimitSelection);
- document.getElementById("logRows").innerHTML = table(await api(`/api/log?limit=${limit}&${levels}`), ["id","ts","level","event_type","message","file_id"]);
+ document.getElementById("logRows").innerHTML = table(await api(`/api/log?limit=${limit}&${levels}&${eventTypes}&${exclude}`), ["id","ts","level","event_type","message","file_id"]);
 }
 async function loadLog(){ await updateLogPage(); }
 function fileTree(rows, showDeleted=false){
@@ -446,7 +526,10 @@ function fileTree(rows, showDeleted=false){
 }
 function treeNode(node, prefix, showDeleted){
  const dirs = Object.keys(node.dirs).sort((a,b)=>a.localeCompare(b));
- const dirHtml = dirs.map(name => `<li class="folder"><details><summary class="tree-row"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span class="tree-meta">${countFiles(node.dirs[name])} files &middot; ${formatBytes(node.dirs[name].total_size || 0)}</span></summary><ul>${treeNode(node.dirs[name], prefix ? prefix+"/"+name : name, showDeleted)}</ul></details></li>`).join("");
+ const dirHtml = dirs.map(name => {
+  const path = prefix ? prefix+"/"+name : name;
+  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span class="tree-meta">${countFiles(node.dirs[name])} files &middot; ${formatBytes(node.dirs[name].total_size || 0)}</span><button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button><button class="icon-btn" title="Restore folder" onclick="event.preventDefault();restoreCatalogFolder(${jsString(path)})">&#8635;</button></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
+ }).join("");
  const fileHtml = node.files.sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name))).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
 }
@@ -462,13 +545,24 @@ function fileRow(file){
   <span class="tree-meta">${formatBytes(file.size)}</span>
   <span class="tree-meta ${stateClass}">${esc(file.state)}</span>
   ${canQueue ? `<button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>` : ""}
+  ${file.state !== "backed_up" && file.state !== "deleted" ? `<button class="icon-btn" title="Increase queue priority" onclick="boostFile(${Number(file.id)})">&#8593;</button>` : ""}
   <button class="icon-btn" title="Restore file" onclick="restoreCatalogFile(${Number(file.id)})">&#8635;</button>
  </div></li>`;
 }
 async function queueFile(fileId){
  const out = await post("/api/files/queue", { file_id:fileId });
  if(!out.ok) alert(out.error || "Unable to queue file");
- await render();
+ await updateFilesPage();
+}
+async function boostFile(fileId){
+ const out = await post("/api/files/priority", { file_id:fileId, amount:10 });
+ if(!out.ok) alert(out.error || "Unable to prioritize file");
+ await updateFilesPage();
+}
+async function boostFolder(path){
+ const out = await post("/api/folders/priority", { path:path, amount:10 });
+ if(out.error) alert(out.error);
+ await updateFilesPage();
 }
 async function restoreCatalogFile(fileId){
  const file = fileRowsCache.find(row => Number(row.id) === Number(fileId));
@@ -476,6 +570,11 @@ async function restoreCatalogFile(fileId){
  const dest = prompt("Restore destination, blank for original location", "");
  const out = await post("/api/restore", { path:file.path, dest:dest || null });
  alert(out.error || `Restored to ${out.target}`);
+}
+async function restoreCatalogFolder(path){
+ const dest = prompt("Restore destination for this folder, blank for original locations", "");
+ const out = await post("/api/restore", { path:path, dest:dest || null, folder:true });
+ alert(out.error || `Restored ${out.restored} files`);
 }
 async function search(){ document.getElementById("results").innerHTML = table(await api("/api/search?q="+encodeURIComponent(document.getElementById("q").value)), ["id","relative_path","size","state","updated_at"]); }
 async function restore(){ const out = await post("/api/restore",{path:restorePath.value,dest:restoreDest.value,folder:restoreFolder.checked}); restoreOut.textContent = JSON.stringify(out,null,2); }
