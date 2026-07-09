@@ -2,7 +2,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from .backup import post_next
+from .backup import post_next, verify_due_chunks
 from .config import Config
 from .db import Database
 from .queueing import enqueue_unbacked
@@ -198,6 +198,42 @@ class BackupMonitor(ScheduledTask):
         else:
             result = f"posted file id {file_id}, {recovered} stale recovered, {queued} queued, {posting} posting"
         self.db.log("debug", "monitor.backup", f"Automatic backup task completed: {result}")
+        return result
+
+    def tasks(self):
+        return [self.task_info()]
+
+
+class VerificationMonitor(ScheduledTask):
+    def __init__(self, db: Database, config: Config):
+        super().__init__(db, config, "Chunk verification worker", "verification")
+
+    @property
+    def interval_seconds(self) -> int:
+        return self.config.verification_task_interval_seconds
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, name=f"backuprr-{self.kind}", daemon=True)
+        self._thread.start()
+        self._schedule_next(self.interval_seconds)
+
+    def verify_once(self, force: bool = False) -> int:
+        if force:
+            result = verify_due_chunks(self.db, self.config, force=True)
+            self.db.log("info", "verify.manual", f"Manual verification checked {result} chunks")
+            return result
+        result = self.run_once()
+        try:
+            return int(result.split(" ", 1)[0])
+        except (ValueError, IndexError):
+            return 0
+
+    def execute(self) -> str:
+        count = verify_due_chunks(self.db, self.config, force=False)
+        result = f"{count} chunks verified"
+        self.db.log("debug", "monitor.verify", f"Automatic verification task completed: {result}")
         return result
 
     def tasks(self):

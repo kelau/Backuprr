@@ -431,11 +431,19 @@ class Database:
         status = "verified" if exists else "missing"
         missing_file_id: Optional[int] = None
         with self.connect() as conn:
+            now = utcnow()
             row = conn.execute("SELECT file_id FROM chunks WHERE id=?", (chunk_id,)).fetchone()
-            conn.execute("UPDATE chunks SET status=?, verified_at=? WHERE id=?", (status, utcnow(), chunk_id))
+            conn.execute("UPDATE chunks SET status=?, verified_at=? WHERE id=?", (status, now, chunk_id))
             if row and not exists:
-                conn.execute("UPDATE files SET state='missing_chunks', updated_at=? WHERE id=?", (utcnow(), row["file_id"]))
+                conn.execute("UPDATE files SET state='missing_chunks', updated_at=? WHERE id=?", (now, row["file_id"]))
                 missing_file_id = int(row["file_id"])
+            elif row and exists:
+                incomplete = conn.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE file_id=? AND status != 'verified'",
+                    (row["file_id"],),
+                ).fetchone()[0]
+                if incomplete == 0:
+                    conn.execute("UPDATE files SET last_verify_at=?, updated_at=? WHERE id=?", (now, now, row["file_id"]))
         if missing_file_id is not None:
             self.queue_file(missing_file_id, priority=10, reason="missing-chunks")
 
@@ -445,6 +453,75 @@ class Database:
             raise ValueError(f"Unsupported table: {table}")
         with self.connect() as conn:
             return conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def list_files(
+        self,
+        limit: int = 200,
+        offset: int = 0,
+        search: str = "",
+        include_deleted: bool = False,
+        unbacked_only: bool = False,
+    ) -> List[sqlite3.Row]:
+        clauses = []
+        params: List[Any] = []
+        if not include_deleted:
+            clauses.append("f.state != 'deleted'")
+        if unbacked_only:
+            clauses.append("f.state != 'backed_up'")
+        if search:
+            clauses.append("(f.path LIKE ? OR f.relative_path LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            return conn.execute(
+                f"""
+                SELECT f.*,
+                       COUNT(c.id) AS chunk_count,
+                       SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END) AS verified_chunks,
+                       SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) AS missing_chunks,
+                       COALESCE(SUM(c.size), 0) AS chunk_bytes
+                FROM files f
+                LEFT JOIN chunks c ON c.file_id = f.id
+                {where}
+                GROUP BY f.id
+                ORDER BY f.relative_path
+                LIMIT ? OFFSET ?
+                """,
+                (*params, limit, offset),
+            ).fetchall()
+
+    def file_count(self, search: str = "", include_deleted: bool = False, unbacked_only: bool = False) -> int:
+        clauses = []
+        params: List[Any] = []
+        if not include_deleted:
+            clauses.append("state != 'deleted'")
+        if unbacked_only:
+            clauses.append("state != 'backed_up'")
+        if search:
+            clauses.append("(path LIKE ? OR relative_path LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            return int(conn.execute(f"SELECT COUNT(*) FROM files {where}", params).fetchone()[0])
+
+    def verification_rows(self, limit: int = 200, offset: int = 0) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT f.id, f.path, f.relative_path, f.state, f.last_verify_at,
+                       COUNT(c.id) AS chunk_count,
+                       SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END) AS verified_chunks,
+                       SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) AS missing_chunks,
+                       MAX(c.verified_at) AS last_chunk_verify_at
+                FROM files f
+                LEFT JOIN chunks c ON c.file_id = f.id
+                WHERE f.state != 'deleted'
+                GROUP BY f.id
+                ORDER BY f.last_verify_at IS NULL DESC, f.last_verify_at ASC, f.relative_path
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            ).fetchall()
 
     def list_events(
         self,
@@ -490,7 +567,7 @@ class Database:
                   (SELECT COALESCE(MAX(updated_at), '') FROM queue) AS queue_updated,
                   (SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type != 'web.access') AS event_id,
                   (SELECT COUNT(*) FROM chunks) AS chunks_total,
-                  (SELECT COUNT(*) FROM files) AS files_total,
+                  (SELECT COUNT(*) FROM files WHERE state != 'deleted') AS files_total,
                   (SELECT COUNT(*) FROM queue) AS queue_total
                 """
             ).fetchone()
@@ -544,12 +621,15 @@ class Database:
             return {
                 **{f"files_{row['state']}": row["count"] for row in states},
                 **{f"queue_{row['status']}": row["count"] for row in queue},
-                "files_total": conn.execute("SELECT COUNT(*) FROM files").fetchone()[0],
+                "files_total": conn.execute("SELECT COUNT(*) FROM files WHERE state != 'deleted'").fetchone()[0],
+                "files_all_total": conn.execute("SELECT COUNT(*) FROM files").fetchone()[0],
                 "files_bytes_total": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state != 'deleted'").fetchone()[0],
                 "files_bytes_backed_up": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state='backed_up'").fetchone()[0],
                 "files_bytes_queued": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state='queued'").fetchone()[0],
                 "files_bytes_posting": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state='posting'").fetchone()[0],
                 "chunks_total": conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
+                "chunks_verified": conn.execute("SELECT COUNT(*) FROM chunks WHERE status='verified'").fetchone()[0],
+                "chunks_missing": conn.execute("SELECT COUNT(*) FROM chunks WHERE status='missing'").fetchone()[0],
                 "chunks_bytes_total": conn.execute("SELECT COALESCE(SUM(size), 0) FROM chunks").fetchone()[0],
             }
 

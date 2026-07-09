@@ -3,6 +3,7 @@ import os
 import subprocess
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional
@@ -81,15 +82,24 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         db.log("debug", "post.retry", f"Cleared {cleared} partial chunk records before retrying {original}", file_id)
     payload = prepare_payload(original, config)
     try:
-        with UsenetClient(host) as client:
-            for chunk_index, chunk in enumerate(iter_chunks(payload, config.article_size)):
-                salt = os.urandom(16)
-                body = encode_chunk(chunk, config, salt)
-                digest = hashlib.sha256(body).hexdigest()
-                subject = obfuscated_subject(file_id, chunk_index, digest)
+        def post_chunk(chunk_index: int, chunk: bytes) -> tuple[int, str, int, str, str]:
+            salt = os.urandom(16)
+            body = encode_chunk(chunk, config, salt)
+            digest = hashlib.sha256(body).hexdigest()
+            subject = obfuscated_subject(file_id, chunk_index, digest)
+            with UsenetClient(host) as client:
                 message_id = client.post(config.newsgroup, subject, body)
-                db.add_chunk(file_id, chunk_index, message_id, len(body), digest, subject)
-            db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
+            return chunk_index, message_id, len(body), digest, subject
+
+        max_workers = max(1, int(config.nntp_threads))
+        futures = []
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backuprr-post") as executor:
+            for chunk_index, chunk in enumerate(iter_chunks(payload, config.article_size)):
+                futures.append(executor.submit(post_chunk, chunk_index, chunk))
+            for future in as_completed(futures):
+                chunk_index, message_id, body_size, digest, subject = future.result()
+                db.add_chunk(file_id, chunk_index, message_id, body_size, digest, subject)
+                db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
         with db.connect() as conn:
             conn.execute("UPDATE files SET state='backed_up', last_backup_at=?, updated_at=? WHERE id=?", (utcnow(), utcnow(), file_id))
             conn.execute("UPDATE queue SET status='done', updated_at=? WHERE file_id=?", (utcnow(), file_id))
@@ -111,11 +121,19 @@ def verify_due_chunks(db: Database, config: Config, force: bool = False) -> int:
     if not chunks:
         return 0
     host = select_host(config, "read")
-    count = 0
-    with UsenetClient(host) as client:
-        for chunk in chunks:
+
+    def verify_chunk(chunk) -> tuple[int, int, str, bool]:
+        with UsenetClient(host) as client:
             exists = client.article_exists(chunk["message_id"])
-            db.mark_chunk_verified(int(chunk["id"]), exists)
-            db.log("debug" if exists else "warning", "verify.chunk", f"Chunk {chunk['message_id']} exists={exists}", int(chunk["file_id"]))
+        return int(chunk["id"]), int(chunk["file_id"]), chunk["message_id"], exists
+
+    count = 0
+    max_workers = max(1, int(config.nntp_threads))
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backuprr-verify") as executor:
+        futures = [executor.submit(verify_chunk, chunk) for chunk in chunks]
+        for future in as_completed(futures):
+            chunk_id, file_id, message_id, exists = future.result()
+            db.mark_chunk_verified(chunk_id, exists)
+            db.log("debug" if exists else "warning", "verify.chunk", f"Chunk {message_id} exists={exists}", file_id)
             count += 1
     return count

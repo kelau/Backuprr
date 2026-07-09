@@ -4,6 +4,7 @@ from pathlib import Path
 
 from . import __version__
 from .backup import post_next, verify_due_chunks
+from .cloud_backup import backup_config_and_database
 from .config import Config
 from .db import Database
 from .queueing import enqueue_unbacked, move, prioritize
@@ -40,6 +41,7 @@ def main(argv=None) -> int:
     sub.add_parser("post-next")
     verify = sub.add_parser("verify")
     verify.add_argument("--force", action="store_true")
+    sub.add_parser("cloud-backup")
     restore = sub.add_parser("restore")
     restore.add_argument("--path", required=True)
     restore.add_argument("--dest")
@@ -83,6 +85,8 @@ def main(argv=None) -> int:
         print("No queued file" if posted is None else f"Posted file id {posted}")
     elif args.command == "verify":
         print(f"Verified {verify_due_chunks(db, config, force=args.force)} chunks")
+    elif args.command == "cloud-backup":
+        print(json.dumps(backup_config_and_database(db, config), indent=2))
     elif args.command == "restore":
         if args.folder:
             print(f"Restored {restore_folder(db, config, args.path, args.dest)} files")
@@ -95,4 +99,3 @@ def main(argv=None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

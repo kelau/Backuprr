@@ -5,10 +5,10 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from . import __version__
-from .backup import verify_due_chunks
+from .cloud_backup import backup_config_and_database
 from .config import Config, update_config
 from .db import Database
-from .monitor import BackupMonitor, CatalogMonitor
+from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
 
@@ -23,6 +23,7 @@ class Handler(BaseHTTPRequestHandler):
     db: Database
     monitor: CatalogMonitor
     backup_monitor: BackupMonitor
+    verification_monitor: VerificationMonitor
 
     def log_message(self, fmt: str, *args: Any) -> None:
         self.db.log("verbose", "web.access", fmt % args)
@@ -57,6 +58,7 @@ class Handler(BaseHTTPRequestHandler):
                     "stats": self.db.stats(),
                     "scan_interval_seconds": self.config.scan_interval_seconds,
                     "backup_interval_seconds": self.config.backup_interval_seconds,
+                    "verification_task_interval_seconds": self.config.verification_task_interval_seconds,
                 }
             )
         elif parsed.path == "/api/speed":
@@ -64,9 +66,36 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/events/stream":
             self.stream_changes()
         elif parsed.path == "/api/files":
-            self.send_json(rowdicts(self.db.list_rows("files", int(query.get("limit", ["200"])[0]))))
+            page = max(1, int(query.get("page", ["1"])[0]))
+            page_size = max(1, min(500, int(query.get("page_size", query.get("limit", ["200"]))[0])))
+            search = query.get("q", [""])[0]
+            include_deleted = query.get("include_deleted", ["0"])[0] in {"1", "true", "yes"}
+            unbacked_only = query.get("unbacked", ["0"])[0] in {"1", "true", "yes"}
+            offset = (page - 1) * page_size
+            self.send_json(
+                {
+                    "rows": rowdicts(self.db.list_files(page_size, offset, search, include_deleted, unbacked_only)),
+                    "page": page,
+                    "page_size": page_size,
+                    "total": self.db.file_count(search, include_deleted, unbacked_only),
+                }
+            )
         elif parsed.path == "/api/search":
             self.send_json(rowdicts(self.db.search_files(query.get("q", [""])[0])))
+        elif parsed.path == "/api/statistics":
+            self.send_json(
+                {
+                    "stats": self.db.stats(),
+                    "tasks": self.monitor.tasks() + self.backup_monitor.tasks() + self.verification_monitor.tasks(),
+                    "speed": self.db.speed_samples(120, 300),
+                    "events": rowdicts(self.db.list_events(limit=50, exclude_event_types=["web.access"])),
+                }
+            )
+        elif parsed.path == "/api/verification":
+            page = max(1, int(query.get("page", ["1"])[0]))
+            page_size = max(1, min(200, int(query.get("page_size", ["25"])[0])))
+            offset = (page - 1) * page_size
+            self.send_json({"rows": rowdicts(self.db.verification_rows(page_size, offset)), "page": page, "page_size": page_size, "total": self.db.file_count()})
         elif parsed.path == "/api/log":
             levels = query.get("level", [])
             if not levels and query.get("levels"):
@@ -85,7 +114,7 @@ class Handler(BaseHTTPRequestHandler):
             rows = [self.queue_row_payload(row) for row in self.db.list_queue(status=status, limit=page_size, offset=offset)]
             self.send_json({"rows": rows, "page": page, "page_size": page_size, "total": self.db.queue_count(status=status)})
         elif parsed.path == "/api/tasks":
-            self.send_json(self.monitor.tasks() + self.backup_monitor.tasks())
+            self.send_json(self.monitor.tasks() + self.backup_monitor.tasks() + self.verification_monitor.tasks())
         elif parsed.path == "/api/settings":
             self.send_json(self.config.public_dict())
         else:
@@ -110,12 +139,22 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/files/priority":
                 self.db.boost_queue_priority(int(data["file_id"]), amount=int(data.get("amount", 10)))
                 self.send_json({"ok": True})
+            elif parsed.path == "/api/files/priority-many":
+                changed = 0
+                for file_id in data.get("file_ids", []):
+                    self.db.boost_queue_priority(int(file_id), amount=int(data.get("amount", 10)))
+                    changed += 1
+                self.send_json({"ok": True, "changed": changed})
             elif parsed.path == "/api/folders/priority":
                 self.send_json({"changed": self.db.boost_folder_priority(data["path"], amount=int(data.get("amount", 10)))})
             elif parsed.path == "/api/post-next":
                 self.send_json({"file_id": self.backup_monitor.post_once()})
             elif parsed.path == "/api/verify":
-                self.send_json({"verified": verify_due_chunks(self.db, self.config, force=bool(data.get("force")))})
+                self.send_json({"verified": self.verification_monitor.verify_once(force=bool(data.get("force")))})
+            elif parsed.path == "/api/cloud-backup":
+                results = backup_config_and_database(self.db, self.config)
+                self.db.log("info", "cloud.backup", f"Backed up config/database to {len(results)} cloud targets")
+                self.send_json({"ok": True, "results": results})
             elif parsed.path == "/api/restore":
                 if data.get("folder"):
                     self.send_json({"restored": restore_folder(self.db, self.config, data["path"], data.get("dest"))})
@@ -154,7 +193,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 token = self.db.change_token()
-                token["task_revision"] = sum(int(task.get("revision", 0)) for task in self.monitor.tasks() + self.backup_monitor.tasks())
+                token["task_revision"] = sum(int(task.get("revision", 0)) for task in self.monitor.tasks() + self.backup_monitor.tasks() + self.verification_monitor.tasks())
                 payload = json.dumps(token, default=str)
                 if payload != last_payload:
                     self.wfile.write(f"event: change\ndata: {payload}\n\n".encode("utf-8"))
@@ -171,8 +210,10 @@ def run_web(config: Config, db: Database, host: str, port: int) -> None:
     Handler.db = db
     Handler.monitor = CatalogMonitor(db, config)
     Handler.backup_monitor = BackupMonitor(db, config)
+    Handler.verification_monitor = VerificationMonitor(db, config)
     Handler.monitor.start()
     Handler.backup_monitor.start()
+    Handler.verification_monitor.start()
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Backuprr {__version__} listening on http://{host}:{port}")
     try:
@@ -180,6 +221,7 @@ def run_web(config: Config, db: Database, host: str, port: int) -> None:
     finally:
         Handler.monitor.stop()
         Handler.backup_monitor.stop()
+        Handler.verification_monitor.stop()
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -197,6 +239,7 @@ header strong { font-size:18px; }
 nav { width:220px; padding:14px; border-right:1px solid var(--line); background:#fff; min-height:calc(100vh - 56px); }
 nav button { width:100%; display:flex; align-items:center; gap:8px; margin:3px 0; padding:9px 10px; border:0; background:transparent; color:var(--ink); text-align:left; border-radius:6px; cursor:pointer; }
 nav button.active, nav button:hover { background:#e8f3f1; }
+.nav-icon, .ui-icon { width:1.2em; display:inline-grid; place-items:center; flex:0 0 auto; }
 main { display:flex; }
 section { flex:1; padding:18px; min-width:0; }
 .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
@@ -219,6 +262,14 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .task-card h3 { margin:0; font-size:14px; }
 .badge { display:inline-flex; align-items:center; width:max-content; padding:3px 7px; border-radius:999px; background:#e8f3f1; color:var(--accent); font-size:12px; font-weight:700; }
 .badge.running { background:#fff7ed; color:var(--warn); }
+.pill { display:inline-flex; align-items:center; gap:5px; width:max-content; max-width:100%; padding:3px 7px; border-radius:999px; background:#edf1f2; color:var(--muted); font-size:12px; font-weight:700; }
+.pill.ok { background:#e8f3f1; color:var(--accent); }
+.pill.warn { background:#fff7ed; color:var(--warn); }
+.pill.bad { background:#fef2f2; color:var(--bad); }
+.pill.info { background:#eff6ff; color:#1d4ed8; }
+.pill.debug { background:#f5f3ff; color:#6d28d9; }
+.pill.verbose { background:#f8fafc; color:var(--muted); }
+.stat span, .section-title, .chart-card h3, .task-card h3 { display:flex; align-items:center; gap:6px; }
 .chart-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
 .chart-card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px; }
 .chart-card h3 { margin:0 0 10px; font-size:14px; }
@@ -241,6 +292,9 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .host-row { border:1px solid var(--line); background:#fff; border-radius:8px; padding:12px; }
 .host-row h3 { margin:0 0 10px; font-size:14px; }
 .host-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
+.tabs { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
+.tab-panel { display:none; }
+.tab-panel.active { display:block; }
 .danger { color:var(--bad); }
 .tree { background:#fff; border:1px solid var(--line); border-radius:8px; padding:8px; }
 .tree ul { list-style:none; margin:0; padding-left:20px; }
@@ -265,7 +319,7 @@ pre { white-space:pre-wrap; background:#fff; border:1px solid var(--line); paddi
 <section id="content"></section>
 </main>
 <script>
-const pages = ["Status","Files","Search","Log","Queue","Tasks","Restore","Settings","About"];
+const pages = ["Status","Files","Search","Log","Queue","Tasks","Verification","Statistics","Restore","Settings","About"];
 let page = "Status";
 let settingsCache = null;
 let fileRowsCache = [];
@@ -277,7 +331,11 @@ let eventSource = null;
 let lastChangeToken = null;
 let activeQueuePage = 1;
 let completedQueuePage = 1;
+let filesPage = 1;
+let verificationPage = 1;
+let selectedFiles = new Set();
 const queuePageSize = 10;
+const filesPageSize = 100;
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
@@ -285,13 +343,54 @@ function jsString(v){ return JSON.stringify(String(v ?? "")).replace(/</g, "\\u0
 function table(rows, cols){
  if(!rows.length) return "<p class='muted'>No rows.</p>";
  return `<table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>`+
- rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(formatCell(c, r[c]))}</td>`).join("")}</tr>`).join("")+"</tbody></table>";
+ rows.map(r=>`<tr>${cols.map(c=>`<td>${formatCellHtml(c, r[c], r)}</td>`).join("")}</tr>`).join("")+"</tbody></table>";
 }
 function formatCell(col, value){
  return ["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total"].includes(col) ? formatBytes(value) : value;
 }
+function formatCellHtml(col, value, row={}){
+ if(["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total"].includes(col)) return esc(formatBytes(value));
+ if(["ts","created_at","updated_at","last_backup_at","last_verify_at","last_chunk_verify_at","posted_at","verified_at","last_run"].includes(col)) return esc(formatDateTime(value));
+ if(["state","status"].includes(col)) return statePill(value);
+ if(col === "level") return levelPill(value);
+ if(col === "kind") return iconText(kindIcon(value), value);
+ if(col === "progress") return iconText(iconForProgress(row.progress_percent), value);
+ if(col === "last_error" && value) return iconText("&#9888;", value, "error");
+ return esc(value);
+}
+function iconText(icon, text, cls=""){
+ return `<span class="${cls}"><span class="ui-icon">${icon}</span>${esc(text)}</span>`;
+}
+function pageIcon(name){
+ return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Restore:"&#8635;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
+}
+function stateIcon(value){
+ return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;"}[String(value || "")] || "&#8226;");
+}
+function stateTone(value){
+ return ({backed_up:"ok",done:"ok",restored:"ok",queued:"warn",posting:"warn",running:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad"}[String(value || "")] || "");
+}
+function statePill(value){
+ const tone = stateTone(value);
+ return `<span class="pill ${tone}"><span class="ui-icon">${stateIcon(value)}</span>${esc(value || "-")}</span>`;
+}
+function levelPill(value){
+ const key = String(value || "");
+ const tone = ({error:"bad",warning:"warn",info:"info",debug:"debug",verbose:"verbose"}[key] || "");
+ const icon = ({error:"&#10060;",warning:"&#9888;",info:"&#8505;",debug:"&#128027;",verbose:"&#128269;"}[key] || "&#8226;");
+ return `<span class="pill ${tone}"><span class="ui-icon">${icon}</span>${esc(value || "-")}</span>`;
+}
+function kindIcon(value){
+ return ({catalog:"&#128193;",backup:"&#128230;",verification:"&#10003;"}[String(value || "")] || "&#9881;");
+}
+function iconForProgress(value){
+ const pct = Number(value || 0);
+ if(pct >= 100) return "&#10003;";
+ if(pct > 0) return "&#9658;";
+ return "&#9711;";
+}
 function nav(){
- document.getElementById("nav").innerHTML = pages.map(p=>`<button class="${p===page?"active":""}" onclick="page='${p}';render()"> ${p}</button>`).join("");
+ document.getElementById("nav").innerHTML = pages.map(p=>`<button class="${p===page?"active":""}" onclick="page='${p}';render()"><span class="nav-icon">${pageIcon(p)}</span>${p}</button>`).join("");
 }
 function connectChanges(){
  if(eventSource) return;
@@ -305,7 +404,7 @@ function connectChanges(){
  eventSource.onerror = () => { document.querySelectorAll(".push-state").forEach(el => el.textContent = "Waiting for change stream"); };
 }
 function pushLabel(){
- return `<span class="muted push-note push-state">Live updates on change</span>`;
+ return `<span class="muted push-note push-state"><span class="ui-icon">&#128225;</span>Live updates on change</span>`;
 }
 async function render(){
  nav();
@@ -316,37 +415,53 @@ async function render(){
   await updateStatusPage();
  }
  if(page==="Files"){
-  c.innerHTML = `<div class="toolbar"><button onclick="updateFilesPage()">&#8635;</button><label><input id="showDeletedFiles" type="checkbox" onchange="updateFilesPage()"> Show deleted</label>${pushLabel()}</div><div id="filesTree"></div>`;
+  c.innerHTML = `<div class="toolbar">
+   <input id="filesSearch" placeholder="Search files" oninput="filesPage=1;updateFilesPage()">
+   <label><input id="showUnbackedOnly" type="checkbox" onchange="filesPage=1;updateFilesPage()"> <span class="ui-icon">&#9888;</span>Only unbacked</label>
+   <label><input id="showDeletedFiles" type="checkbox" onchange="filesPage=1;updateFilesPage()"> <span class="ui-icon">&#128465;</span>Show deleted</label>
+   <label><input id="selectAllFiles" type="checkbox" onchange="toggleSelectAllFiles(this.checked)"> Select page</label>
+   <button onclick="boostSelectedFiles()"><span class="ui-icon">&#8593;</span>Bump selected</button>
+   <button onclick="restoreSelectedFiles()"><span class="ui-icon">&#8635;</span>Restore selected</button>
+   ${pushLabel()}
+  </div><div id="filesTree"></div>`;
   await updateFilesPage();
  }
  if(page==="Search"){
-  c.innerHTML = `<div class="toolbar"><input id="q" placeholder="Search files"><button onclick="search()">Search</button></div><div id="results"></div>`;
+  c.innerHTML = `<div class="toolbar"><input id="q" placeholder="Search files"><button onclick="search()"><span class="ui-icon">&#128269;</span>Search</button></div><div id="results"></div>`;
  }
  if(page==="Log"){
   const eventTypes = await api("/api/log/event-types");
   const levels = ["error","warning","info","debug","verbose"];
   c.innerHTML = `<div class="toolbar">
-   ${levels.map(level=>`<label><input class="logLevel" type="checkbox" value="${level}" ${logLevelSelection.includes(level) ? "checked" : ""}> ${level}</label>`).join("")}
+   ${levels.map(level=>`<label><input class="logLevel" type="checkbox" value="${level}" ${logLevelSelection.includes(level) ? "checked" : ""}> ${levelPill(level)}</label>`).join("")}
    <select id="logEventType"><option value="">All event types</option>${eventTypes.map(type=>`<option value="${esc(type)}" ${logEventTypeSelection.includes(type) ? "selected" : ""}>${esc(type)}</option>`).join("")}</select>
    <label><input id="hideWebAccess" type="checkbox" ${logExcludeWebAccess ? "checked" : ""}> Hide web.access</label>
    <select id="logLimit"><option ${logLimitSelection==="100"?"selected":""}>100</option><option ${logLimitSelection==="300"?"selected":""}>300</option><option ${logLimitSelection==="1000"?"selected":""}>1000</option></select>
-   <button onclick="loadLog()">Apply</button>${pushLabel()}
+   <button onclick="loadLog()"><span class="ui-icon">&#128269;</span>Apply</button>${pushLabel()}
   </div><div id="logRows"></div>`;
   await updateLogPage();
  }
  if(page==="Queue"){
-  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(updateQueuePage)">Apply filter</button><button class="primary" onclick="post('/api/post-next').then(updateQueuePage)">Post next</button>${pushLabel()}</div><h2 class="section-title">Active</h2><div id="activeQueueRows"></div><h2 class="section-title">Completed</h2><div id="completedQueueRows"></div>`;
+  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(updateQueuePage)"><span class="ui-icon">&#8593;</span>Apply filter</button><button class="primary" onclick="post('/api/post-next').then(updateQueuePage)"><span class="ui-icon">&#9658;</span>Post next</button>${pushLabel()}</div><h2 class="section-title"><span class="ui-icon">&#9658;</span>Active</h2><div id="activeQueueRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Completed</h2><div id="completedQueueRows"></div>`;
   await updateQueuePage();
  }
  if(page==="Tasks"){
-  c.innerHTML = `<div class="toolbar"><button onclick="updateTasksPage()">Refresh</button><button class="primary" onclick="post('/api/scan').then(updateTasksPage)">Run catalog scan</button>${pushLabel()}</div><div id="taskRows"></div>`;
+  c.innerHTML = `<div class="toolbar"><button class="primary" onclick="post('/api/scan').then(updateTasksPage)"><span class="ui-icon">&#128193;</span>Run catalog scan</button>${pushLabel()}</div><div id="taskRows"></div>`;
   await updateTasksPage();
  }
+ if(page==="Verification"){
+  c.innerHTML = `<div class="toolbar"><button class="primary" onclick="post('/api/verify',{force:true}).then(updateVerificationPage)"><span class="ui-icon">&#10003;</span>Verify now</button>${pushLabel()}</div><div id="verificationRows"></div>`;
+  await updateVerificationPage();
+ }
+ if(page==="Statistics"){
+  c.innerHTML = `<div id="statisticsPanel"></div>`;
+  await updateStatisticsPage();
+ }
  if(page==="Restore"){
-  c.innerHTML = `<div class="toolbar"><input id="restorePath" placeholder="File or folder path"><input id="restoreDest" placeholder="Optional destination"><label><input id="restoreFolder" type="checkbox"> Folder</label><button class="primary" onclick="restore()">Restore</button></div><pre id="restoreOut"></pre>`;
+  c.innerHTML = `<div class="toolbar"><input id="restorePath" placeholder="File or folder path"><input id="restoreDest" placeholder="Optional destination"><label><input id="restoreFolder" type="checkbox"> <span class="ui-icon">&#128193;</span>Folder</label><button class="primary" onclick="restore()"><span class="ui-icon">&#8635;</span>Restore</button></div><pre id="restoreOut"></pre>`;
  }
  if(page==="Settings"){ settingsCache = await api("/api/settings"); c.innerHTML = settingsForm(settingsCache); }
- if(page==="About"){ c.innerHTML = `<h1>Backuprr</h1><p>Version <span id="aboutVersion"></span></p><p>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
+ if(page==="About"){ c.innerHTML = `<h1><span class="ui-icon">&#128230;</span>Backuprr</h1><p><span class="ui-icon">&#128278;</span>Version <span id="aboutVersion"></span></p><p><span class="ui-icon">&#128274;</span>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
 }
 async function refreshPageForChanges(previous, token){
  const filesChanged = previous.files_updated !== token.files_updated || previous.files_total !== token.files_total;
@@ -359,6 +474,8 @@ async function refreshPageForChanges(previous, token){
  if(page==="Log" && eventsChanged) await updateLogPage(false);
  if(page==="Queue" && (queueChanged || filesChanged)) await updateQueuePage();
  if(page==="Tasks" && (eventsChanged || tasksChanged)) await updateTasksPage();
+ if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged)) await updateVerificationPage();
+ if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged)) await updateStatisticsPage();
  document.querySelectorAll(".push-state").forEach(el => el.textContent = "Updated after change");
 }
 async function updateStatusPage(){
@@ -371,11 +488,14 @@ async function updateStatusPage(){
 }
 async function updateFilesPage(){
  const openFolders = new Set(Array.from(document.querySelectorAll("#filesTree details[data-path][open]")).map(item => item.dataset.path));
- fileRowsCache = await api("/api/files?limit=5000");
  const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
+ const unbacked = !!document.getElementById("showUnbackedOnly")?.checked;
+ const q = document.getElementById("filesSearch")?.value || "";
+ const result = await api(`/api/files?page=${filesPage}&page_size=${filesPageSize}&include_deleted=${showDeleted ? 1 : 0}&unbacked=${unbacked ? 1 : 0}&q=${encodeURIComponent(q)}`);
+ fileRowsCache = result.rows || [];
  const target = document.getElementById("filesTree");
  if(target){
-  target.innerHTML = fileTree(fileRowsCache, showDeleted);
+  target.innerHTML = fileTree(fileRowsCache, showDeleted) + paginationControls(result, "filesPage", "updateFilesPage");
   target.querySelectorAll("details[data-path]").forEach(details => {
    if(openFolders.has(details.dataset.path)) details.open = true;
   });
@@ -399,6 +519,22 @@ async function updateTasksPage(){
  const target = document.getElementById("taskRows");
  if(target) target.innerHTML = table(rows, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"]);
 }
+async function updateVerificationPage(){
+ const result = await api(`/api/verification?page=${verificationPage}&page_size=25`);
+ const target = document.getElementById("verificationRows");
+ if(target) target.innerHTML = table(result.rows || [], ["id","relative_path","state","chunk_count","verified_chunks","missing_chunks","last_verify_at","last_chunk_verify_at"]) + paginationControls(result, "verificationPage", "updateVerificationPage");
+}
+async function updateStatisticsPage(){
+ const data = await api("/api/statistics");
+ if(!settingsCache) settingsCache = await api("/api/settings");
+ const target = document.getElementById("statisticsPanel");
+ if(target) target.innerHTML = statisticsDashboard(data);
+}
+function paginationControls(result, pageVar, updateFn){
+ const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || 1)));
+ const pageNo = Number(result.page || 1);
+ return `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);${updateFn}()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${Number(result.total || 0)} rows</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;${updateFn}()">Next</button></div>`;
+}
 function statusDashboard(status, tasks, speed){
  const stats = status.stats || {};
  const total = Number(stats.files_total || 0);
@@ -407,6 +543,8 @@ function statusDashboard(status, tasks, speed){
  const posting = Number(stats.files_posting || 0);
  const deleted = Number(stats.files_deleted || 0);
  const chunks = Number(stats.chunks_total || 0);
+ const verifiedChunks = Number(stats.chunks_verified || 0);
+ const missingChunks = Number(stats.chunks_missing || 0);
  const totalBytes = Number(stats.files_bytes_total || 0);
  const backedBytes = Number(stats.files_bytes_backed_up || 0);
  const queuedBytes = Number(stats.files_bytes_queued || 0);
@@ -421,22 +559,24 @@ function statusDashboard(status, tasks, speed){
   .filter(task => task.status !== "running" && task.time_until_next_run)
   .sort((a,b) => secondsFromLabel(a.time_until_next_run) - secondsFromLabel(b.time_until_next_run))[0];
  return `<div class="dashboard">
-  <div class="toolbar"><button class="primary" onclick="post('/api/scan').then(updateStatusPage)">&#8635; Scan now</button><button onclick="post('/api/queue/enqueue-unbacked').then(updateStatusPage)">&#10133; Queue unbacked</button><button onclick="post('/api/verify',{force:true}).then(updateStatusPage)">&#10003; Verify chunks</button>${pushLabel()}</div>
+  <div class="toolbar"><button class="primary" onclick="post('/api/scan').then(updateStatusPage)"><span class="ui-icon">&#128193;</span>Scan now</button><button onclick="post('/api/queue/enqueue-unbacked').then(updateStatusPage)"><span class="ui-icon">&#10133;</span>Queue unbacked</button><button onclick="post('/api/verify',{force:true}).then(updateStatusPage)"><span class="ui-icon">&#10003;</span>Verify chunks</button>${pushLabel()}</div>
   <div class="hero-status">
-   <h2>${esc(activeTask ? `${activeTask.name} is running` : "Backuprr is standing by")}</h2>
+   <h2><span class="ui-icon">${activeTask ? "&#9658;" : "&#10003;"}</span>${esc(activeTask ? `${activeTask.name} is running` : "Backuprr is standing by")}</h2>
    <div class="muted">${esc(activeTask ? activeTask.last_result || "Working through the current task" : nextTask ? `Next: ${nextTask.name} in ${nextTask.time_until_next_run}` : "No scheduled task time reported")}</div>
    <div class="progress-track"><div class="progress-fill" style="width:${protectedPct}%"></div></div>
    <div>${protectedPct}% backed up &middot; ${backed} of ${total} files protected (${formatBytes(backedBytes)} of ${formatBytes(totalBytes)}) &middot; ${queued + posting} waiting or posting (${formatBytes(queuedBytes + postingBytes)}) &middot; ${chunks} chunks posted (${formatBytes(chunkBytes)})</div>
   </div>
   <div class="task-strip">${tasks.map(taskCard).join("")}</div>
   <div class="stats">
-   ${statCard("Files", total)}
-   ${statCard("Data", formatBytes(totalBytes))}
-   ${statCard("Backed up", `${backed} / ${formatBytes(backedBytes)}`)}
-   ${statCard("Queued", `${queued} / ${formatBytes(queuedBytes)}`)}
-   ${statCard("Posting", `${posting} / ${formatBytes(postingBytes)}`)}
-   ${statCard("Deleted", deleted)}
-   ${statCard("Chunks", chunks)}
+   ${statCard("Files", total, "&#128196;")}
+   ${statCard("Data", formatBytes(totalBytes), "&#128190;")}
+   ${statCard("Backed up", `${backed} / ${formatBytes(backedBytes)}`, "&#10003;")}
+   ${statCard("Queued", `${queued} / ${formatBytes(queuedBytes)}`, "&#9203;")}
+   ${statCard("Posting", `${posting} / ${formatBytes(postingBytes)}`, "&#9658;")}
+   ${statCard("Deleted", deleted, "&#128465;")}
+   ${statCard("Chunks", chunks, "&#129513;")}
+   ${statCard("Verified chunks", verifiedChunks, "&#10003;")}
+   ${statCard("Missing chunks", missingChunks, "&#9888;")}
   </div>
   <div class="chart-grid">
    ${speedChart("Transfer speed", speed || [])}
@@ -452,29 +592,59 @@ function statusDashboard(status, tasks, speed){
     ["queued", queuedQueue, "warn"],
     ["posting", postingQueue, "warn"]
    ])}
+   ${barChart("Verification", [
+    ["verified", verifiedChunks, "ok"],
+    ["missing", missingChunks, "bad"],
+    ["unchecked", Math.max(0, chunks - verifiedChunks - missingChunks), "warn"]
+   ])}
   </div>
  </div>`;
 }
-function statCard(label, value){
- return `<div class="stat"><span>${esc(label)}</span><b>${esc(value)}</b></div>`;
+function statCard(label, value, icon="&#8226;"){
+ return `<div class="stat"><span><span class="ui-icon">${icon}</span>${esc(label)}</span><b>${esc(value)}</b></div>`;
 }
 function taskCard(task){
  const running = task.status === "running";
  return `<div class="task-card">
-  <h3>${esc(task.name)}</h3>
-  <span class="badge ${running ? "running" : ""}">${esc(task.status)}</span>
-  <div class="muted">Last run: ${esc(task.last_run || "not yet")}</div>
-  <div>Duration: ${esc(task.last_run_duration || "-")}</div>
-  <div>Next run: ${esc(task.time_until_next_run || "-")}</div>
+  <h3><span class="ui-icon">${kindIcon(task.kind)}</span>${esc(task.name)}</h3>
+  <span class="badge ${running ? "running" : ""}"><span class="ui-icon">${stateIcon(task.status)}</span>${esc(task.status)}</span>
+  <div class="muted"><span class="ui-icon">&#9201;</span>Last run: ${esc(formatDateTime(task.last_run) || "not yet")}</div>
+  <div><span class="ui-icon">&#9201;</span>Duration: ${esc(task.last_run_duration || "-")}</div>
+  <div><span class="ui-icon">&#9202;</span>Next run: ${esc(task.time_until_next_run || "-")}</div>
   <div class="${task.last_error ? "error" : "muted"}">${esc(task.last_error || task.last_result || "")}</div>
  </div>`;
 }
 function barChart(title, rows){
  const max = Math.max(1, ...rows.map(row => Number(row[1] || 0)));
- return `<div class="chart-card"><h3>${esc(title)}</h3>${rows.map(([label, value, tone]) => {
+ return `<div class="chart-card"><h3><span class="ui-icon">${title === "Queue" ? "&#128230;" : "&#128202;"}</span>${esc(title)}</h3>${rows.map(([label, value, tone]) => {
   const width = Math.max(0, Math.round((Number(value || 0) / max) * 100));
-  return `<div class="bar-row"><span>${esc(label)}</span><div class="bar-track"><div class="bar-fill ${tone === "bad" ? "bad" : tone === "warn" ? "warn" : ""}" style="width:${width}%"></div></div><b>${esc(value)}</b></div>`;
+  return `<div class="bar-row"><span><span class="ui-icon">${stateIcon(label.replace(" ", "_"))}</span>${esc(label)}</span><div class="bar-track"><div class="bar-fill ${tone === "bad" ? "bad" : tone === "warn" ? "warn" : ""}" style="width:${width}%"></div></div><b>${esc(value)}</b></div>`;
  }).join("")}</div>`;
+}
+function statisticsDashboard(data){
+ const stats = data.stats || {};
+ const tasks = data.tasks || [];
+ const speed = data.speed || [];
+ const events = data.events || [];
+ const eventCounts = {};
+ for(const event of events){ eventCounts[event.event_type] = (eventCounts[event.event_type] || 0) + 1; }
+ const eventRows = Object.entries(eventCounts).sort((a,b)=>b[1]-a[1]).slice(0, 10).map(([label, value]) => [label, value, "ok"]);
+ return `<div class="dashboard">
+  <div class="stats">
+   ${statCard("Active files", Number(stats.files_total || 0), "&#128196;")}
+   ${statCard("All records", Number(stats.files_all_total || 0), "&#128452;")}
+   ${statCard("Data cataloged", formatBytes(stats.files_bytes_total || 0), "&#128190;")}
+   ${statCard("Chunks", Number(stats.chunks_total || 0), "&#129513;")}
+   ${statCard("NNTP threads", settingsCache?.nntp_threads || "-", "&#128225;")}
+  </div>
+  <div class="chart-grid">
+   ${speedChart("Two hour transfer speed", speed)}
+   ${barChart("Engine tasks", tasks.map(task => [task.name, task.runs || 0, task.status === "running" ? "warn" : "ok"]))}
+   ${barChart("Recent event types", eventRows.length ? eventRows : [["none", 0, "ok"]])}
+  </div>
+  <h2 class="section-title"><span class="ui-icon">&#9881;</span>Workers</h2>
+  ${table(tasks, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"])}
+ </div>`;
 }
 function speedChart(title, rows){
  const width = 520, height = 170, pad = 28;
@@ -485,10 +655,16 @@ function speedChart(title, rows){
   return `${x.toFixed(1)},${y.toFixed(1)}`;
  }).join(" ");
  const latest = rows[rows.length - 1] || {};
- return `<div class="chart-card"><h3>${esc(title)}</h3>
+ const maxLabel = formatBytes(max) + "/s";
+ return `<div class="chart-card"><h3><span class="ui-icon">&#128200;</span>${esc(title)}</h3>
   <svg viewBox="0 0 ${width} ${height}" width="100%" height="180" role="img" aria-label="Transfer speed over time">
    <line x1="${pad}" y1="${height-pad}" x2="${width-pad}" y2="${height-pad}" stroke="#d8dee4"/>
    <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height-pad}" stroke="#d8dee4"/>
+   <text x="${pad + 4}" y="${pad - 7}" font-size="11" fill="#64717b">${esc(maxLabel)}</text>
+   <text x="${pad}" y="${height - 4}" font-size="11" fill="#64717b">30 min ago</text>
+   <text x="${width - pad - 22}" y="${height - 4}" font-size="11" fill="#64717b">now</text>
+   <text x="${width - pad - 112}" y="${pad + 12}" font-size="11" fill="#0f766e">upload</text>
+   <text x="${width - pad - 62}" y="${pad + 12}" font-size="11" fill="#b45309">download</text>
    <polyline points="${points("upload_bps")}" fill="none" stroke="#0f766e" stroke-width="3"/>
    <polyline points="${points("download_bps")}" fill="none" stroke="#b45309" stroke-width="3"/>
   </svg>
@@ -501,6 +677,12 @@ function formatBytes(value){
  let index = 0;
  while(size >= 1024 && index < units.length - 1){ size /= 1024; index++; }
  return `${size.toFixed(index ? 1 : 0)} ${units[index]}`;
+}
+function formatDateTime(value){
+ if(!value) return "";
+ const date = new Date(value);
+ if(Number.isNaN(date.getTime())) return value;
+ return new Intl.DateTimeFormat(undefined, { dateStyle:"medium", timeStyle:"medium" }).format(date);
 }
 function secondsFromLabel(label){
  const text = String(label || "");
@@ -540,7 +722,9 @@ function treeNode(node, prefix, showDeleted){
  const dirs = Object.keys(node.dirs).sort((a,b)=>a.localeCompare(b));
  const dirHtml = dirs.map(name => {
   const path = prefix ? prefix+"/"+name : name;
-  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span class="tree-meta">${countFiles(node.dirs[name])} files &middot; ${formatBytes(node.dirs[name].total_size || 0)}</span><button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button><button class="icon-btn" title="Restore folder" onclick="event.preventDefault();restoreCatalogFolder(${jsString(path)})">&#8635;</button></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
+  const state = folderState(node.dirs[name]);
+  const canRestore = folderChunkCount(node.dirs[name]) > 0;
+  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row"><span>&#128193;</span><span class="tree-name">${esc(name)}</span>${statePill(state)}<span class="tree-meta">${countFiles(node.dirs[name])} files &middot; ${formatBytes(node.dirs[name].total_size || 0)}</span><button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button>${canRestore ? `<button class="icon-btn" title="Restore folder" onclick="event.preventDefault();restoreCatalogFolder(${jsString(path)})">&#8635;</button>` : ""}</summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
  }).join("");
  const fileHtml = node.files.sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name))).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
@@ -548,18 +732,46 @@ function treeNode(node, prefix, showDeleted){
 function countFiles(node){
  return node.files.length + Object.values(node.dirs).reduce((total, child) => total + countFiles(child), 0);
 }
+function folderChunkCount(node){
+ return node.files.reduce((total, file) => total + Number(file.chunk_count || 0), 0) + Object.values(node.dirs).reduce((total, child) => total + folderChunkCount(child), 0);
+}
+function folderState(node){
+ const files = collectNodeFiles(node).filter(file => file.state !== "deleted");
+ if(!files.length) return "empty";
+ if(files.every(file => file.state === "backed_up")) return "backed_up";
+ if(files.some(file => ["failed","missing_chunks"].includes(file.state))) return "missing_chunks";
+ if(files.some(file => ["queued","posting"].includes(file.state))) return "queued";
+ return "discovered";
+}
+function collectNodeFiles(node){
+ return node.files.concat(...Object.values(node.dirs).map(child => collectNodeFiles(child)));
+}
 function fileRow(file){
- const stateClass = file.state === "deleted" ? "error" : "muted";
  const canQueue = !["backed_up", "deleted", "posting", "queued"].includes(file.state);
+ const hasChunks = Number(file.chunk_count || 0) > 0;
+ const checked = selectedFiles.has(Number(file.id)) ? "checked" : "";
  return `<li><div class="tree-row">
+  <input type="checkbox" class="fileSelect" value="${Number(file.id)}" ${checked} onchange="setFileSelected(${Number(file.id)}, this.checked)">
   <span>&#128196;</span>
   <span class="tree-name">${esc(file.display_name)}</span>
   <span class="tree-meta">${formatBytes(file.size)}</span>
-  <span class="tree-meta ${stateClass}">${esc(file.state)}</span>
+  ${statePill(file.state)}
+  <span class="tree-meta">${Number(file.chunk_count || 0)} chunks${file.last_verify_at ? ` &middot; verified ${esc(formatDateTime(file.last_verify_at))}` : ""}</span>
   ${canQueue ? `<button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>` : ""}
   ${file.state !== "backed_up" && file.state !== "deleted" ? `<button class="icon-btn" title="Increase queue priority" onclick="boostFile(${Number(file.id)})">&#8593;</button>` : ""}
-  <button class="icon-btn" title="Restore file" onclick="restoreCatalogFile(${Number(file.id)})">&#8635;</button>
+  ${hasChunks ? `<button class="icon-btn" title="Restore file" onclick="restoreCatalogFile(${Number(file.id)})">&#8635;</button>` : ""}
  </div></li>`;
+}
+function setFileSelected(fileId, checked){
+ if(checked) selectedFiles.add(Number(fileId));
+ else selectedFiles.delete(Number(fileId));
+}
+function toggleSelectAllFiles(checked){
+ for(const row of fileRowsCache){
+  if(checked) selectedFiles.add(Number(row.id));
+  else selectedFiles.delete(Number(row.id));
+ }
+ updateFilesPage();
 }
 async function queueFile(fileId){
  const out = await post("/api/files/queue", { file_id:fileId });
@@ -576,6 +788,25 @@ async function boostFolder(path){
  if(out.error) alert(out.error);
  await updateFilesPage();
 }
+async function boostSelectedFiles(){
+ const ids = Array.from(selectedFiles);
+ if(!ids.length) return alert("Select files first");
+ const out = await post("/api/files/priority-many", { file_ids:ids, amount:10 });
+ if(out.error) alert(out.error);
+ await updateFilesPage();
+}
+async function restoreSelectedFiles(){
+ const selectedRows = fileRowsCache.filter(row => selectedFiles.has(Number(row.id)) && Number(row.chunk_count || 0) > 0);
+ if(!selectedRows.length) return alert("Select files with recorded chunks first");
+ const dest = prompt("Restore destination folder, blank for original locations", "");
+ let restored = 0;
+ for(const file of selectedRows){
+  const out = await post("/api/restore", { path:file.path, dest:dest || null });
+  if(out.error) return alert(out.error);
+  restored++;
+ }
+ alert(`Restored ${restored} files`);
+}
 async function restoreCatalogFile(fileId){
  const file = fileRowsCache.find(row => Number(row.id) === Number(fileId));
  if(!file) return;
@@ -591,38 +822,75 @@ async function restoreCatalogFolder(path){
 async function search(){ document.getElementById("results").innerHTML = table(await api("/api/search?q="+encodeURIComponent(document.getElementById("q").value)), ["id","relative_path","size","state","updated_at"]); }
 async function restore(){ const out = await post("/api/restore",{path:restorePath.value,dest:restoreDest.value,folder:restoreFolder.checked}); restoreOut.textContent = JSON.stringify(out,null,2); }
 function settingsForm(s){
- return `<div class="form-grid">
-  <label class="field"><span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
-  <label class="field"><span>Article size bytes</span><input id="setArticleSize" type="number" min="1" value="${esc(s.article_size)}"></label>
-  <label class="field"><span>Verify interval days</span><input id="setVerifyDays" type="number" min="1" value="${esc(s.verification_interval_days)}"></label>
-  <label class="field"><span>Catalog scan interval seconds</span><input id="setScanInterval" type="number" min="1" value="${esc(s.scan_interval_seconds || 300)}"></label>
-  <label class="field"><span>Backup task interval seconds</span><input id="setBackupInterval" type="number" min="1" value="${esc(s.backup_interval_seconds || 300)}"></label>
-  <label class="field"><span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
-  <label><input id="setZip" type="checkbox" ${s.zip_subfolders?"checked":""}> Zip subfolders</label>
-  <label><input id="setEncrypt" type="checkbox" ${s.encrypt_bodies?"checked":""}> Encrypt article bodies</label>
-  <label><input id="setPar2" type="checkbox" ${s.par2?.enabled?"checked":""}> Generate PAR2 recovery files</label>
-  <label class="field"><span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
-  <label class="field"><span>PAR2 redundancy percent</span><input id="setPar2Redundancy" type="number" min="0" value="${esc(s.par2?.redundancy_percent ?? 10)}"></label>
-  <label class="field full"><span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
-  <div class="field full"><span>Usenet hosts</span><div id="hostList" class="host-list">${hostRows(s.usenet_hosts || [])}</div></div>
+ return `<div class="tabs">
+  ${["General","Usenet","Protection","Schedules","Endpoints","Cloud"].map((name,index)=>`<button class="${index===0?"primary":""}" onclick="showSettingsTab('${name}', this)">${name}</button>`).join("")}
  </div>
- <div class="toolbar"><button onclick="addHost()">Add host</button><button class="primary" onclick="saveSettings()">Save settings</button><button onclick="render()">Reset</button></div>
+ <div id="tabGeneral" class="tab-panel active"><div class="form-grid">
+  <label class="field"><span><span class="ui-icon">&#128101;</span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
+  <label class="field"><span><span class="ui-icon">&#129513;</span>Article size bytes</span><input id="setArticleSize" type="number" min="1" value="${esc(s.article_size)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128225;</span>NNTP threads</span><input id="setNntpThreads" type="number" min="1" max="64" value="${esc(s.nntp_threads || 4)}"></label>
+ </div></div>
+ <div id="tabSchedules" class="tab-panel"><div class="form-grid">
+  <label class="field"><span><span class="ui-icon">&#10003;</span>Verify interval days</span><input id="setVerifyDays" type="number" min="1" value="${esc(s.verification_interval_days)}"></label>
+  <label class="field"><span><span class="ui-icon">&#10003;</span>Verification task interval seconds</span><input id="setVerifyTaskInterval" type="number" min="1" value="${esc(s.verification_task_interval_seconds || 3600)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128193;</span>Catalog scan interval seconds</span><input id="setScanInterval" type="number" min="1" value="${esc(s.scan_interval_seconds || 300)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128230;</span>Backup task interval seconds</span><input id="setBackupInterval" type="number" min="1" value="${esc(s.backup_interval_seconds || 300)}"></label>
+ </div></div>
+ <div id="tabProtection" class="tab-panel"><div class="form-grid">
+  <label class="field"><span><span class="ui-icon">&#128274;</span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
+  <label><input id="setZip" type="checkbox" ${s.zip_subfolders?"checked":""}> <span class="ui-icon">&#128451;</span>Zip subfolders</label>
+  <label><input id="setEncrypt" type="checkbox" ${s.encrypt_bodies?"checked":""}> <span class="ui-icon">&#128274;</span>Encrypt article bodies</label>
+  <label><input id="setPar2" type="checkbox" ${s.par2?.enabled?"checked":""}> <span class="ui-icon">&#128737;</span>Generate PAR2 recovery files</label>
+  <label class="field"><span><span class="ui-icon">&#9881;</span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
+  <label class="field"><span><span class="ui-icon">&#128737;</span>PAR2 redundancy percent</span><input id="setPar2Redundancy" type="number" min="0" value="${esc(s.par2?.redundancy_percent ?? 10)}"></label>
+ </div></div>
+ <div id="tabEndpoints" class="tab-panel"><div class="form-grid">
+  <label class="field full"><span><span class="ui-icon">&#128193;</span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
+ </div></div>
+ <div id="tabUsenet" class="tab-panel"><div class="form-grid">
+  <div class="field full"><span><span class="ui-icon">&#128225;</span>Usenet hosts</span><div id="hostList" class="host-list">${hostRows(s.usenet_hosts || [])}</div></div>
+ </div></div>
+ <div id="tabCloud" class="tab-panel"><div class="form-grid">
+  <div class="field full"><span><span class="ui-icon">&#9729;</span>Cloud backup targets</span><div id="cloudList" class="host-list">${cloudRows(s.cloud_backups || [])}</div></div>
+ </div></div>
+ <div class="toolbar"><button onclick="addHost()"><span class="ui-icon">&#10133;</span>Add host</button><button onclick="addCloudTarget()"><span class="ui-icon">&#10133;</span>Add cloud target</button><button onclick="post('/api/cloud-backup').then(out=>settingsOut.textContent=JSON.stringify(out,null,2))"><span class="ui-icon">&#9729;</span>Backup config/db now</button><button class="primary" onclick="saveSettings()"><span class="ui-icon">&#128190;</span>Save settings</button><button onclick="render()"><span class="ui-icon">&#8635;</span>Reset</button></div>
  <pre id="settingsOut"></pre>`;
+}
+function showSettingsTab(name, button){
+ document.querySelectorAll(".tab-panel").forEach(panel => panel.classList.remove("active"));
+ document.getElementById("tab"+name).classList.add("active");
+ document.querySelectorAll(".tabs button").forEach(tab => tab.classList.remove("primary"));
+ button.classList.add("primary");
 }
 function hostRows(hosts){
  return hosts.map((host, index) => hostRow(host, index)).join("") || hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"" }, 0);
 }
 function hostRow(host, index){
  return `<div class="host-row" data-host-index="${index}">
-  <div class="toolbar"><h3>Host ${index + 1}</h3><button class="danger" onclick="removeHost(this)">Remove</button></div>
+  <div class="toolbar"><h3><span class="ui-icon">&#128225;</span>Host ${index + 1}</h3><button class="danger" onclick="removeHost(this)"><span class="ui-icon">&#128465;</span>Remove</button></div>
   <div class="host-grid">
-   <label class="field"><span>Name</span><input class="hostName" value="${esc(host.name)}" placeholder="eweka-read"></label>
-   <label class="field"><span>Mode</span><select class="hostMode"><option value="read" ${host.mode==="read"?"selected":""}>read</option><option value="post" ${host.mode==="post"?"selected":""}>post</option></select></label>
-   <label class="field"><span>Server</span><input class="hostServer" value="${esc(host.host)}" placeholder="news.example.com"></label>
-   <label class="field"><span>Port</span><input class="hostPort" type="number" min="1" value="${esc(host.port || 563)}"></label>
-   <label class="field"><span>TLS mode</span><select class="hostTls"><option value="implicit" ${host.tls==="implicit"?"selected":""}>implicit</option><option value="starttls" ${host.tls==="starttls"?"selected":""}>starttls</option><option value="plain" ${host.tls==="plain"?"selected":""}>plain</option></select></label>
-   <label class="field"><span>Username</span><input class="hostUsername" value="${esc(host.username || "")}" autocomplete="off"></label>
-   <label class="field"><span>Password</span><input class="hostPassword" type="password" value="${esc(host.password || "")}" autocomplete="new-password" placeholder="leave blank to keep existing"></label>
+   <label class="field"><span><span class="ui-icon">&#128278;</span>Name</span><input class="hostName" value="${esc(host.name)}" placeholder="eweka-read"></label>
+   <label class="field"><span><span class="ui-icon">&#8644;</span>Mode</span><select class="hostMode"><option value="read" ${host.mode==="read"?"selected":""}>read</option><option value="post" ${host.mode==="post"?"selected":""}>post</option></select></label>
+   <label class="field"><span><span class="ui-icon">&#127760;</span>Server</span><input class="hostServer" value="${esc(host.host)}" placeholder="news.example.com"></label>
+   <label class="field"><span><span class="ui-icon">&#128279;</span>Port</span><input class="hostPort" type="number" min="1" value="${esc(host.port || 563)}"></label>
+   <label class="field"><span><span class="ui-icon">&#128274;</span>TLS mode</span><select class="hostTls"><option value="implicit" ${host.tls==="implicit"?"selected":""}>implicit</option><option value="starttls" ${host.tls==="starttls"?"selected":""}>starttls</option><option value="plain" ${host.tls==="plain"?"selected":""}>plain</option></select></label>
+   <label class="field"><span><span class="ui-icon">&#128100;</span>Username</span><input class="hostUsername" value="${esc(host.username || "")}" autocomplete="off"></label>
+   <label class="field"><span><span class="ui-icon">&#128273;</span>Password</span><input class="hostPassword" type="password" value="${esc(host.password || "")}" autocomplete="new-password" placeholder="leave blank to keep existing"></label>
+  </div>
+ </div>`;
+}
+function cloudRows(targets){
+ return targets.map((target, index) => cloudRow(target, index)).join("") || cloudRow({ name:"", provider:"local", target:"", command:"", enabled:true }, 0);
+}
+function cloudRow(target, index){
+ return `<div class="host-row cloud-row" data-cloud-index="${index}">
+  <div class="toolbar"><h3><span class="ui-icon">&#9729;</span>Cloud target ${index + 1}</h3><button class="danger" onclick="removeCloudTarget(this)"><span class="ui-icon">&#128465;</span>Remove</button></div>
+  <div class="host-grid">
+   <label><input class="cloudEnabled" type="checkbox" ${target.enabled === false ? "" : "checked"}> Enabled</label>
+   <label class="field"><span><span class="ui-icon">&#128278;</span>Name</span><input class="cloudName" value="${esc(target.name || "")}" placeholder="OneDrive sync"></label>
+   <label class="field"><span><span class="ui-icon">&#9729;</span>Provider</span><select class="cloudProvider"><option value="local" ${target.provider==="local"?"selected":""}>local/sync folder</option><option value="onedrive" ${target.provider==="onedrive"?"selected":""}>OneDrive folder</option><option value="google_drive" ${target.provider==="google_drive"?"selected":""}>Google Drive folder</option><option value="command" ${target.provider==="command"?"selected":""}>command</option></select></label>
+   <label class="field"><span><span class="ui-icon">&#128193;</span>Target path</span><input class="cloudTarget" value="${esc(target.target || "")}" placeholder="/mnt/cloud/backuprr"></label>
+   <label class="field full"><span><span class="ui-icon">&#9881;</span>Command</span><input class="cloudCommand" value="${esc(target.command || "")}" placeholder="rclone copy {archive} remote:backuprr"></label>
   </div>
  </div>`;
 }
@@ -631,6 +899,23 @@ function addHost(){
  const index = list.querySelectorAll(".host-row").length;
  list.insertAdjacentHTML("beforeend", hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"" }, index));
  renumberHosts();
+}
+function addCloudTarget(){
+ const list = document.getElementById("cloudList");
+ const index = list.querySelectorAll(".cloud-row").length;
+ list.insertAdjacentHTML("beforeend", cloudRow({ name:"", provider:"local", target:"", command:"", enabled:true }, index));
+ renumberCloudTargets();
+}
+function removeCloudTarget(button){
+ button.closest(".cloud-row").remove();
+ if(!document.querySelector(".cloud-row")) addCloudTarget();
+ renumberCloudTargets();
+}
+function renumberCloudTargets(){
+ document.querySelectorAll(".cloud-row").forEach((row, index) => {
+  row.dataset.cloudIndex = index;
+  row.querySelector("h3").textContent = `Cloud target ${index + 1}`;
+ });
 }
 function removeHost(button){
  button.closest(".host-row").remove();
@@ -654,18 +939,30 @@ function collectHosts(){
   password: row.querySelector(".hostPassword").value || null
  })).filter(host => host.name || host.host);
 }
+function collectCloudTargets(){
+ return Array.from(document.querySelectorAll(".cloud-row")).map(row => ({
+  name: row.querySelector(".cloudName").value.trim(),
+  provider: row.querySelector(".cloudProvider").value,
+  target: row.querySelector(".cloudTarget").value.trim(),
+  command: row.querySelector(".cloudCommand").value.trim(),
+  enabled: row.querySelector(".cloudEnabled").checked
+ })).filter(target => target.name || target.target || target.command);
+}
 async function saveSettings(){
  const payload = {
   newsgroup: setNewsgroup.value,
   article_size: Number(setArticleSize.value),
   verification_interval_days: Number(setVerifyDays.value),
+  verification_task_interval_seconds: Number(setVerifyTaskInterval.value),
   scan_interval_seconds: Number(setScanInterval.value),
   backup_interval_seconds: Number(setBackupInterval.value),
+  nntp_threads: Number(setNntpThreads.value),
   zip_subfolders: setZip.checked,
   encrypt_bodies: setEncrypt.checked,
   encryption_passphrase_env: setPassEnv.value,
   endpoints: setEndpoints.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   usenet_hosts: collectHosts(),
+  cloud_backups: collectCloudTargets(),
   par2: { enabled: setPar2.checked, command: setPar2Command.value, redundancy_percent: Number(setPar2Redundancy.value) }
  };
  const out = await post("/api/settings", payload);

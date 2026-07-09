@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from backuprr import __version__
 from backuprr.backup import decode_chunk, encode_chunk, post_next
+from backuprr.cloud_backup import backup_config_and_database
 from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
@@ -46,7 +47,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.6")
+        self.assertEqual(__version__, "0.2.8")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -58,6 +59,22 @@ class CoreTests(unittest.TestCase):
         stats = self.db.stats()
         self.assertEqual(stats["files_total"], 1)
         self.assertEqual(stats["queue_queued"], 1)
+
+    def test_stats_exclude_deleted_from_active_total(self):
+        media = self.root / "media"
+        media.mkdir()
+        deleted = media / "deleted.mkv"
+        active = media / "active.mkv"
+        deleted.write_bytes(b"deleted")
+        active.write_bytes(b"active")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        deleted.unlink()
+        scan_all(self.db)
+        stats = self.db.stats()
+        self.assertEqual(stats["files_total"], 1)
+        self.assertEqual(stats["files_all_total"], 2)
+        self.assertEqual(stats["files_deleted"], 1)
 
     def test_scan_updates_relative_path_for_moved_file(self):
         media = self.root / "media"
@@ -204,6 +221,26 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(queue_row["status"], "queued")
         self.assertEqual(queue_row["reason"], "missing-chunks")
 
+    def test_all_chunks_verified_updates_last_verify_at(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<one@example.test>", 3, "abc", "[one]")
+        self.db.add_chunk(file_id, 1, "<two@example.test>", 3, "def", "[two]")
+        with self.db.connect() as conn:
+            chunk_ids = [row["id"] for row in conn.execute("SELECT id FROM chunks ORDER BY id").fetchall()]
+        self.db.mark_chunk_verified(chunk_ids[0], exists=True)
+        with self.db.connect() as conn:
+            self.assertIsNone(conn.execute("SELECT last_verify_at FROM files WHERE id=?", (file_id,)).fetchone()["last_verify_at"])
+        self.db.mark_chunk_verified(chunk_ids[1], exists=True)
+        with self.db.connect() as conn:
+            self.assertIsNotNone(conn.execute("SELECT last_verify_at FROM files WHERE id=?", (file_id,)).fetchone()["last_verify_at"])
+
     def test_queue_hides_completed_backed_up_files_by_default(self):
         media = self.root / "media"
         media.mkdir()
@@ -347,8 +384,10 @@ class CoreTests(unittest.TestCase):
                 "article_size": 1024,
                 "newsgroup": "alt.binaries.example",
                 "verification_interval_days": 30,
+                "verification_task_interval_seconds": 45,
                 "scan_interval_seconds": 15,
                 "backup_interval_seconds": 20,
+                "nntp_threads": 6,
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
                 "encryption_passphrase_env": "BACKUPRR_SECRET",
@@ -365,13 +404,18 @@ class CoreTests(unittest.TestCase):
                     }
                 ],
                 "par2": {"enabled": True, "command": "par2", "redundancy_percent": 12},
+                "cloud_backups": [
+                    {"name": "local", "provider": "local", "target": str(self.root / "cloud"), "enabled": True}
+                ],
             },
         )
         self.assertEqual(self.config.article_size, 1024)
         self.assertEqual(self.config.newsgroup, "alt.binaries.example")
         self.assertEqual(self.config.verification_interval_days, 30)
+        self.assertEqual(self.config.verification_task_interval_seconds, 45)
         self.assertEqual(self.config.scan_interval_seconds, 15)
         self.assertEqual(self.config.backup_interval_seconds, 20)
+        self.assertEqual(self.config.nntp_threads, 6)
         self.assertTrue(self.config.zip_subfolders)
         self.assertTrue(self.config.encrypt_bodies)
         self.assertEqual(self.config.endpoints, [str(self.root / "media")])
@@ -379,6 +423,20 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.usenet_hosts[0].resolved_username(), "provider-user")
         self.assertEqual(self.config.usenet_hosts[0].resolved_password(), "provider-password")
         self.assertEqual(self.config.par2["redundancy_percent"], 12)
+        self.assertEqual(self.config.cloud_backups[0].provider, "local")
+
+    def test_cloud_backup_writes_config_and_database_archive(self):
+        config_path = self.root / "config.json"
+        self.config.source_path = config_path
+        self.config.save(str(config_path))
+        target = self.root / "cloud"
+        self.config.cloud_backups = [
+            type("Target", (), {"name": "local", "provider": "local", "target": str(target), "command": "", "enabled": True})()
+        ]
+        results = backup_config_and_database(self.db, self.config)
+        self.assertEqual(len(results), 1)
+        archives = list(target.glob("backuprr-backup-*.zip"))
+        self.assertEqual(len(archives), 1)
 
     def test_update_config_preserves_blank_existing_host_password(self):
         self.config.usenet_hosts = [

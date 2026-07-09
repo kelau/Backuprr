@@ -34,14 +34,33 @@ class UsenetHost:
 
 
 @dataclass
+class CloudBackupTarget:
+    name: str
+    provider: str = "local"
+    target: str = ""
+    command: str = ""
+    enabled: bool = True
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "CloudBackupTarget":
+        supported = {key: data.get(key) for key in ("name", "provider", "target", "command", "enabled")}
+        if supported["enabled"] is None:
+            supported["enabled"] = True
+        return cls(**supported)
+
+
+@dataclass
 class Config:
     database: str = "backuprr.sqlite3"
     article_size: int = 768 * 1024
     newsgroup: str = "alt.binaries.backup"
     verification_interval_days: int = 90
+    verification_task_interval_seconds: int = 3600
     scan_interval_seconds: int = 300
     backup_interval_seconds: int = 300
+    nntp_threads: int = 4
     usenet_hosts: List[UsenetHost] = field(default_factory=list)
+    cloud_backups: List[CloudBackupTarget] = field(default_factory=list)
     endpoints: List[str] = field(default_factory=list)
     zip_subfolders: bool = False
     encrypt_bodies: bool = False
@@ -57,8 +76,10 @@ class Config:
         if config_path.exists():
             data = json.loads(config_path.read_text(encoding="utf-8"))
         hosts = [UsenetHost.from_dict(item) for item in data.pop("usenet_hosts", [])]
+        cloud_backups = [CloudBackupTarget.from_dict(item) for item in data.pop("cloud_backups", [])]
         config = cls(**data)
         config.usenet_hosts = hosts
+        config.cloud_backups = cloud_backups
         config.base_dir = config_path.resolve().parent
         config.source_path = config_path.resolve()
         return config
@@ -83,9 +104,12 @@ class Config:
             "article_size": self.article_size,
             "newsgroup": self.newsgroup,
             "verification_interval_days": self.verification_interval_days,
+            "verification_task_interval_seconds": self.verification_task_interval_seconds,
             "scan_interval_seconds": self.scan_interval_seconds,
             "backup_interval_seconds": self.backup_interval_seconds,
+            "nntp_threads": self.nntp_threads,
             "usenet_hosts": [host.__dict__ for host in self.usenet_hosts],
+            "cloud_backups": [target.__dict__ for target in self.cloud_backups],
             "endpoints": self.endpoints,
             "zip_subfolders": self.zip_subfolders,
             "encrypt_bodies": self.encrypt_bodies,
@@ -115,6 +139,11 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if interval <= 0:
             raise ValueError("verification_interval_days must be greater than zero")
         config.verification_interval_days = interval
+    if "verification_task_interval_seconds" in data:
+        interval = int(data["verification_task_interval_seconds"])
+        if interval <= 0:
+            raise ValueError("verification_task_interval_seconds must be greater than zero")
+        config.verification_task_interval_seconds = interval
     if "scan_interval_seconds" in data:
         interval = int(data["scan_interval_seconds"])
         if interval <= 0:
@@ -125,6 +154,11 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if interval <= 0:
             raise ValueError("backup_interval_seconds must be greater than zero")
         config.backup_interval_seconds = interval
+    if "nntp_threads" in data:
+        threads = int(data["nntp_threads"])
+        if threads <= 0:
+            raise ValueError("nntp_threads must be greater than zero")
+        config.nntp_threads = min(64, threads)
     if "zip_subfolders" in data:
         config.zip_subfolders = bool(data["zip_subfolders"])
     if "encrypt_bodies" in data:
@@ -153,6 +187,25 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
                 raise ValueError("Usenet host port must be greater than zero")
             hosts.append(host)
         config.usenet_hosts = hosts
+    if "cloud_backups" in data:
+        targets = []
+        for item in data["cloud_backups"]:
+            target = CloudBackupTarget.from_dict(item)
+            target.enabled = bool(target.enabled)
+            target.name = str(target.name or "").strip()
+            target.provider = str(target.provider or "local").strip()
+            target.target = str(target.target or "").strip()
+            target.command = str(target.command or "").strip()
+            if not target.name:
+                raise ValueError("Cloud backup target name is required")
+            if target.provider not in {"local", "google_drive", "onedrive", "command"}:
+                raise ValueError("Cloud backup provider must be local, google_drive, onedrive, or command")
+            if target.provider == "command" and not target.command:
+                raise ValueError("Command cloud backup targets require a command")
+            if target.provider != "command" and not target.target:
+                raise ValueError("Cloud backup targets require a destination path")
+            targets.append(target)
+        config.cloud_backups = targets
     if "par2" in data:
         par2 = dict(config.par2)
         par2.update(data["par2"] or {})

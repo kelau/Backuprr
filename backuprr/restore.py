@@ -45,7 +45,8 @@ def restore_folder(db: Database, config: Config, folder_path: str, dest: Optiona
         rows = conn.execute(
             """
             SELECT path, relative_path FROM files
-            WHERE path LIKE ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?
+            WHERE id IN (SELECT DISTINCT file_id FROM chunks)
+              AND (path LIKE ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?)
             ORDER BY relative_path
             """,
             (
