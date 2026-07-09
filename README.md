@@ -22,8 +22,10 @@ a CLI and an AJAX-enabled Web UI.
 - Periodic chunk existence checks, defaulting to 90 days.
 - Restore support for individual files and folders to the original location or
   an alternate destination.
-- Web pages for Status, Files, Search, Log, Queue, Settings, Restore, and
-  About.
+- Web pages for Status, Files, Search, Log, Queue, Tasks, Settings, Restore,
+  and About.
+- Live-refreshing operational pages and a Status dashboard with task progress,
+  queue/file summaries, and simple charts.
 - CLI commands matching the Web UI operations.
 
 ## Quick start

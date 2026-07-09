@@ -169,6 +169,25 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-bottom:16px; }
 .stat { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px; }
 .stat b { display:block; font-size:24px; }
+.dashboard { display:grid; gap:14px; }
+.hero-status { background:#fff; border:1px solid var(--line); border-radius:8px; padding:14px; display:grid; gap:10px; }
+.hero-status h2 { margin:0; font-size:20px; }
+.task-strip { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:10px; }
+.task-card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px; display:grid; gap:6px; }
+.task-card h3 { margin:0; font-size:14px; }
+.badge { display:inline-flex; align-items:center; width:max-content; padding:3px 7px; border-radius:999px; background:#e8f3f1; color:var(--accent); font-size:12px; font-weight:700; }
+.badge.running { background:#fff7ed; color:var(--warn); }
+.chart-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
+.chart-card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px; }
+.chart-card h3 { margin:0 0 10px; font-size:14px; }
+.bar-row { display:grid; grid-template-columns:minmax(90px,150px) 1fr minmax(42px,max-content); gap:8px; align-items:center; margin:7px 0; }
+.bar-track { height:12px; background:#edf1f2; border-radius:999px; overflow:hidden; }
+.bar-fill { height:100%; background:var(--accent); border-radius:999px; min-width:2px; }
+.bar-fill.warn { background:var(--warn); }
+.bar-fill.bad { background:var(--bad); }
+.progress-track { height:16px; background:#edf1f2; border-radius:999px; overflow:hidden; }
+.progress-fill { height:100%; background:var(--accent); border-radius:999px; transition:width .2s ease; }
+.refresh-note { margin-left:auto; }
 .form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; margin-bottom:12px; }
 .field { display:grid; gap:5px; }
 .field span { color:var(--muted); font-size:12px; font-weight:600; }
@@ -205,6 +224,11 @@ const pages = ["Status","Files","Search","Log","Queue","Tasks","Restore","Settin
 let page = "Status";
 let settingsCache = null;
 let fileRowsCache = [];
+let logLevelSelection = ["error","warning","info","verbose"];
+let logLimitSelection = "300";
+let refreshTimer = null;
+const refreshPages = new Set(["Status","Files","Log","Queue","Tasks"]);
+const refreshMs = 5000;
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
@@ -216,36 +240,50 @@ function table(rows, cols){
 function nav(){
  document.getElementById("nav").innerHTML = pages.map(p=>`<button class="${p===page?"active":""}" onclick="page='${p}';render()"> ${p}</button>`).join("");
 }
+function scheduleRefresh(){
+ if(refreshTimer) clearInterval(refreshTimer);
+ refreshTimer = null;
+ if(refreshPages.has(page)){
+  refreshTimer = setInterval(() => render({ passive:true }), refreshMs);
+ }
+}
+function refreshLabel(){
+ return refreshPages.has(page) ? `<span class="muted refresh-note">Auto-refresh ${Math.round(refreshMs/1000)}s</span>` : "";
+}
 async function render(){
  nav();
+ scheduleRefresh();
  const c = document.getElementById("content");
  if(page==="Status"){
-  const s = await api("/api/status"); document.getElementById("version").textContent = "v"+s.version;
-  c.innerHTML = `<div class="toolbar"><button class="primary" onclick="post('/api/scan').then(render)">Scan</button><button onclick="post('/api/queue/enqueue-unbacked').then(render)">Queue unbacked</button><button onclick="post('/api/verify',{force:true}).then(render)">Verify now</button></div><div class="stats">${Object.entries(s.stats).map(([k,v])=>`<div class="stat"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}</div>`;
+  const s = await api("/api/status");
+  const tasks = await api("/api/tasks");
+  document.getElementById("version").textContent = "v"+s.version;
+  c.innerHTML = statusDashboard(s, tasks);
  }
  if(page==="Files"){
   fileRowsCache = await api("/api/files?limit=5000");
-  c.innerHTML = `<div class="toolbar"><button onclick="render()">&#8635;</button><button class="primary" onclick="post('/api/post-next').then(render)">&#9658; Post next</button></div>${fileTree(fileRowsCache)}`;
+  c.innerHTML = `<div class="toolbar"><button onclick="render()">&#8635;</button><button class="primary" onclick="post('/api/post-next').then(render)">&#9658; Post next</button>${refreshLabel()}</div>${fileTree(fileRowsCache)}`;
  }
  if(page==="Search"){
   c.innerHTML = `<div class="toolbar"><input id="q" placeholder="Search files"><button onclick="search()">Search</button></div><div id="results"></div>`;
  }
  if(page==="Log"){
+  const levels = ["error","warning","info","verbose"];
   c.innerHTML = `<div class="toolbar">
-   ${["error","warning","info","verbose"].map(level=>`<label><input class="logLevel" type="checkbox" value="${level}" checked> ${level}</label>`).join("")}
-   <select id="logLimit"><option>100</option><option selected>300</option><option>1000</option></select>
-   <button onclick="loadLog()">Apply</button>
+   ${levels.map(level=>`<label><input class="logLevel" type="checkbox" value="${level}" ${logLevelSelection.includes(level) ? "checked" : ""}> ${level}</label>`).join("")}
+   <select id="logLimit"><option ${logLimitSelection==="100"?"selected":""}>100</option><option ${logLimitSelection==="300"?"selected":""}>300</option><option ${logLimitSelection==="1000"?"selected":""}>1000</option></select>
+   <button onclick="loadLog()">Apply</button>${refreshLabel()}
   </div><div id="logRows"></div>`;
   await loadLog();
  }
  if(page==="Queue"){
   const rows = await api("/api/queue");
-  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(render)">Apply filter</button><button class="primary" onclick="post('/api/post-next').then(render)">Post next</button></div>`+
+  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(render)">Apply filter</button><button class="primary" onclick="post('/api/post-next').then(render)">Post next</button>${refreshLabel()}</div>`+
   table(rows, ["file_id","position","priority","status","reason","path","size","state"]);
  }
  if(page==="Tasks"){
  const rows = await api("/api/tasks");
-  c.innerHTML = `<div class="toolbar"><button onclick="render()">Refresh</button><button class="primary" onclick="post('/api/scan').then(render)">Run catalog scan</button></div>`+
+  c.innerHTML = `<div class="toolbar"><button onclick="render()">Refresh</button><button class="primary" onclick="post('/api/scan').then(render)">Run catalog scan</button>${refreshLabel()}</div>`+
   table(rows, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"]);
  }
  if(page==="Restore"){
@@ -254,9 +292,88 @@ async function render(){
  if(page==="Settings"){ settingsCache = await api("/api/settings"); c.innerHTML = settingsForm(settingsCache); }
  if(page==="About"){ c.innerHTML = `<h1>Backuprr</h1><p>Version <span id="aboutVersion"></span></p><p>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
 }
+function statusDashboard(status, tasks){
+ const stats = status.stats || {};
+ const total = Number(stats.files_total || 0);
+ const backed = Number(stats.files_backed_up || 0);
+ const queued = Number(stats.files_queued || 0);
+ const posting = Number(stats.files_posting || 0);
+ const deleted = Number(stats.files_deleted || 0);
+ const chunks = Number(stats.chunks_total || 0);
+ const doneQueue = Number(stats.queue_done || 0);
+ const queuedQueue = Number(stats.queue_queued || 0);
+ const postingQueue = Number(stats.queue_posting || 0);
+ const protectedPct = total ? Math.round((backed / total) * 100) : 0;
+ const activeTask = tasks.find(task => task.status === "running");
+ const nextTask = tasks
+  .filter(task => task.status !== "running" && task.time_until_next_run)
+  .sort((a,b) => secondsFromLabel(a.time_until_next_run) - secondsFromLabel(b.time_until_next_run))[0];
+ return `<div class="dashboard">
+  <div class="toolbar"><button class="primary" onclick="post('/api/scan').then(render)">&#8635; Scan now</button><button onclick="post('/api/queue/enqueue-unbacked').then(render)">&#10133; Queue unbacked</button><button onclick="post('/api/verify',{force:true}).then(render)">&#10003; Verify chunks</button>${refreshLabel()}</div>
+  <div class="hero-status">
+   <h2>${esc(activeTask ? `${activeTask.name} is running` : "Backuprr is standing by")}</h2>
+   <div class="muted">${esc(activeTask ? activeTask.last_result || "Working through the current task" : nextTask ? `Next: ${nextTask.name} in ${nextTask.time_until_next_run}` : "No scheduled task time reported")}</div>
+   <div class="progress-track"><div class="progress-fill" style="width:${protectedPct}%"></div></div>
+   <div>${protectedPct}% backed up · ${backed} of ${total} files protected · ${queued + posting} waiting or posting · ${chunks} chunks posted</div>
+  </div>
+  <div class="task-strip">${tasks.map(taskCard).join("")}</div>
+  <div class="stats">
+   ${statCard("Files", total)}
+   ${statCard("Backed up", backed)}
+   ${statCard("Queued", queued)}
+   ${statCard("Posting", posting)}
+   ${statCard("Deleted", deleted)}
+   ${statCard("Chunks", chunks)}
+  </div>
+  <div class="chart-grid">
+   ${barChart("File states", [
+    ["backed up", backed, "ok"],
+    ["queued", queued, "warn"],
+    ["posting", posting, "warn"],
+    ["deleted", deleted, "bad"],
+    ["other", Math.max(0, total - backed - queued - posting - deleted), "ok"]
+   ])}
+   ${barChart("Queue", [
+    ["done", doneQueue, "ok"],
+    ["queued", queuedQueue, "warn"],
+    ["posting", postingQueue, "warn"]
+   ])}
+  </div>
+ </div>`;
+}
+function statCard(label, value){
+ return `<div class="stat"><span>${esc(label)}</span><b>${esc(value)}</b></div>`;
+}
+function taskCard(task){
+ const running = task.status === "running";
+ return `<div class="task-card">
+  <h3>${esc(task.name)}</h3>
+  <span class="badge ${running ? "running" : ""}">${esc(task.status)}</span>
+  <div class="muted">Last run: ${esc(task.last_run || "not yet")}</div>
+  <div>Duration: ${esc(task.last_run_duration || "-")}</div>
+  <div>Next run: ${esc(task.time_until_next_run || "-")}</div>
+  <div class="${task.last_error ? "error" : "muted"}">${esc(task.last_error || task.last_result || "")}</div>
+ </div>`;
+}
+function barChart(title, rows){
+ const max = Math.max(1, ...rows.map(row => Number(row[1] || 0)));
+ return `<div class="chart-card"><h3>${esc(title)}</h3>${rows.map(([label, value, tone]) => {
+  const width = Math.max(0, Math.round((Number(value || 0) / max) * 100));
+  return `<div class="bar-row"><span>${esc(label)}</span><div class="bar-track"><div class="bar-fill ${tone === "bad" ? "bad" : tone === "warn" ? "warn" : ""}" style="width:${width}%"></div></div><b>${esc(value)}</b></div>`;
+ }).join("")}</div>`;
+}
+function secondsFromLabel(label){
+ const text = String(label || "");
+ const h = Number((text.match(/(\d+)h/) || [0,0])[1]);
+ const m = Number((text.match(/(\d+)m/) || [0,0])[1]);
+ const s = Number((text.match(/(\d+)s/) || [0,0])[1]);
+ return h * 3600 + m * 60 + s;
+}
 async function loadLog(){
- const levels = Array.from(document.querySelectorAll(".logLevel:checked")).map(input => "level="+encodeURIComponent(input.value)).join("&");
- const limit = encodeURIComponent(document.getElementById("logLimit").value);
+ logLevelSelection = Array.from(document.querySelectorAll(".logLevel:checked")).map(input => input.value);
+ logLimitSelection = document.getElementById("logLimit").value;
+ const levels = logLevelSelection.map(level => "level="+encodeURIComponent(level)).join("&");
+ const limit = encodeURIComponent(logLimitSelection);
  document.getElementById("logRows").innerHTML = table(await api(`/api/log?limit=${limit}&${levels}`), ["id","ts","level","event_type","message","file_id"]);
 }
 function fileTree(rows){

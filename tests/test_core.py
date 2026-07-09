@@ -46,7 +46,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.1")
+        self.assertEqual(__version__, "0.2.2")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
