@@ -14,18 +14,17 @@ class UsenetHost:
     tls: str = "plain"
     username: Optional[str] = None
     password: Optional[str] = None
-    username_env: Optional[str] = None
-    password_env: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "UsenetHost":
-        return cls(**data)
+        supported = {key: data.get(key) for key in ("name", "mode", "host", "port", "tls", "username", "password")}
+        return cls(**supported)
 
     def resolved_username(self) -> Optional[str]:
-        return os.getenv(self.username_env) if self.username_env else self.username
+        return self.username
 
     def resolved_password(self) -> Optional[str]:
-        return os.getenv(self.password_env) if self.password_env else self.password
+        return self.password
 
     def public_dict(self) -> Dict[str, Any]:
         data = self.__dict__.copy()

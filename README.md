@@ -41,7 +41,8 @@ systemd unit to start `backuprr web`.
 
 ## Configuration
 
-Do not commit real credentials. Use environment variables in `config.json`:
+Do not commit real credentials. `config.json` is ignored by Git and stores the
+direct provider username/password used for NNTP authentication:
 
 ```json
 {
@@ -56,8 +57,8 @@ Do not commit real credentials. Use environment variables in `config.json`:
       "host": "news.eweka.nl",
       "port": 563,
       "tls": "implicit",
-      "username_env": "BACKUPRR_USENET_USER",
-      "password_env": "BACKUPRR_USENET_PASSWORD"
+      "username": "your-user",
+      "password": "your-password"
     },
     {
       "name": "eweka-post",
@@ -65,19 +66,12 @@ Do not commit real credentials. Use environment variables in `config.json`:
       "host": "post.eweka.nl",
       "port": 563,
       "tls": "implicit",
-      "username_env": "BACKUPRR_USENET_USER",
-      "password_env": "BACKUPRR_USENET_PASSWORD"
+      "username": "your-user",
+      "password": "your-password"
     }
   ],
   "endpoints": []
 }
-```
-
-For the settings supplied during project creation:
-
-```bash
-export BACKUPRR_USENET_USER='your-user'
-export BACKUPRR_USENET_PASSWORD='your-password'
 ```
 
 ## CLI
@@ -114,4 +108,3 @@ PAR2 support is implemented as an external command hook. Configure `par2` in
 ```bash
 python -m unittest discover -s tests
 ```
-

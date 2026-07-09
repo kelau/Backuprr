@@ -238,7 +238,7 @@ function settingsForm(s){
  <pre id="settingsOut"></pre>`;
 }
 function hostRows(hosts){
- return hosts.map((host, index) => hostRow(host, index)).join("") || hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username_env:"", password_env:"" }, 0);
+ return hosts.map((host, index) => hostRow(host, index)).join("") || hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"" }, 0);
 }
 function hostRow(host, index){
  return `<div class="host-row" data-host-index="${index}">
@@ -249,8 +249,6 @@ function hostRow(host, index){
    <label class="field"><span>Server</span><input class="hostServer" value="${esc(host.host)}" placeholder="news.example.com"></label>
    <label class="field"><span>Port</span><input class="hostPort" type="number" min="1" value="${esc(host.port || 563)}"></label>
    <label class="field"><span>TLS mode</span><select class="hostTls"><option value="implicit" ${host.tls==="implicit"?"selected":""}>implicit</option><option value="starttls" ${host.tls==="starttls"?"selected":""}>starttls</option><option value="plain" ${host.tls==="plain"?"selected":""}>plain</option></select></label>
-   <label class="field"><span>Username env</span><input class="hostUsernameEnv" value="${esc(host.username_env || "")}" placeholder="BACKUPRR_USENET_USER"></label>
-   <label class="field"><span>Password env</span><input class="hostPasswordEnv" value="${esc(host.password_env || "")}" placeholder="BACKUPRR_USENET_PASSWORD"></label>
    <label class="field"><span>Username</span><input class="hostUsername" value="${esc(host.username || "")}" autocomplete="off"></label>
    <label class="field"><span>Password</span><input class="hostPassword" type="password" value="${esc(host.password || "")}" autocomplete="new-password" placeholder="leave blank to keep existing"></label>
   </div>
@@ -259,7 +257,7 @@ function hostRow(host, index){
 function addHost(){
  const list = document.getElementById("hostList");
  const index = list.querySelectorAll(".host-row").length;
- list.insertAdjacentHTML("beforeend", hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username_env:"", password_env:"" }, index));
+ list.insertAdjacentHTML("beforeend", hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"" }, index));
  renumberHosts();
 }
 function removeHost(button){
@@ -280,8 +278,6 @@ function collectHosts(){
   host: row.querySelector(".hostServer").value.trim(),
   port: Number(row.querySelector(".hostPort").value),
   tls: row.querySelector(".hostTls").value,
-  username_env: row.querySelector(".hostUsernameEnv").value.trim() || null,
-  password_env: row.querySelector(".hostPasswordEnv").value.trim() || null,
   username: row.querySelector(".hostUsername").value.trim() || null,
   password: row.querySelector(".hostPassword").value || null
  })).filter(host => host.name || host.host);

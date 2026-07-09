@@ -10,8 +10,8 @@
       "host": "news.eweka.nl",
       "port": 563,
       "tls": "implicit",
-      "username_env": "BACKUPRR_USENET_USER",
-      "password_env": "BACKUPRR_USENET_PASSWORD"
+      "username": "",
+      "password": ""
     },
     {
       "name": "eweka-post",
@@ -19,8 +19,8 @@
       "host": "post.eweka.nl",
       "port": 563,
       "tls": "implicit",
-      "username_env": "BACKUPRR_USENET_USER",
-      "password_env": "BACKUPRR_USENET_PASSWORD"
+      "username": "",
+      "password": ""
     }
   ],
   "endpoints": [],

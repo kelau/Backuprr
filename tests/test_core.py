@@ -151,8 +151,8 @@ class CoreTests(unittest.TestCase):
                         "host": "news.example.test",
                         "port": 563,
                         "tls": "implicit",
-                        "username_env": "USER_ENV",
-                        "password_env": "PASS_ENV",
+                        "username": "provider-user",
+                        "password": "provider-password",
                     }
                 ],
                 "par2": {"enabled": True, "command": "par2", "redundancy_percent": 12},
@@ -165,6 +165,8 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(self.config.encrypt_bodies)
         self.assertEqual(self.config.endpoints, [str(self.root / "media")])
         self.assertEqual(self.config.usenet_hosts[0].tls, "implicit")
+        self.assertEqual(self.config.usenet_hosts[0].resolved_username(), "provider-user")
+        self.assertEqual(self.config.usenet_hosts[0].resolved_password(), "provider-password")
         self.assertEqual(self.config.par2["redundancy_percent"], 12)
 
     def test_update_config_preserves_blank_existing_host_password(self):
@@ -187,6 +189,24 @@ class CoreTests(unittest.TestCase):
             },
         )
         self.assertEqual(self.config.usenet_hosts[0].password, "secret")
+
+    def test_old_env_host_keys_are_ignored_when_loading_hosts(self):
+        host = UsenetHost.from_dict(
+            {
+                "name": "read",
+                "mode": "read",
+                "host": "news.example.test",
+                "port": 563,
+                "tls": "implicit",
+                "username_env": "OLD_USER_ENV",
+                "password_env": "OLD_PASS_ENV",
+                "username": "direct-user",
+                "password": "direct-password",
+            }
+        )
+        self.assertEqual(host.resolved_username(), "direct-user")
+        self.assertEqual(host.resolved_password(), "direct-password")
+        self.assertNotIn("username_env", host.public_dict())
 
 
 if __name__ == "__main__":
