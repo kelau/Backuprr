@@ -46,7 +46,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.4")
+        self.assertEqual(__version__, "0.2.5")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -393,6 +393,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("time_until_next_run", tasks[0])
         self.assertNotIn("last_started_at", tasks[0])
         self.assertIn("files cataloged", tasks[0]["last_result"])
+        self.assertGreater(tasks[0]["revision"], 0)
 
     def test_backup_monitor_posts_next_queued_file(self):
         media = self.root / "media"
@@ -407,6 +408,22 @@ class CoreTests(unittest.TestCase):
         tasks = monitor.tasks()
         self.assertEqual(tasks[0]["name"], "Usenet backup worker")
         self.assertIn("posted file id", tasks[0]["last_result"])
+
+    def test_backup_monitor_reports_active_posting_count(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='posting' WHERE id=?", (file_id,))
+            conn.execute("UPDATE queue SET status='posting' WHERE file_id=?", (file_id,))
+        monitor = BackupMonitor(self.db, self.config)
+        result = monitor.run_once()
+        self.assertIn("0 newly queued", result)
+        self.assertIn("1 posting", result)
 
 
 if __name__ == "__main__":

@@ -144,7 +144,9 @@ class Handler(BaseHTTPRequestHandler):
         last_payload = ""
         try:
             while True:
-                payload = json.dumps(self.db.change_token(), default=str)
+                token = self.db.change_token()
+                token["task_revision"] = sum(int(task.get("revision", 0)) for task in self.monitor.tasks() + self.backup_monitor.tasks())
+                payload = json.dumps(token, default=str)
                 if payload != last_payload:
                     self.wfile.write(f"event: change\ndata: {payload}\n\n".encode("utf-8"))
                     self.wfile.flush()
@@ -342,11 +344,12 @@ async function refreshPageForChanges(previous, token){
  const queueChanged = previous.queue_updated !== token.queue_updated || previous.queue_total !== token.queue_total;
  const eventsChanged = previous.event_id !== token.event_id;
  const chunksChanged = previous.chunks_total !== token.chunks_total;
- if(page==="Status" && (filesChanged || queueChanged || chunksChanged)) await updateStatusPage();
+ const tasksChanged = previous.task_revision !== token.task_revision;
+ if(page==="Status" && (filesChanged || queueChanged || chunksChanged || tasksChanged)) await updateStatusPage();
  if(page==="Files" && filesChanged) await updateFilesPage();
  if(page==="Log" && eventsChanged) await updateLogPage(false);
  if(page==="Queue" && (queueChanged || filesChanged)) await updateQueuePage();
- if(page==="Tasks" && eventsChanged) await updateTasksPage();
+ if(page==="Tasks" && (eventsChanged || tasksChanged)) await updateTasksPage();
  document.querySelectorAll(".push-state").forEach(el => el.textContent = "Updated after change");
 }
 async function updateStatusPage(){

@@ -49,6 +49,7 @@ class ScheduledTask:
         self._last_error = ""
         self._runs = 0
         self._running = False
+        self._revision = 0
 
     @property
     def interval_seconds(self) -> int:
@@ -107,6 +108,7 @@ class ScheduledTask:
                 "runs": self._runs,
                 "last_result": self._last_result,
                 "last_error": self._last_error,
+                "revision": self._revision,
             }
 
     def _run(self) -> None:
@@ -123,6 +125,7 @@ class ScheduledTask:
             self._running = True
             self._last_started_at = utcnow_dt()
             self._last_error = ""
+            self._revision += 1
 
     def _mark_finished(self, result: str, error: str) -> None:
         finished = utcnow_dt()
@@ -135,10 +138,12 @@ class ScheduledTask:
             self._last_result = result
             self._last_error = error
             self._next_run_at = utcnow_dt() + timedelta(seconds=self.interval_seconds)
+            self._revision += 1
 
     def _schedule_next(self, seconds: int) -> None:
         with self._state_lock:
             self._next_run_at = utcnow_dt() + timedelta(seconds=seconds)
+            self._revision += 1
 
 
 class CatalogMonitor(ScheduledTask):
@@ -178,19 +183,21 @@ class BackupMonitor(ScheduledTask):
     def post_once(self) -> Optional[int]:
         result = self.run_once()
         if result.startswith("posted file id "):
-            return int(result.rsplit(" ", 1)[1])
+            return int(result.removeprefix("posted file id ").split(",", 1)[0])
         return None
 
     def execute(self) -> str:
-        queued = enqueue_unbacked(self.db)
+        newly_queued = enqueue_unbacked(self.db)
         file_id = post_next(self.db, self.config)
+        stats = self.db.stats()
+        queued = int(stats.get("queue_queued", 0))
+        posting = int(stats.get("queue_posting", 0))
         if file_id is None:
-            result = f"{queued} queued, no file posted"
+            result = f"{newly_queued} newly queued, {queued} queued, {posting} posting, no file posted"
         else:
-            result = f"posted file id {file_id}"
+            result = f"posted file id {file_id}, {queued} queued, {posting} posting"
         self.db.log("info", "monitor.backup", f"Automatic backup task completed: {result}")
         return result
 
     def tasks(self):
         return [self.task_info()]
-
