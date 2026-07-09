@@ -39,6 +39,7 @@ class Config:
     article_size: int = 768 * 1024
     newsgroup: str = "alt.binaries.backup"
     verification_interval_days: int = 90
+    scan_interval_seconds: int = 300
     usenet_hosts: List[UsenetHost] = field(default_factory=list)
     endpoints: List[str] = field(default_factory=list)
     zip_subfolders: bool = False
@@ -81,6 +82,7 @@ class Config:
             "article_size": self.article_size,
             "newsgroup": self.newsgroup,
             "verification_interval_days": self.verification_interval_days,
+            "scan_interval_seconds": self.scan_interval_seconds,
             "usenet_hosts": [host.__dict__ for host in self.usenet_hosts],
             "endpoints": self.endpoints,
             "zip_subfolders": self.zip_subfolders,
@@ -111,6 +113,11 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if interval <= 0:
             raise ValueError("verification_interval_days must be greater than zero")
         config.verification_interval_days = interval
+    if "scan_interval_seconds" in data:
+        interval = int(data["scan_interval_seconds"])
+        if interval <= 0:
+            raise ValueError("scan_interval_seconds must be greater than zero")
+        config.scan_interval_seconds = interval
     if "zip_subfolders" in data:
         config.zip_subfolders = bool(data["zip_subfolders"])
     if "encrypt_bodies" in data:

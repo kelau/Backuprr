@@ -7,6 +7,8 @@ a CLI and an AJAX-enabled Web UI.
 ## Features
 
 - SQLite catalog of watched endpoints and all files below them.
+- Automatic catalog scans on service startup, after endpoint changes, and on a
+  configurable interval.
 - File state tracking: discovered, changed, queued, posting, backed up,
   verifying, missing chunks, failed, and restored.
 - Verbose event log persisted in the database.
@@ -50,6 +52,7 @@ direct provider username/password used for NNTP authentication:
   "article_size": 786432,
   "newsgroup": "alt.binaries.backup",
   "verification_interval_days": 90,
+  "scan_interval_seconds": 300,
   "usenet_hosts": [
     {
       "name": "eweka-read",

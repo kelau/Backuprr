@@ -8,6 +8,7 @@ from backuprr.backup import decode_chunk, encode_chunk, post_next
 from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
+from backuprr.monitor import CatalogMonitor
 from backuprr.queueing import enqueue_unbacked, prioritize
 from backuprr.scanner import scan_all
 
@@ -140,6 +141,7 @@ class CoreTests(unittest.TestCase):
                 "article_size": 1024,
                 "newsgroup": "alt.binaries.example",
                 "verification_interval_days": 30,
+                "scan_interval_seconds": 15,
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
                 "encryption_passphrase_env": "BACKUPRR_SECRET",
@@ -161,6 +163,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.article_size, 1024)
         self.assertEqual(self.config.newsgroup, "alt.binaries.example")
         self.assertEqual(self.config.verification_interval_days, 30)
+        self.assertEqual(self.config.scan_interval_seconds, 15)
         self.assertTrue(self.config.zip_subfolders)
         self.assertTrue(self.config.encrypt_bodies)
         self.assertEqual(self.config.endpoints, [str(self.root / "media")])
@@ -207,6 +210,17 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(host.resolved_username(), "direct-user")
         self.assertEqual(host.resolved_password(), "direct-password")
         self.assertNotIn("username_env", host.public_dict())
+
+    def test_catalog_monitor_scan_once_catalogs_endpoint(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "episode.mkv").write_bytes(b"episode")
+        self.db.add_endpoint(str(media))
+        monitor = CatalogMonitor(self.db, self.config)
+        self.assertEqual(monitor.scan_once(), 1)
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT relative_path FROM files").fetchone()
+        self.assertEqual(row["relative_path"], "episode.mkv")
 
 
 if __name__ == "__main__":

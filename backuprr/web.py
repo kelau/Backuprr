@@ -7,9 +7,9 @@ from . import __version__
 from .backup import post_next, verify_due_chunks
 from .config import Config, update_config
 from .db import Database
+from .monitor import CatalogMonitor
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
-from .scanner import scan_all
 
 
 def rowdicts(rows):
@@ -20,6 +20,7 @@ class Handler(BaseHTTPRequestHandler):
     config: Config
     config_path: str
     db: Database
+    monitor: CatalogMonitor
 
     def log_message(self, fmt: str, *args: Any) -> None:
         self.db.log("verbose", "web.access", fmt % args)
@@ -47,7 +48,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(INDEX_HTML.encode("utf-8"))
         elif parsed.path == "/api/status":
-            self.send_json({"version": __version__, "stats": self.db.stats()})
+            self.send_json(
+                {
+                    "version": __version__,
+                    "stats": self.db.stats(),
+                    "scan_interval_seconds": self.config.scan_interval_seconds,
+                }
+            )
         elif parsed.path == "/api/files":
             self.send_json(rowdicts(self.db.list_rows("files", int(query.get("limit", ["200"])[0]))))
         elif parsed.path == "/api/search":
@@ -77,7 +84,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             data = self.read_json()
             if parsed.path == "/api/scan":
-                self.send_json({"files": scan_all(self.db)})
+                self.send_json({"files": self.monitor.scan_once()})
             elif parsed.path == "/api/queue/enqueue-unbacked":
                 self.send_json({"queued": enqueue_unbacked(self.db)})
             elif parsed.path == "/api/queue/prioritize":
@@ -100,6 +107,7 @@ class Handler(BaseHTTPRequestHandler):
                 for endpoint in self.config.endpoints:
                     self.db.add_endpoint(endpoint)
                 self.db.log("info", "settings", "Updated configuration from Web UI")
+                self.monitor.trigger()
                 self.send_json({"ok": True, "settings": self.config.public_dict()})
             else:
                 self.send_json({"error": "not found"}, 404)
@@ -112,9 +120,14 @@ def run_web(config: Config, db: Database, host: str, port: int) -> None:
     Handler.config = config
     Handler.config_path = str(config.source_path or (config.base_dir / "config.json"))
     Handler.db = db
+    Handler.monitor = CatalogMonitor(db, config)
+    Handler.monitor.start()
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Backuprr {__version__} listening on http://{host}:{port}")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        Handler.monitor.stop()
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -225,6 +238,7 @@ function settingsForm(s){
   <label class="field"><span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
   <label class="field"><span>Article size bytes</span><input id="setArticleSize" type="number" min="1" value="${esc(s.article_size)}"></label>
   <label class="field"><span>Verify interval days</span><input id="setVerifyDays" type="number" min="1" value="${esc(s.verification_interval_days)}"></label>
+  <label class="field"><span>Catalog scan interval seconds</span><input id="setScanInterval" type="number" min="1" value="${esc(s.scan_interval_seconds || 300)}"></label>
   <label class="field"><span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
   <label><input id="setZip" type="checkbox" ${s.zip_subfolders?"checked":""}> Zip subfolders</label>
   <label><input id="setEncrypt" type="checkbox" ${s.encrypt_bodies?"checked":""}> Encrypt article bodies</label>
@@ -287,6 +301,7 @@ async function saveSettings(){
   newsgroup: setNewsgroup.value,
   article_size: Number(setArticleSize.value),
   verification_interval_days: Number(setVerifyDays.value),
+  scan_interval_seconds: Number(setScanInterval.value),
   zip_subfolders: setZip.checked,
   encrypt_bodies: setEncrypt.checked,
   encryption_passphrase_env: setPassEnv.value,

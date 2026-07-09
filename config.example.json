@@ -3,6 +3,7 @@
   "article_size": 786432,
   "newsgroup": "alt.binaries.backup",
   "verification_interval_days": 90,
+  "scan_interval_seconds": 300,
   "usenet_hosts": [
     {
       "name": "eweka-read",
