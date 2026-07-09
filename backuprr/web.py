@@ -74,6 +74,8 @@ class Handler(BaseHTTPRequestHandler):
                     """
                 ).fetchall()
             self.send_json(rowdicts(rows))
+        elif parsed.path == "/api/tasks":
+            self.send_json(self.monitor.tasks())
         elif parsed.path == "/api/settings":
             self.send_json(self.config.public_dict())
         else:
@@ -182,7 +184,7 @@ pre { white-space:pre-wrap; background:#fff; border:1px solid var(--line); paddi
 <section id="content"></section>
 </main>
 <script>
-const pages = ["Status","Files","Search","Log","Queue","Restore","Settings","About"];
+const pages = ["Status","Files","Search","Log","Queue","Tasks","Restore","Settings","About"];
 let page = "Status";
 let settingsCache = null;
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
@@ -219,6 +221,11 @@ async function render(){
   const rows = await api("/api/queue");
   c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(render)">Apply filter</button><button class="primary" onclick="post('/api/post-next').then(render)">Post next</button></div>`+
   table(rows, ["file_id","position","priority","status","reason","path","size","state"]);
+ }
+ if(page==="Tasks"){
+  const rows = await api("/api/tasks");
+  c.innerHTML = `<div class="toolbar"><button onclick="render()">Refresh</button><button class="primary" onclick="post('/api/scan').then(render)">Run catalog scan</button></div>`+
+  table(rows, ["name","kind","status","interval_seconds","last_started_at","last_finished_at","next_run_at","runs","last_result","last_error"]);
  }
  if(page==="Restore"){
   c.innerHTML = `<div class="toolbar"><input id="restorePath" placeholder="File or folder path"><input id="restoreDest" placeholder="Optional destination"><label><input id="restoreFolder" type="checkbox"> Folder</label><button class="primary" onclick="restore()">Restore</button></div><pre id="restoreOut"></pre>`;

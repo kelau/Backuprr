@@ -82,6 +82,37 @@ class Database:
                 )
                 file_id = int(row["id"])
             else:
+                move_row = self._find_move_candidate(conn, record)
+                if move_row:
+                    conn.execute(
+                        """
+                        UPDATE files
+                        SET path=?, relative_path=?, mtime_ns=?, state=CASE WHEN state='deleted' THEN ? ELSE state END,
+                            updated_at=?
+                        WHERE id=?
+                        """,
+                        (
+                            record["path"],
+                            record["relative_path"],
+                            record["mtime_ns"],
+                            record.get("state", "discovered"),
+                            now,
+                            move_row["id"],
+                        ),
+                    )
+                    file_id = int(move_row["id"])
+                    conn.execute(
+                        "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
+                        (
+                            now,
+                            "info",
+                            "scan.move",
+                            f"Updated moved file path: {move_row['path']} -> {record['path']}",
+                            file_id,
+                            "",
+                        ),
+                    )
+                    return file_id
                 cur = conn.execute(
                     """
                     INSERT INTO files(endpoint_id, path, relative_path, size, mtime_ns, sha256, state, created_at, updated_at)
@@ -102,6 +133,19 @@ class Database:
                 file_id = int(cur.lastrowid)
             return file_id
 
+    def _find_move_candidate(self, conn: sqlite3.Connection, record: Dict[str, Any]) -> Optional[sqlite3.Row]:
+        rows = conn.execute(
+            """
+            SELECT id, path FROM files
+            WHERE endpoint_id=? AND size=? AND sha256=? AND path != ?
+            """,
+            (record["endpoint_id"], record["size"], record["sha256"], record["path"]),
+        ).fetchall()
+        missing_rows = [row for row in rows if not Path(row["path"]).exists()]
+        if len(missing_rows) == 1:
+            return missing_rows[0]
+        return None
+
     def mark_missing_files(self, seen_paths: Iterable[str], endpoint_id: int) -> int:
         seen = set(seen_paths)
         with self.connect() as conn:
@@ -110,6 +154,80 @@ class Database:
             if missing:
                 conn.executemany("UPDATE files SET state='deleted', updated_at=? WHERE id=?", [(utcnow(), item) for item in missing])
             return len(missing)
+
+    def reconcile_moved_duplicates(self, endpoint_id: int) -> int:
+        now = utcnow()
+        reconciled = 0
+        with self.connect() as conn:
+            pairs = conn.execute(
+                """
+                SELECT
+                  deleted.id AS deleted_id,
+                  deleted.path AS deleted_path,
+                  active.id AS active_id,
+                  active.path AS active_path,
+                  active.relative_path AS active_relative_path,
+                  active.mtime_ns AS active_mtime_ns,
+                  active.state AS active_state
+                FROM files deleted
+                JOIN files active
+                  ON active.endpoint_id = deleted.endpoint_id
+                 AND active.size = deleted.size
+                 AND active.sha256 = deleted.sha256
+                 AND active.id != deleted.id
+                WHERE deleted.endpoint_id = ?
+                  AND deleted.state = 'deleted'
+                  AND active.state != 'deleted'
+                """,
+                (endpoint_id,),
+            ).fetchall()
+            for pair in pairs:
+                if Path(pair["deleted_path"]).exists() or not Path(pair["active_path"]).exists():
+                    continue
+                active_chunks = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_id=?", (pair["active_id"],)).fetchone()[0]
+                active_queue = conn.execute("SELECT COUNT(*) FROM queue WHERE file_id=?", (pair["active_id"],)).fetchone()[0]
+                if active_chunks or active_queue:
+                    continue
+                duplicate_count = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM files
+                    WHERE endpoint_id=? AND size=(SELECT size FROM files WHERE id=?)
+                      AND sha256=(SELECT sha256 FROM files WHERE id=?)
+                      AND state != 'deleted'
+                    """,
+                    (endpoint_id, pair["deleted_id"], pair["deleted_id"]),
+                ).fetchone()[0]
+                if duplicate_count != 1:
+                    continue
+                conn.execute("DELETE FROM files WHERE id=?", (pair["active_id"],))
+                conn.execute(
+                    """
+                    UPDATE files
+                    SET path=?, relative_path=?, mtime_ns=?, state=?, updated_at=?
+                    WHERE id=?
+                    """,
+                    (
+                        pair["active_path"],
+                        pair["active_relative_path"],
+                        pair["active_mtime_ns"],
+                        pair["active_state"],
+                        now,
+                        pair["deleted_id"],
+                    ),
+                )
+                conn.execute(
+                    "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
+                    (
+                        now,
+                        "info",
+                        "scan.move",
+                        f"Reconciled moved file path: {pair['deleted_path']} -> {pair['active_path']}",
+                        pair["deleted_id"],
+                        "",
+                    ),
+                )
+                reconciled += 1
+        return reconciled
 
     def queue_file(self, file_id: int, priority: int = 100, reason: str = "manual") -> None:
         now = utcnow()

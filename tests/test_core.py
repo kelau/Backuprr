@@ -55,6 +55,64 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(stats["files_total"], 1)
         self.assertEqual(stats["queue_queued"], 1)
 
+    def test_scan_updates_relative_path_for_moved_file(self):
+        media = self.root / "media"
+        media.mkdir()
+        original = media / "movie.mkv"
+        original.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        self.assertEqual(scan_all(self.db), 1)
+        subfolder = media / "subfolder"
+        subfolder.mkdir()
+        moved = subfolder / "movie.mkv"
+        original.rename(moved)
+        self.assertEqual(scan_all(self.db), 1)
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT path, relative_path, state FROM files").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path"], str(moved.resolve()))
+        self.assertEqual(rows[0]["relative_path"], str(Path("subfolder") / "movie.mkv"))
+        self.assertNotEqual(rows[0]["state"], "deleted")
+
+    def test_scan_reconciles_existing_deleted_and_discovered_move_split(self):
+        media = self.root / "media"
+        media.mkdir()
+        original = media / "movie.mkv"
+        original.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        subfolder = media / "subfolder"
+        subfolder.mkdir()
+        moved = subfolder / "movie.mkv"
+        original.rename(moved)
+        with self.db.connect() as conn:
+            old = conn.execute("SELECT * FROM files WHERE relative_path='movie.mkv'").fetchone()
+            conn.execute("UPDATE files SET state='deleted' WHERE id=?", (old["id"],))
+            conn.execute(
+                """
+                INSERT INTO files(endpoint_id, path, relative_path, size, mtime_ns, sha256, state, created_at, updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    old["endpoint_id"],
+                    str(moved.resolve()),
+                    str(Path("subfolder") / "movie.mkv"),
+                    old["size"],
+                    moved.stat().st_mtime_ns,
+                    old["sha256"],
+                    "discovered",
+                    old["created_at"],
+                    old["updated_at"],
+                ),
+            )
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT path, relative_path, state FROM files").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["path"], str(moved.resolve()))
+        self.assertEqual(rows[0]["relative_path"], str(Path("subfolder") / "movie.mkv"))
+        self.assertEqual(rows[0]["state"], "discovered")
+
     def test_prioritize_older_first(self):
         media = self.root / "media"
         media.mkdir()
@@ -221,6 +279,17 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             row = conn.execute("SELECT relative_path FROM files").fetchone()
         self.assertEqual(row["relative_path"], "episode.mkv")
+
+    def test_catalog_monitor_reports_task_state(self):
+        monitor = CatalogMonitor(self.db, self.config)
+        tasks = monitor.tasks()
+        self.assertEqual(tasks[0]["name"], "Catalog monitor")
+        self.assertEqual(tasks[0]["status"], "scheduled")
+        self.assertEqual(tasks[0]["interval_seconds"], self.config.scan_interval_seconds)
+        monitor.scan_once()
+        tasks = monitor.tasks()
+        self.assertEqual(tasks[0]["runs"], 1)
+        self.assertIn("files cataloged", tasks[0]["last_result"])
 
 
 if __name__ == "__main__":

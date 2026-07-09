@@ -40,7 +40,8 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
         db.log("verbose", "scan.file", f"Cataloged {resolved}", file_id=file_id)
         count += 1
     missing = db.mark_missing_files(seen, endpoint_id)
-    db.log("info", "scan", f"Scanned {root}: {count} files, {missing} missing")
+    reconciled = db.reconcile_moved_duplicates(endpoint_id)
+    db.log("info", "scan", f"Scanned {root}: {count} files, {missing} missing, {reconciled} moved")
     return count
 
 
@@ -49,4 +50,3 @@ def scan_all(db: Database) -> int:
     for endpoint in db.endpoints():
         total += scan_endpoint(db, int(endpoint["id"]), endpoint["path"])
     return total
-
