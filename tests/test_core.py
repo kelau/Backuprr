@@ -46,7 +46,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.5")
+        self.assertEqual(__version__, "0.2.6")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -232,14 +232,31 @@ class CoreTests(unittest.TestCase):
         self.db.queue_file(file_id)
         self.assertEqual(len(self.db.list_queue(include_done=True)), 0)
 
+    def test_enqueue_unbacked_does_not_auto_retry_failed_files(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='failed' WHERE id=?", (file_id,))
+        self.assertEqual(enqueue_unbacked(self.db), 0)
+        self.db.queue_file(file_id)
+        self.assertEqual(len(self.db.list_queue()), 1)
+
     def test_log_filtering_by_level(self):
         self.db.log("info", "test.info", "info message")
+        self.db.log("debug", "test.debug", "debug message")
         self.db.log("error", "test.error", "error message")
         self.db.log("verbose", "test.verbose", "verbose message")
         rows = self.db.list_events(["error"])
         self.assertEqual([row["level"] for row in rows], ["error"])
+        debug_rows = self.db.list_events(["debug"])
+        self.assertEqual([row["level"] for row in debug_rows], ["debug"])
         all_rows = self.db.list_events([])
-        self.assertEqual(len(all_rows), 3)
+        self.assertEqual(len(all_rows), 4)
 
     def test_log_filtering_by_event_type_and_exclusion(self):
         self.db.log("verbose", "web.access", "GET /api/status")
@@ -287,6 +304,41 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             priorities = [row["priority"] for row in conn.execute("SELECT priority FROM queue ORDER BY file_id").fetchall()]
         self.assertEqual(priorities, [90, 90])
+
+    def test_queue_rows_include_posted_progress_counts(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 120, "abc", "[hidden]")
+        rows = self.db.list_queue()
+        self.assertEqual(rows[0]["posted_chunks"], 1)
+        self.assertEqual(rows[0]["posted_bytes"], 120)
+
+    def test_recover_stale_posting_requeues_file(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='posting' WHERE id=?", (file_id,))
+            conn.execute("UPDATE queue SET status='posting', updated_at='2000-01-01T00:00:00+00:00' WHERE file_id=?", (file_id,))
+        self.assertEqual(self.db.recover_stale_posting(stale_after_seconds=1), 1)
+        with self.db.connect() as conn:
+            file_row = conn.execute("SELECT state FROM files WHERE id=?", (file_id,)).fetchone()
+            queue_row = conn.execute("SELECT status, reason FROM queue WHERE file_id=?", (file_id,)).fetchone()
+        self.assertEqual(file_row["state"], "queued")
+        self.assertEqual(queue_row["status"], "queued")
+        self.assertEqual(queue_row["reason"], "stale-posting-retry")
 
     def test_update_config_from_settings_payload(self):
         update_config(

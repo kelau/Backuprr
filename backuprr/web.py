@@ -82,8 +82,8 @@ class Handler(BaseHTTPRequestHandler):
             page_size = max(1, min(100, int(query.get("page_size", ["10"])[0])))
             status = query.get("status", [None])[0]
             offset = (page - 1) * page_size
-            rows = self.db.list_queue(status=status, limit=page_size, offset=offset)
-            self.send_json({"rows": rowdicts(rows), "page": page, "page_size": page_size, "total": self.db.queue_count(status=status)})
+            rows = [self.queue_row_payload(row) for row in self.db.list_queue(status=status, limit=page_size, offset=offset)]
+            self.send_json({"rows": rows, "page": page, "page_size": page_size, "total": self.db.queue_count(status=status)})
         elif parsed.path == "/api/tasks":
             self.send_json(self.monitor.tasks() + self.backup_monitor.tasks())
         elif parsed.path == "/api/settings":
@@ -134,6 +134,15 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.db.log("error", "web.error", f"{parsed.path}: {exc}")
             self.send_json({"error": str(exc)}, 500)
+
+    def queue_row_payload(self, row: Any) -> dict:
+        payload = dict(row)
+        expected = max(1, (int(payload["size"]) + self.config.article_size - 1) // self.config.article_size)
+        posted = int(payload.get("posted_chunks") or 0)
+        payload["expected_chunks"] = expected
+        payload["progress_percent"] = min(100, int((posted / expected) * 100))
+        payload["progress"] = f"{posted}/{expected} chunks ({payload['progress_percent']}%)"
+        return payload
 
     def stream_changes(self) -> None:
         self.send_response(200)
@@ -260,7 +269,7 @@ const pages = ["Status","Files","Search","Log","Queue","Tasks","Restore","Settin
 let page = "Status";
 let settingsCache = null;
 let fileRowsCache = [];
-let logLevelSelection = ["error","warning","info","verbose"];
+let logLevelSelection = ["error","warning","info"];
 let logEventTypeSelection = [];
 let logExcludeWebAccess = true;
 let logLimitSelection = "300";
@@ -315,7 +324,7 @@ async function render(){
  }
  if(page==="Log"){
   const eventTypes = await api("/api/log/event-types");
-  const levels = ["error","warning","info","verbose"];
+  const levels = ["error","warning","info","debug","verbose"];
   c.innerHTML = `<div class="toolbar">
    ${levels.map(level=>`<label><input class="logLevel" type="checkbox" value="${level}" ${logLevelSelection.includes(level) ? "checked" : ""}> ${level}</label>`).join("")}
    <select id="logEventType"><option value="">All event types</option>${eventTypes.map(type=>`<option value="${esc(type)}" ${logEventTypeSelection.includes(type) ? "selected" : ""}>${esc(type)}</option>`).join("")}</select>
@@ -377,8 +386,8 @@ async function updateQueuePage(){
  const done = await api(`/api/queue?status=done&page=${completedQueuePage}&page_size=${queuePageSize}`);
  const activeTarget = document.getElementById("activeQueueRows");
  const doneTarget = document.getElementById("completedQueueRows");
- if(activeTarget) activeTarget.innerHTML = pagedTable(active, "activeQueuePage", ["file_id","position","priority","status","reason","path","size","state"]);
- if(doneTarget) doneTarget.innerHTML = pagedTable(done, "completedQueuePage", ["file_id","position","priority","status","reason","path","size","state"]);
+ if(activeTarget) activeTarget.innerHTML = pagedTable(active, "activeQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"]);
+ if(doneTarget) doneTarget.innerHTML = pagedTable(done, "completedQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"]);
 }
 function pagedTable(result, pageVar, cols){
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || queuePageSize)));

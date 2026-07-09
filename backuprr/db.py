@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 
 SCHEMA_VERSION = 1
+STALE_POSTING_SECONDS = 15 * 60
 
 
 def utcnow() -> str:
@@ -273,9 +274,14 @@ class Database:
         with self.connect() as conn:
             return conn.execute(
                 f"""
-                SELECT q.*, f.path, f.size, f.state FROM queue q
+                SELECT q.*, f.path, f.size, f.state,
+                       COUNT(c.id) AS posted_chunks,
+                       COALESCE(SUM(c.size), 0) AS posted_bytes
+                FROM queue q
                 JOIN files f ON f.id = q.file_id
+                LEFT JOIN chunks c ON c.file_id = f.id
                 {where}
+                GROUP BY q.id
                 ORDER BY q.priority ASC, q.position ASC
                 LIMIT ? OFFSET ?
                 """
@@ -317,6 +323,30 @@ class Database:
                 (utcnow(),),
             )
             return cur.rowcount
+
+    def recover_stale_posting(self, stale_after_seconds: int = STALE_POSTING_SECONDS) -> int:
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)).replace(microsecond=0).isoformat()
+        now = utcnow()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT q.file_id, f.path FROM queue q
+                JOIN files f ON f.id = q.file_id
+                WHERE q.status='posting' AND q.updated_at <= ?
+                """,
+                (cutoff,),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE queue SET status='queued', reason='stale-posting-retry', updated_at=? WHERE file_id=?",
+                    (now, row["file_id"]),
+                )
+                conn.execute("UPDATE files SET state='queued', updated_at=? WHERE id=?", (now, row["file_id"]))
+                conn.execute(
+                    "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
+                    (now, "warning", "queue.recover", f"Recovered stale posting queue item: {row['path']}", row["file_id"], ""),
+                )
+            return len(rows)
 
     def set_queue_status(self, file_id: int, status: str) -> None:
         with self.connect() as conn:
@@ -363,14 +393,17 @@ class Database:
         return len(rows)
 
     def add_chunk(self, file_id: int, chunk_index: int, message_id: str, size: int, sha256: str, subject: str) -> None:
+        now = utcnow()
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO chunks(file_id, chunk_index, message_id, size, sha256, subject, status, posted_at)
                 VALUES(?,?,?,?,?,?,?,?)
                 """,
-                (file_id, chunk_index, message_id, size, sha256, subject, "posted", utcnow()),
+                (file_id, chunk_index, message_id, size, sha256, subject, "posted", now),
             )
+            conn.execute("UPDATE queue SET updated_at=? WHERE file_id=?", (now, file_id))
+            conn.execute("UPDATE files SET updated_at=? WHERE id=?", (now, file_id))
 
     def clear_chunks(self, file_id: int) -> int:
         with self.connect() as conn:
@@ -420,7 +453,7 @@ class Database:
         event_types: Optional[List[str]] = None,
         exclude_event_types: Optional[List[str]] = None,
     ) -> List[sqlite3.Row]:
-        allowed_levels = {"error", "warning", "info", "verbose"}
+        allowed_levels = {"error", "warning", "info", "debug", "verbose"}
         selected = [level for level in (levels or []) if level in allowed_levels]
         clauses = []
         params: List[Any] = []

@@ -41,7 +41,7 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
         count += 1
     missing = db.mark_missing_files(seen, endpoint_id)
     reconciled = db.reconcile_moved_duplicates(endpoint_id)
-    db.log("info", "scan", f"Scanned {root}: {count} files, {missing} missing, {reconciled} moved")
+    db.log("info" if missing or reconciled else "debug", "scan", f"Scanned {root}: {count} files, {missing} missing, {reconciled} moved")
     return count
 
 

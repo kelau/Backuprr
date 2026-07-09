@@ -78,7 +78,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
     db.update_file_state(file_id, "posting")
     cleared = db.clear_chunks(file_id)
     if cleared:
-        db.log("info", "post.retry", f"Cleared {cleared} partial chunk records before retrying {original}", file_id)
+        db.log("debug", "post.retry", f"Cleared {cleared} partial chunk records before retrying {original}", file_id)
     payload = prepare_payload(original, config)
     try:
         with UsenetClient(host) as client:
@@ -89,7 +89,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                 subject = obfuscated_subject(file_id, chunk_index, digest)
                 message_id = client.post(config.newsgroup, subject, body)
                 db.add_chunk(file_id, chunk_index, message_id, len(body), digest, subject)
-                db.log("verbose", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
+            db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
         with db.connect() as conn:
             conn.execute("UPDATE files SET state='backed_up', last_backup_at=?, updated_at=? WHERE id=?", (utcnow(), utcnow(), file_id))
             conn.execute("UPDATE queue SET status='done', updated_at=? WHERE file_id=?", (utcnow(), file_id))
@@ -116,6 +116,6 @@ def verify_due_chunks(db: Database, config: Config, force: bool = False) -> int:
         for chunk in chunks:
             exists = client.article_exists(chunk["message_id"])
             db.mark_chunk_verified(int(chunk["id"]), exists)
-            db.log("info" if exists else "warning", "verify.chunk", f"Chunk {chunk['message_id']} exists={exists}", int(chunk["file_id"]))
+            db.log("debug" if exists else "warning", "verify.chunk", f"Chunk {chunk['message_id']} exists={exists}", int(chunk["file_id"]))
             count += 1
     return count

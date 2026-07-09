@@ -7,7 +7,7 @@ def enqueue_unbacked(db: Database) -> int:
         rows = conn.execute(
             """
             SELECT id FROM files
-            WHERE state IN ('discovered', 'changed', 'missing_chunks', 'failed')
+            WHERE state IN ('discovered', 'changed', 'missing_chunks')
               AND id NOT IN (SELECT file_id FROM queue WHERE status IN ('queued', 'posting'))
             ORDER BY created_at ASC
             """
@@ -15,7 +15,7 @@ def enqueue_unbacked(db: Database) -> int:
     for row in rows:
         db.queue_file(int(row["id"]), priority=100, reason="unbacked")
         count += 1
-    db.log("info", "queue", f"Queued {count} unbacked files")
+    db.log("info" if count else "debug", "queue", f"Queued {count} unbacked files")
     return count
 
 
@@ -39,7 +39,7 @@ def prioritize(db: Database, filter_name: str) -> int:
         ).fetchall()
         for position, row in enumerate(rows, start=1):
             conn.execute("UPDATE queue SET position=?, updated_at=datetime('now') WHERE file_id=?", (position, row["file_id"]))
-    db.log("info", "queue.prioritize", f"Applied queue filter {filter_name}")
+    db.log("debug", "queue.prioritize", f"Applied queue filter {filter_name}")
     return len(rows)
 
 
