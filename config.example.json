@@ -1,0 +1,35 @@
+{
+  "database": "backuprr.sqlite3",
+  "article_size": 786432,
+  "newsgroup": "alt.binaries.backup",
+  "verification_interval_days": 90,
+  "usenet_hosts": [
+    {
+      "name": "eweka-read",
+      "mode": "read",
+      "host": "news.eweka.nl",
+      "port": 563,
+      "tls": "implicit",
+      "username_env": "BACKUPRR_USENET_USER",
+      "password_env": "BACKUPRR_USENET_PASSWORD"
+    },
+    {
+      "name": "eweka-post",
+      "mode": "post",
+      "host": "post.eweka.nl",
+      "port": 563,
+      "tls": "implicit",
+      "username_env": "BACKUPRR_USENET_USER",
+      "password_env": "BACKUPRR_USENET_PASSWORD"
+    }
+  ],
+  "endpoints": [],
+  "zip_subfolders": false,
+  "encrypt_bodies": false,
+  "encryption_passphrase_env": "BACKUPRR_ENCRYPTION_PASSPHRASE",
+  "par2": {
+    "enabled": false,
+    "command": "par2",
+    "redundancy_percent": 10
+  }
+}

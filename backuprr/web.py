@@ -1,0 +1,194 @@
+import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+
+from . import __version__
+from .backup import post_next, verify_due_chunks
+from .config import Config
+from .db import Database
+from .queueing import enqueue_unbacked, move, prioritize
+from .restore import restore_file, restore_folder
+from .scanner import scan_all
+
+
+def rowdicts(rows):
+    return [dict(row) for row in rows]
+
+
+class Handler(BaseHTTPRequestHandler):
+    config: Config
+    db: Database
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        self.db.log("verbose", "web.access", fmt % args)
+
+    def send_json(self, data: Any, status: int = 200) -> None:
+        payload = json.dumps(data, default=str).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def read_json(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        if length == 0:
+            return {}
+        return json.loads(self.rfile.read(length).decode("utf-8"))
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        query = parse_qs(parsed.query)
+        if parsed.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(INDEX_HTML.encode("utf-8"))
+        elif parsed.path == "/api/status":
+            self.send_json({"version": __version__, "stats": self.db.stats()})
+        elif parsed.path == "/api/files":
+            self.send_json(rowdicts(self.db.list_rows("files", int(query.get("limit", ["200"])[0]))))
+        elif parsed.path == "/api/search":
+            self.send_json(rowdicts(self.db.search_files(query.get("q", [""])[0])))
+        elif parsed.path == "/api/log":
+            self.send_json(rowdicts(self.db.list_rows("events", int(query.get("limit", ["300"])[0]))))
+        elif parsed.path == "/api/queue":
+            with self.db.connect() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT q.*, f.path, f.size, f.state FROM queue q
+                    JOIN files f ON f.id = q.file_id
+                    ORDER BY q.priority ASC, q.position ASC
+                    """
+                ).fetchall()
+            self.send_json(rowdicts(rows))
+        elif parsed.path == "/api/settings":
+            data = self.config.to_dict()
+            for host in data["usenet_hosts"]:
+                host.pop("password", None)
+            self.send_json(data)
+        else:
+            self.send_json({"error": "not found"}, 404)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        try:
+            data = self.read_json()
+            if parsed.path == "/api/scan":
+                self.send_json({"files": scan_all(self.db)})
+            elif parsed.path == "/api/queue/enqueue-unbacked":
+                self.send_json({"queued": enqueue_unbacked(self.db)})
+            elif parsed.path == "/api/queue/prioritize":
+                self.send_json({"changed": prioritize(self.db, data.get("filter", "older-first"))})
+            elif parsed.path == "/api/queue/move":
+                move(self.db, int(data["file_id"]), int(data["position"]))
+                self.send_json({"ok": True})
+            elif parsed.path == "/api/post-next":
+                self.send_json({"file_id": post_next(self.db, self.config)})
+            elif parsed.path == "/api/verify":
+                self.send_json({"verified": verify_due_chunks(self.db, self.config, force=bool(data.get("force")))})
+            elif parsed.path == "/api/restore":
+                if data.get("folder"):
+                    self.send_json({"restored": restore_folder(self.db, self.config, data["path"], data.get("dest"))})
+                else:
+                    self.send_json({"target": str(restore_file(self.db, self.config, data["path"], data.get("dest")))})
+            else:
+                self.send_json({"error": "not found"}, 404)
+        except Exception as exc:
+            self.db.log("error", "web.error", f"{parsed.path}: {exc}")
+            self.send_json({"error": str(exc)}, 500)
+
+
+def run_web(config: Config, db: Database, host: str, port: int) -> None:
+    Handler.config = config
+    Handler.db = db
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"Backuprr {__version__} listening on http://{host}:{port}")
+    server.serve_forever()
+
+
+INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backuprr</title>
+<style>
+:root { color-scheme: light; --ink:#172026; --muted:#64717b; --line:#d8dee4; --bg:#f6f7f8; --accent:#0f766e; --warn:#b45309; --bad:#b91c1c; }
+* { box-sizing:border-box; }
+body { margin:0; font:14px/1.45 system-ui, -apple-system, Segoe UI, sans-serif; color:var(--ink); background:var(--bg); }
+header { height:56px; display:flex; align-items:center; justify-content:space-between; padding:0 18px; background:#fff; border-bottom:1px solid var(--line); }
+header strong { font-size:18px; }
+nav { width:220px; padding:14px; border-right:1px solid var(--line); background:#fff; min-height:calc(100vh - 56px); }
+nav button { width:100%; display:flex; align-items:center; gap:8px; margin:3px 0; padding:9px 10px; border:0; background:transparent; color:var(--ink); text-align:left; border-radius:6px; cursor:pointer; }
+nav button.active, nav button:hover { background:#e8f3f1; }
+main { display:flex; }
+section { flex:1; padding:18px; min-width:0; }
+.toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
+button, select, input { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:6px; padding:8px 10px; font:inherit; }
+button { cursor:pointer; }
+button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); }
+th, td { padding:8px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; overflow-wrap:anywhere; }
+th { color:var(--muted); font-weight:600; background:#fafbfb; }
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-bottom:16px; }
+.stat { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px; }
+.stat b { display:block; font-size:24px; }
+.hidden { display:none; }
+.muted { color:var(--muted); }
+.error { color:var(--bad); }
+pre { white-space:pre-wrap; background:#fff; border:1px solid var(--line); padding:12px; border-radius:8px; }
+@media (max-width:760px) { main { display:block; } nav { width:auto; min-height:0; border-right:0; border-bottom:1px solid var(--line); display:grid; grid-template-columns:repeat(2,1fr); } }
+</style>
+</head>
+<body>
+<header><strong>Backuprr</strong><span id="version" class="muted"></span></header>
+<main>
+<nav id="nav"></nav>
+<section id="content"></section>
+</main>
+<script>
+const pages = ["Status","Files","Search","Log","Queue","Restore","Settings","About"];
+let page = "Status";
+const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
+const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
+function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
+function table(rows, cols){
+ if(!rows.length) return "<p class='muted'>No rows.</p>";
+ return `<table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>`+
+ rows.map(r=>`<tr>${cols.map(c=>`<td>${esc(r[c])}</td>`).join("")}</tr>`).join("")+"</tbody></table>";
+}
+function nav(){
+ document.getElementById("nav").innerHTML = pages.map(p=>`<button class="${p===page?"active":""}" onclick="page='${p}';render()"> ${p}</button>`).join("");
+}
+async function render(){
+ nav();
+ const c = document.getElementById("content");
+ if(page==="Status"){
+  const s = await api("/api/status"); document.getElementById("version").textContent = "v"+s.version;
+  c.innerHTML = `<div class="toolbar"><button class="primary" onclick="post('/api/scan').then(render)">Scan</button><button onclick="post('/api/queue/enqueue-unbacked').then(render)">Queue unbacked</button><button onclick="post('/api/verify',{force:true}).then(render)">Verify now</button></div><div class="stats">${Object.entries(s.stats).map(([k,v])=>`<div class="stat"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join("")}</div>`;
+ }
+ if(page==="Files"){ c.innerHTML = table(await api("/api/files"), ["id","relative_path","size","state","updated_at","sha256"]); }
+ if(page==="Search"){
+  c.innerHTML = `<div class="toolbar"><input id="q" placeholder="Search files"><button onclick="search()">Search</button></div><div id="results"></div>`;
+ }
+ if(page==="Log"){ c.innerHTML = table(await api("/api/log"), ["id","ts","level","event_type","message","file_id"]); }
+ if(page==="Queue"){
+  const rows = await api("/api/queue");
+  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(render)">Apply filter</button><button class="primary" onclick="post('/api/post-next').then(render)">Post next</button></div>`+
+  table(rows, ["file_id","position","priority","status","reason","path","size","state"]);
+ }
+ if(page==="Restore"){
+  c.innerHTML = `<div class="toolbar"><input id="restorePath" placeholder="File or folder path"><input id="restoreDest" placeholder="Optional destination"><label><input id="restoreFolder" type="checkbox"> Folder</label><button class="primary" onclick="restore()">Restore</button></div><pre id="restoreOut"></pre>`;
+ }
+ if(page==="Settings"){ c.innerHTML = `<pre>${esc(JSON.stringify(await api("/api/settings"), null, 2))}</pre>`; }
+ if(page==="About"){ c.innerHTML = `<h1>Backuprr</h1><p>Version <span id="aboutVersion"></span></p><p>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
+}
+async function search(){ document.getElementById("results").innerHTML = table(await api("/api/search?q="+encodeURIComponent(document.getElementById("q").value)), ["id","relative_path","size","state","updated_at"]); }
+async function restore(){ const out = await post("/api/restore",{path:restorePath.value,dest:restoreDest.value,folder:restoreFolder.checked}); restoreOut.textContent = JSON.stringify(out,null,2); }
+render();
+</script>
+</body>
+</html>"""
+
