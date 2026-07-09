@@ -8,6 +8,7 @@ def enqueue_unbacked(db: Database) -> int:
             """
             SELECT id FROM files
             WHERE state IN ('discovered', 'changed', 'missing_chunks', 'failed')
+              AND id NOT IN (SELECT file_id FROM queue WHERE status IN ('queued', 'posting'))
             ORDER BY created_at ASC
             """
         ).fetchall()
@@ -32,6 +33,7 @@ def prioritize(db: Database, filter_name: str) -> int:
             SELECT q.file_id FROM queue q
             JOIN files f ON f.id = q.file_id
             WHERE q.status='queued'
+              AND f.state NOT IN ('backed_up', 'deleted', 'posting')
             ORDER BY {order}
             """
         ).fetchall()
@@ -45,4 +47,3 @@ def move(db: Database, file_id: int, position: int) -> None:
     with db.connect() as conn:
         conn.execute("UPDATE queue SET position=?, updated_at=datetime('now') WHERE file_id=?", (position, file_id))
     db.log("info", "queue.move", f"Moved file {file_id} to queue position {position}", file_id)
-

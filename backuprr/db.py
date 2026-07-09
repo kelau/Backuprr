@@ -1,6 +1,6 @@
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
@@ -232,6 +232,9 @@ class Database:
     def queue_file(self, file_id: int, priority: int = 100, reason: str = "manual") -> None:
         now = utcnow()
         with self.connect() as conn:
+            file_row = conn.execute("SELECT state FROM files WHERE id=?", (file_id,)).fetchone()
+            if not file_row or file_row["state"] in {"backed_up", "deleted", "posting"}:
+                return
             row = conn.execute("SELECT COALESCE(MAX(position), 0) + 1 AS next_pos FROM queue").fetchone()
             conn.execute(
                 """
@@ -251,10 +254,36 @@ class Database:
                 SELECT q.*, f.path, f.size, f.sha256 FROM queue q
                 JOIN files f ON f.id = q.file_id
                 WHERE q.status='queued'
+                  AND f.state NOT IN ('backed_up', 'deleted', 'posting')
                 ORDER BY q.priority ASC, q.position ASC
                 LIMIT 1
                 """
             ).fetchone()
+
+    def list_queue(self, include_done: bool = False) -> List[sqlite3.Row]:
+        where = "" if include_done else "WHERE q.status != 'done' AND f.state != 'backed_up'"
+        with self.connect() as conn:
+            return conn.execute(
+                f"""
+                SELECT q.*, f.path, f.size, f.state FROM queue q
+                JOIN files f ON f.id = q.file_id
+                {where}
+                ORDER BY q.priority ASC, q.position ASC
+                """
+            ).fetchall()
+
+    def cleanup_completed_queue(self) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE queue
+                SET status='done', updated_at=?
+                WHERE file_id IN (SELECT id FROM files WHERE state='backed_up')
+                  AND status != 'done'
+                """,
+                (utcnow(),),
+            )
+            return cur.rowcount
 
     def set_queue_status(self, file_id: int, status: str) -> None:
         with self.connect() as conn:
@@ -269,6 +298,11 @@ class Database:
                 """,
                 (file_id, chunk_index, message_id, size, sha256, subject, "posted", utcnow()),
             )
+
+    def clear_chunks(self, file_id: int) -> int:
+        with self.connect() as conn:
+            cur = conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
+            return cur.rowcount
 
     def update_file_state(self, file_id: int, state: str) -> None:
         with self.connect() as conn:
@@ -324,6 +358,40 @@ class Database:
                 "SELECT * FROM files WHERE path LIKE ? OR relative_path LIKE ? ORDER BY path LIMIT ?",
                 (f"%{term}%", f"%{term}%", limit),
             ).fetchall()
+
+    def speed_samples(self, minutes: int = 30, bucket_seconds: int = 60) -> List[Dict[str, Any]]:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        start = now - timedelta(minutes=minutes)
+        buckets: Dict[str, Dict[str, Any]] = {}
+        cursor = start
+        while cursor <= now:
+            bucket_start = cursor - timedelta(seconds=cursor.timestamp() % bucket_seconds)
+            key = bucket_start.isoformat()
+            buckets[key] = {"ts": key, "upload_bps": 0.0, "download_bps": 0.0}
+            cursor += timedelta(seconds=bucket_seconds)
+        with self.connect() as conn:
+            posted = conn.execute(
+                "SELECT posted_at, size FROM chunks WHERE posted_at >= ?",
+                (start.isoformat(),),
+            ).fetchall()
+            verified = conn.execute(
+                "SELECT verified_at, size FROM chunks WHERE verified_at IS NOT NULL AND verified_at >= ?",
+                (start.isoformat(),),
+            ).fetchall()
+        for row in posted:
+            key = self._bucket_key(row["posted_at"], bucket_seconds)
+            buckets.setdefault(key, {"ts": key, "upload_bps": 0.0, "download_bps": 0.0})
+            buckets[key]["upload_bps"] += row["size"] / bucket_seconds
+        for row in verified:
+            key = self._bucket_key(row["verified_at"], bucket_seconds)
+            buckets.setdefault(key, {"ts": key, "upload_bps": 0.0, "download_bps": 0.0})
+            buckets[key]["download_bps"] += row["size"] / bucket_seconds
+        return [buckets[key] for key in sorted(buckets)]
+
+    def _bucket_key(self, timestamp: str, bucket_seconds: int) -> str:
+        dt = datetime.fromisoformat(timestamp)
+        bucket_start = dt - timedelta(seconds=dt.timestamp() % bucket_seconds)
+        return bucket_start.replace(microsecond=0).isoformat()
 
     def stats(self) -> Dict[str, int]:
         with self.connect() as conn:

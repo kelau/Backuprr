@@ -46,7 +46,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.2")
+        self.assertEqual(__version__, "0.2.3")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -157,6 +157,23 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(file_row["state"], "backed_up")
         self.assertNotIn("movie.mkv", chunks[0]["subject"])
 
+    def test_post_next_clears_partial_chunks_before_retry(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<old@example.test>", 3, "abc", "[old]")
+        with patch("backuprr.backup.UsenetClient", FakePostClient):
+            self.assertIsNotNone(post_next(self.db, self.config))
+        with self.db.connect() as conn:
+            chunks = conn.execute("SELECT message_id FROM chunks WHERE file_id=? ORDER BY chunk_index", (file_id,)).fetchall()
+        self.assertTrue(chunks)
+        self.assertNotEqual(chunks[0]["message_id"], "<old@example.test>")
+
     def test_encryption_round_trip(self):
         salt = b"1234567890abcdef"
         encrypted = xor_crypt(b"payload", "secret", salt)
@@ -187,6 +204,34 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(queue_row["status"], "queued")
         self.assertEqual(queue_row["reason"], "missing-chunks")
 
+    def test_queue_hides_completed_backed_up_files_by_default(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='backed_up' WHERE id=?", (file_id,))
+        self.db.cleanup_completed_queue()
+        self.assertEqual(len(self.db.list_queue()), 0)
+        self.assertEqual(len(self.db.list_queue(include_done=True)), 1)
+
+    def test_queue_file_ignores_backed_up_files(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='backed_up' WHERE id=?", (file_id,))
+        self.db.queue_file(file_id)
+        self.assertEqual(len(self.db.list_queue(include_done=True)), 0)
+
     def test_log_filtering_by_level(self):
         self.db.log("info", "test.info", "info message")
         self.db.log("error", "test.error", "error message")
@@ -195,6 +240,19 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([row["level"] for row in rows], ["error"])
         all_rows = self.db.list_events([])
         self.assertEqual(len(all_rows), 3)
+
+    def test_speed_samples_include_posted_chunks(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 120, "abc", "[hidden]")
+        samples = self.db.speed_samples(minutes=5, bucket_seconds=60)
+        self.assertTrue(any(sample["upload_bps"] > 0 for sample in samples))
 
     def test_update_config_from_settings_payload(self):
         update_config(

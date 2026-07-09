@@ -76,6 +76,9 @@ def post_next(db: Database, config: Config) -> Optional[int]:
     host = select_host(config, "post")
     db.set_queue_status(file_id, "posting")
     db.update_file_state(file_id, "posting")
+    cleared = db.clear_chunks(file_id)
+    if cleared:
+        db.log("info", "post.retry", f"Cleared {cleared} partial chunk records before retrying {original}", file_id)
     payload = prepare_payload(original, config)
     try:
         with UsenetClient(host) as client:
@@ -116,4 +119,3 @@ def verify_due_chunks(db: Database, config: Config, force: bool = False) -> int:
             db.log("info" if exists else "warning", "verify.chunk", f"Chunk {chunk['message_id']} exists={exists}", int(chunk["file_id"]))
             count += 1
     return count
-

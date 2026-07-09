@@ -49,6 +49,7 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(INDEX_HTML.encode("utf-8"))
         elif parsed.path == "/api/status":
+            self.db.cleanup_completed_queue()
             self.send_json(
                 {
                     "version": __version__,
@@ -57,6 +58,8 @@ class Handler(BaseHTTPRequestHandler):
                     "backup_interval_seconds": self.config.backup_interval_seconds,
                 }
             )
+        elif parsed.path == "/api/speed":
+            self.send_json(self.db.speed_samples(int(query.get("minutes", ["30"])[0]), int(query.get("bucket", ["60"])[0])))
         elif parsed.path == "/api/files":
             self.send_json(rowdicts(self.db.list_rows("files", int(query.get("limit", ["200"])[0]))))
         elif parsed.path == "/api/search":
@@ -67,15 +70,9 @@ class Handler(BaseHTTPRequestHandler):
                 levels = [item for group in query.get("levels", []) for item in group.split(",")]
             self.send_json(rowdicts(self.db.list_events(levels, int(query.get("limit", ["300"])[0]))))
         elif parsed.path == "/api/queue":
-            with self.db.connect() as conn:
-                rows = conn.execute(
-                    """
-                    SELECT q.*, f.path, f.size, f.state FROM queue q
-                    JOIN files f ON f.id = q.file_id
-                    ORDER BY q.priority ASC, q.position ASC
-                    """
-                ).fetchall()
-            self.send_json(rowdicts(rows))
+            self.db.cleanup_completed_queue()
+            include_done = query.get("include_done", ["0"])[0] in {"1", "true", "yes"}
+            self.send_json(rowdicts(self.db.list_queue(include_done=include_done)))
         elif parsed.path == "/api/tasks":
             self.send_json(self.monitor.tasks() + self.backup_monitor.tasks())
         elif parsed.path == "/api/settings":
@@ -228,7 +225,7 @@ let logLevelSelection = ["error","warning","info","verbose"];
 let logLimitSelection = "300";
 let refreshTimer = null;
 const refreshPages = new Set(["Status","Files","Log","Queue","Tasks"]);
-const refreshMs = 5000;
+const refreshIntervals = { Status:5000, Files:10000, Log:5000, Queue:5000, Tasks:3000 };
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
@@ -244,25 +241,23 @@ function scheduleRefresh(){
  if(refreshTimer) clearInterval(refreshTimer);
  refreshTimer = null;
  if(refreshPages.has(page)){
-  refreshTimer = setInterval(() => render({ passive:true }), refreshMs);
+  refreshTimer = setInterval(() => refreshPage(), refreshIntervals[page] || 5000);
  }
 }
 function refreshLabel(){
- return refreshPages.has(page) ? `<span class="muted refresh-note">Auto-refresh ${Math.round(refreshMs/1000)}s</span>` : "";
+ return refreshPages.has(page) ? `<span class="muted refresh-note">Partial refresh ${Math.round((refreshIntervals[page] || 5000)/1000)}s</span>` : "";
 }
 async function render(){
  nav();
  scheduleRefresh();
  const c = document.getElementById("content");
  if(page==="Status"){
-  const s = await api("/api/status");
-  const tasks = await api("/api/tasks");
-  document.getElementById("version").textContent = "v"+s.version;
-  c.innerHTML = statusDashboard(s, tasks);
+  c.innerHTML = `<div id="statusPanel"></div>`;
+  await updateStatusPage();
  }
  if(page==="Files"){
-  fileRowsCache = await api("/api/files?limit=5000");
-  c.innerHTML = `<div class="toolbar"><button onclick="render()">&#8635;</button><button class="primary" onclick="post('/api/post-next').then(render)">&#9658; Post next</button>${refreshLabel()}</div>${fileTree(fileRowsCache)}`;
+  c.innerHTML = `<div class="toolbar"><button onclick="updateFilesPage()">&#8635;</button><button class="primary" onclick="post('/api/post-next').then(updateFilesPage)">&#9658; Post next</button><label><input id="showDeletedFiles" type="checkbox" onchange="updateFilesPage()"> Show deleted</label>${refreshLabel()}</div><div id="filesTree"></div>`;
+  await updateFilesPage();
  }
  if(page==="Search"){
   c.innerHTML = `<div class="toolbar"><input id="q" placeholder="Search files"><button onclick="search()">Search</button></div><div id="results"></div>`;
@@ -274,17 +269,15 @@ async function render(){
    <select id="logLimit"><option ${logLimitSelection==="100"?"selected":""}>100</option><option ${logLimitSelection==="300"?"selected":""}>300</option><option ${logLimitSelection==="1000"?"selected":""}>1000</option></select>
    <button onclick="loadLog()">Apply</button>${refreshLabel()}
   </div><div id="logRows"></div>`;
-  await loadLog();
+  await updateLogPage();
  }
  if(page==="Queue"){
-  const rows = await api("/api/queue");
-  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(render)">Apply filter</button><button class="primary" onclick="post('/api/post-next').then(render)">Post next</button>${refreshLabel()}</div>`+
-  table(rows, ["file_id","position","priority","status","reason","path","size","state"]);
+  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(updateQueuePage)">Apply filter</button><button class="primary" onclick="post('/api/post-next').then(updateQueuePage)">Post next</button><label><input id="showDoneQueue" type="checkbox" onchange="updateQueuePage()"> Show completed</label>${refreshLabel()}</div><div id="queueRows"></div>`;
+  await updateQueuePage();
  }
  if(page==="Tasks"){
- const rows = await api("/api/tasks");
-  c.innerHTML = `<div class="toolbar"><button onclick="render()">Refresh</button><button class="primary" onclick="post('/api/scan').then(render)">Run catalog scan</button>${refreshLabel()}</div>`+
-  table(rows, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"]);
+  c.innerHTML = `<div class="toolbar"><button onclick="updateTasksPage()">Refresh</button><button class="primary" onclick="post('/api/scan').then(updateTasksPage)">Run catalog scan</button>${refreshLabel()}</div><div id="taskRows"></div>`;
+  await updateTasksPage();
  }
  if(page==="Restore"){
   c.innerHTML = `<div class="toolbar"><input id="restorePath" placeholder="File or folder path"><input id="restoreDest" placeholder="Optional destination"><label><input id="restoreFolder" type="checkbox"> Folder</label><button class="primary" onclick="restore()">Restore</button></div><pre id="restoreOut"></pre>`;
@@ -292,7 +285,39 @@ async function render(){
  if(page==="Settings"){ settingsCache = await api("/api/settings"); c.innerHTML = settingsForm(settingsCache); }
  if(page==="About"){ c.innerHTML = `<h1>Backuprr</h1><p>Version <span id="aboutVersion"></span></p><p>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
 }
-function statusDashboard(status, tasks){
+async function refreshPage(){
+ if(page==="Status") await updateStatusPage();
+ if(page==="Files") await updateFilesPage();
+ if(page==="Log") await updateLogPage(false);
+ if(page==="Queue") await updateQueuePage();
+ if(page==="Tasks") await updateTasksPage();
+}
+async function updateStatusPage(){
+ const s = await api("/api/status");
+ const tasks = await api("/api/tasks");
+ const speed = await api("/api/speed?minutes=30&bucket=60");
+ document.getElementById("version").textContent = "v"+s.version;
+ const panel = document.getElementById("statusPanel");
+ if(panel) panel.innerHTML = statusDashboard(s, tasks, speed);
+}
+async function updateFilesPage(){
+ fileRowsCache = await api("/api/files?limit=5000");
+ const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
+ const target = document.getElementById("filesTree");
+ if(target) target.innerHTML = fileTree(fileRowsCache, showDeleted);
+}
+async function updateQueuePage(){
+ const includeDone = !!document.getElementById("showDoneQueue")?.checked;
+ const rows = await api(`/api/queue?include_done=${includeDone ? "1" : "0"}`);
+ const target = document.getElementById("queueRows");
+ if(target) target.innerHTML = table(rows, ["file_id","position","priority","status","reason","path","size","state"]);
+}
+async function updateTasksPage(){
+ const rows = await api("/api/tasks");
+ const target = document.getElementById("taskRows");
+ if(target) target.innerHTML = table(rows, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"]);
+}
+function statusDashboard(status, tasks, speed){
  const stats = status.stats || {};
  const total = Number(stats.files_total || 0);
  const backed = Number(stats.files_backed_up || 0);
@@ -314,7 +339,7 @@ function statusDashboard(status, tasks){
    <h2>${esc(activeTask ? `${activeTask.name} is running` : "Backuprr is standing by")}</h2>
    <div class="muted">${esc(activeTask ? activeTask.last_result || "Working through the current task" : nextTask ? `Next: ${nextTask.name} in ${nextTask.time_until_next_run}` : "No scheduled task time reported")}</div>
    <div class="progress-track"><div class="progress-fill" style="width:${protectedPct}%"></div></div>
-   <div>${protectedPct}% backed up · ${backed} of ${total} files protected · ${queued + posting} waiting or posting · ${chunks} chunks posted</div>
+   <div>${protectedPct}% backed up &middot; ${backed} of ${total} files protected &middot; ${queued + posting} waiting or posting &middot; ${chunks} chunks posted</div>
   </div>
   <div class="task-strip">${tasks.map(taskCard).join("")}</div>
   <div class="stats">
@@ -326,6 +351,7 @@ function statusDashboard(status, tasks){
    ${statCard("Chunks", chunks)}
   </div>
   <div class="chart-grid">
+   ${speedChart("Transfer speed", speed || [])}
    ${barChart("File states", [
     ["backed up", backed, "ok"],
     ["queued", queued, "warn"],
@@ -362,6 +388,32 @@ function barChart(title, rows){
   return `<div class="bar-row"><span>${esc(label)}</span><div class="bar-track"><div class="bar-fill ${tone === "bad" ? "bad" : tone === "warn" ? "warn" : ""}" style="width:${width}%"></div></div><b>${esc(value)}</b></div>`;
  }).join("")}</div>`;
 }
+function speedChart(title, rows){
+ const width = 520, height = 170, pad = 28;
+ const max = Math.max(1, ...rows.flatMap(row => [Number(row.upload_bps || 0), Number(row.download_bps || 0)]));
+ const points = (key) => rows.map((row, index) => {
+  const x = rows.length <= 1 ? pad : pad + (index / (rows.length - 1)) * (width - pad * 2);
+  const y = height - pad - (Number(row[key] || 0) / max) * (height - pad * 2);
+  return `${x.toFixed(1)},${y.toFixed(1)}`;
+ }).join(" ");
+ const latest = rows[rows.length - 1] || {};
+ return `<div class="chart-card"><h3>${esc(title)}</h3>
+  <svg viewBox="0 0 ${width} ${height}" width="100%" height="180" role="img" aria-label="Transfer speed over time">
+   <line x1="${pad}" y1="${height-pad}" x2="${width-pad}" y2="${height-pad}" stroke="#d8dee4"/>
+   <line x1="${pad}" y1="${pad}" x2="${pad}" y2="${height-pad}" stroke="#d8dee4"/>
+   <polyline points="${points("upload_bps")}" fill="none" stroke="#0f766e" stroke-width="3"/>
+   <polyline points="${points("download_bps")}" fill="none" stroke="#b45309" stroke-width="3"/>
+  </svg>
+  <div class="muted">Upload ${formatBytes(Number(latest.upload_bps || 0))}/s &middot; Download ${formatBytes(Number(latest.download_bps || 0))}/s</div>
+ </div>`;
+}
+function formatBytes(value){
+ const units = ["B","KiB","MiB","GiB"];
+ let size = Number(value || 0);
+ let index = 0;
+ while(size >= 1024 && index < units.length - 1){ size /= 1024; index++; }
+ return `${size.toFixed(index ? 1 : 0)} ${units[index]}`;
+}
 function secondsFromLabel(label){
  const text = String(label || "");
  const h = Number((text.match(/(\d+)h/) || [0,0])[1]);
@@ -369,29 +421,32 @@ function secondsFromLabel(label){
  const s = Number((text.match(/(\d+)s/) || [0,0])[1]);
  return h * 3600 + m * 60 + s;
 }
-async function loadLog(){
+async function updateLogPage(saveSelection=true){
  logLevelSelection = Array.from(document.querySelectorAll(".logLevel:checked")).map(input => input.value);
  logLimitSelection = document.getElementById("logLimit").value;
  const levels = logLevelSelection.map(level => "level="+encodeURIComponent(level)).join("&");
  const limit = encodeURIComponent(logLimitSelection);
  document.getElementById("logRows").innerHTML = table(await api(`/api/log?limit=${limit}&${levels}`), ["id","ts","level","event_type","message","file_id"]);
 }
-function fileTree(rows){
+async function loadLog(){ await updateLogPage(); }
+function fileTree(rows, showDeleted=false){
  const root = { dirs:{}, files:[] };
- for(const row of rows){
+ for(const row of rows.filter(row => showDeleted || row.state !== "deleted")){
   const parts = String(row.relative_path || row.path || "").split(/[\\/]+/).filter(Boolean);
   let node = root;
+  node.total_size = (node.total_size || 0) + Number(row.size || 0);
   for(const part of parts.slice(0, -1)){
-   node.dirs[part] = node.dirs[part] || { dirs:{}, files:[] };
+   node.dirs[part] = node.dirs[part] || { dirs:{}, files:[], total_size:0 };
    node = node.dirs[part];
+   node.total_size = (node.total_size || 0) + Number(row.size || 0);
   }
   node.files.push({...row, display_name: parts[parts.length - 1] || row.path});
  }
- return `<div class="tree"><ul>${treeNode(root, "")}</ul></div>`;
+ return `<div class="tree"><ul>${treeNode(root, "", showDeleted)}</ul></div>`;
 }
-function treeNode(node, prefix){
+function treeNode(node, prefix, showDeleted){
  const dirs = Object.keys(node.dirs).sort((a,b)=>a.localeCompare(b));
- const dirHtml = dirs.map(name => `<li class="folder"><div class="tree-row"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span class="tree-meta">${countFiles(node.dirs[name])} files</span></div><ul>${treeNode(node.dirs[name], prefix ? prefix+"/"+name : name)}</ul></li>`).join("");
+ const dirHtml = dirs.map(name => `<li class="folder"><details><summary class="tree-row"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span class="tree-meta">${countFiles(node.dirs[name])} files &middot; ${formatBytes(node.dirs[name].total_size || 0)}</span></summary><ul>${treeNode(node.dirs[name], prefix ? prefix+"/"+name : name, showDeleted)}</ul></details></li>`).join("");
  const fileHtml = node.files.sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name))).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
 }
@@ -400,12 +455,13 @@ function countFiles(node){
 }
 function fileRow(file){
  const stateClass = file.state === "deleted" ? "error" : "muted";
+ const canQueue = !["backed_up", "deleted", "posting", "queued"].includes(file.state);
  return `<li><div class="tree-row">
   <span>&#128196;</span>
   <span class="tree-name">${esc(file.display_name)}</span>
-  <span class="tree-meta">${esc(file.size)} bytes</span>
+  <span class="tree-meta">${formatBytes(file.size)}</span>
   <span class="tree-meta ${stateClass}">${esc(file.state)}</span>
-  <button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>
+  ${canQueue ? `<button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>` : ""}
   <button class="icon-btn" title="Restore file" onclick="restoreCatalogFile(${Number(file.id)})">&#8635;</button>
  </div></li>`;
 }
