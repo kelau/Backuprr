@@ -188,6 +188,18 @@ class Database:
         with self.connect() as conn:
             return conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
+    def list_events(self, levels: Optional[List[str]] = None, limit: int = 300) -> List[sqlite3.Row]:
+        allowed_levels = {"error", "warning", "info", "verbose"}
+        selected = [level for level in (levels or []) if level in allowed_levels]
+        with self.connect() as conn:
+            if not selected:
+                return conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+            placeholders = ",".join("?" for _ in selected)
+            return conn.execute(
+                f"SELECT * FROM events WHERE level IN ({placeholders}) ORDER BY id DESC LIMIT ?",
+                (*selected, limit),
+            ).fetchall()
+
     def search_files(self, term: str, limit: int = 200) -> List[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(

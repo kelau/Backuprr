@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backuprr.backup import decode_chunk, encode_chunk, post_next
-from backuprr.config import Config, UsenetHost
+from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
 from backuprr.queueing import enqueue_unbacked, prioritize
@@ -124,7 +124,49 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(queue_row["status"], "queued")
         self.assertEqual(queue_row["reason"], "missing-chunks")
 
+    def test_log_filtering_by_level(self):
+        self.db.log("info", "test.info", "info message")
+        self.db.log("error", "test.error", "error message")
+        self.db.log("verbose", "test.verbose", "verbose message")
+        rows = self.db.list_events(["error"])
+        self.assertEqual([row["level"] for row in rows], ["error"])
+        all_rows = self.db.list_events([])
+        self.assertEqual(len(all_rows), 3)
+
+    def test_update_config_from_settings_payload(self):
+        update_config(
+            self.config,
+            {
+                "article_size": 1024,
+                "newsgroup": "alt.binaries.example",
+                "verification_interval_days": 30,
+                "zip_subfolders": True,
+                "encrypt_bodies": True,
+                "encryption_passphrase_env": "BACKUPRR_SECRET",
+                "endpoints": [str(self.root / "media"), ""],
+                "usenet_hosts": [
+                    {
+                        "name": "read",
+                        "mode": "read",
+                        "host": "news.example.test",
+                        "port": 563,
+                        "tls": "implicit",
+                        "username_env": "USER_ENV",
+                        "password_env": "PASS_ENV",
+                    }
+                ],
+                "par2": {"enabled": True, "command": "par2", "redundancy_percent": 12},
+            },
+        )
+        self.assertEqual(self.config.article_size, 1024)
+        self.assertEqual(self.config.newsgroup, "alt.binaries.example")
+        self.assertEqual(self.config.verification_interval_days, 30)
+        self.assertTrue(self.config.zip_subfolders)
+        self.assertTrue(self.config.encrypt_bodies)
+        self.assertEqual(self.config.endpoints, [str(self.root / "media")])
+        self.assertEqual(self.config.usenet_hosts[0].tls, "implicit")
+        self.assertEqual(self.config.par2["redundancy_percent"], 12)
+
 
 if __name__ == "__main__":
     unittest.main()
-

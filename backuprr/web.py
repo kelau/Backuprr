@@ -5,7 +5,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import __version__
 from .backup import post_next, verify_due_chunks
-from .config import Config
+from .config import Config, update_config
 from .db import Database
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
@@ -18,6 +18,7 @@ def rowdicts(rows):
 
 class Handler(BaseHTTPRequestHandler):
     config: Config
+    config_path: str
     db: Database
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -52,7 +53,10 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/search":
             self.send_json(rowdicts(self.db.search_files(query.get("q", [""])[0])))
         elif parsed.path == "/api/log":
-            self.send_json(rowdicts(self.db.list_rows("events", int(query.get("limit", ["300"])[0]))))
+            levels = query.get("level", [])
+            if not levels and query.get("levels"):
+                levels = [item for group in query.get("levels", []) for item in group.split(",")]
+            self.send_json(rowdicts(self.db.list_events(levels, int(query.get("limit", ["300"])[0]))))
         elif parsed.path == "/api/queue":
             with self.db.connect() as conn:
                 rows = conn.execute(
@@ -64,10 +68,7 @@ class Handler(BaseHTTPRequestHandler):
                 ).fetchall()
             self.send_json(rowdicts(rows))
         elif parsed.path == "/api/settings":
-            data = self.config.to_dict()
-            for host in data["usenet_hosts"]:
-                host.pop("password", None)
-            self.send_json(data)
+            self.send_json(self.config.public_dict())
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -93,6 +94,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"restored": restore_folder(self.db, self.config, data["path"], data.get("dest"))})
                 else:
                     self.send_json({"target": str(restore_file(self.db, self.config, data["path"], data.get("dest")))})
+            elif parsed.path == "/api/settings":
+                update_config(self.config, data)
+                self.config.save(self.config_path)
+                for endpoint in self.config.endpoints:
+                    self.db.add_endpoint(endpoint)
+                self.db.log("info", "settings", "Updated configuration from Web UI")
+                self.send_json({"ok": True, "settings": self.config.public_dict()})
             else:
                 self.send_json({"error": "not found"}, 404)
         except Exception as exc:
@@ -102,6 +110,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def run_web(config: Config, db: Database, host: str, port: int) -> None:
     Handler.config = config
+    Handler.config_path = str(config.source_path or (config.base_dir / "config.json"))
     Handler.db = db
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Backuprr {__version__} listening on http://{host}:{port}")
@@ -126,15 +135,21 @@ nav button.active, nav button:hover { background:#e8f3f1; }
 main { display:flex; }
 section { flex:1; padding:18px; min-width:0; }
 .toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:12px; }
-button, select, input { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:6px; padding:8px 10px; font:inherit; }
+button, select, input, textarea { border:1px solid var(--line); background:#fff; color:var(--ink); border-radius:6px; padding:8px 10px; font:inherit; }
 button { cursor:pointer; }
 button.primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+textarea { width:100%; min-height:120px; font-family:ui-monospace, SFMono-Regular, Consolas, monospace; }
+label { display:inline-flex; align-items:center; gap:6px; }
 table { width:100%; border-collapse:collapse; background:#fff; border:1px solid var(--line); }
 th, td { padding:8px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; overflow-wrap:anywhere; }
 th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-bottom:16px; }
 .stat { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px; }
 .stat b { display:block; font-size:24px; }
+.form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; margin-bottom:12px; }
+.field { display:grid; gap:5px; }
+.field span { color:var(--muted); font-size:12px; font-weight:600; }
+.full { grid-column:1 / -1; }
 .hidden { display:none; }
 .muted { color:var(--muted); }
 .error { color:var(--bad); }
@@ -151,6 +166,7 @@ pre { white-space:pre-wrap; background:#fff; border:1px solid var(--line); paddi
 <script>
 const pages = ["Status","Files","Search","Log","Queue","Restore","Settings","About"];
 let page = "Status";
+let settingsCache = null;
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
@@ -173,7 +189,14 @@ async function render(){
  if(page==="Search"){
   c.innerHTML = `<div class="toolbar"><input id="q" placeholder="Search files"><button onclick="search()">Search</button></div><div id="results"></div>`;
  }
- if(page==="Log"){ c.innerHTML = table(await api("/api/log"), ["id","ts","level","event_type","message","file_id"]); }
+ if(page==="Log"){
+  c.innerHTML = `<div class="toolbar">
+   ${["error","warning","info","verbose"].map(level=>`<label><input class="logLevel" type="checkbox" value="${level}" checked> ${level}</label>`).join("")}
+   <select id="logLimit"><option>100</option><option selected>300</option><option>1000</option></select>
+   <button onclick="loadLog()">Apply</button>
+  </div><div id="logRows"></div>`;
+  await loadLog();
+ }
  if(page==="Queue"){
   const rows = await api("/api/queue");
   c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(render)">Apply filter</button><button class="primary" onclick="post('/api/post-next').then(render)">Post next</button></div>`+
@@ -182,13 +205,50 @@ async function render(){
  if(page==="Restore"){
   c.innerHTML = `<div class="toolbar"><input id="restorePath" placeholder="File or folder path"><input id="restoreDest" placeholder="Optional destination"><label><input id="restoreFolder" type="checkbox"> Folder</label><button class="primary" onclick="restore()">Restore</button></div><pre id="restoreOut"></pre>`;
  }
- if(page==="Settings"){ c.innerHTML = `<pre>${esc(JSON.stringify(await api("/api/settings"), null, 2))}</pre>`; }
+ if(page==="Settings"){ settingsCache = await api("/api/settings"); c.innerHTML = settingsForm(settingsCache); }
  if(page==="About"){ c.innerHTML = `<h1>Backuprr</h1><p>Version <span id="aboutVersion"></span></p><p>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
+}
+async function loadLog(){
+ const levels = Array.from(document.querySelectorAll(".logLevel:checked")).map(input => "level="+encodeURIComponent(input.value)).join("&");
+ const limit = encodeURIComponent(document.getElementById("logLimit").value);
+ document.getElementById("logRows").innerHTML = table(await api(`/api/log?limit=${limit}&${levels}`), ["id","ts","level","event_type","message","file_id"]);
 }
 async function search(){ document.getElementById("results").innerHTML = table(await api("/api/search?q="+encodeURIComponent(document.getElementById("q").value)), ["id","relative_path","size","state","updated_at"]); }
 async function restore(){ const out = await post("/api/restore",{path:restorePath.value,dest:restoreDest.value,folder:restoreFolder.checked}); restoreOut.textContent = JSON.stringify(out,null,2); }
+function settingsForm(s){
+ return `<div class="form-grid">
+  <label class="field"><span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
+  <label class="field"><span>Article size bytes</span><input id="setArticleSize" type="number" min="1" value="${esc(s.article_size)}"></label>
+  <label class="field"><span>Verify interval days</span><input id="setVerifyDays" type="number" min="1" value="${esc(s.verification_interval_days)}"></label>
+  <label class="field"><span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
+  <label><input id="setZip" type="checkbox" ${s.zip_subfolders?"checked":""}> Zip subfolders</label>
+  <label><input id="setEncrypt" type="checkbox" ${s.encrypt_bodies?"checked":""}> Encrypt article bodies</label>
+  <label><input id="setPar2" type="checkbox" ${s.par2?.enabled?"checked":""}> Generate PAR2 recovery files</label>
+  <label class="field"><span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
+  <label class="field"><span>PAR2 redundancy percent</span><input id="setPar2Redundancy" type="number" min="0" value="${esc(s.par2?.redundancy_percent ?? 10)}"></label>
+  <label class="field full"><span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
+  <label class="field full"><span>Usenet hosts JSON</span><textarea id="setHosts">${esc(JSON.stringify(s.usenet_hosts || [], null, 2))}</textarea></label>
+ </div>
+ <div class="toolbar"><button class="primary" onclick="saveSettings()">Save settings</button><button onclick="render()">Reset</button></div>
+ <pre id="settingsOut"></pre>`;
+}
+async function saveSettings(){
+ const payload = {
+  newsgroup: setNewsgroup.value,
+  article_size: Number(setArticleSize.value),
+  verification_interval_days: Number(setVerifyDays.value),
+  zip_subfolders: setZip.checked,
+  encrypt_bodies: setEncrypt.checked,
+  encryption_passphrase_env: setPassEnv.value,
+  endpoints: setEndpoints.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
+  usenet_hosts: JSON.parse(setHosts.value),
+  par2: { enabled: setPar2.checked, command: setPar2Command.value, redundancy_percent: Number(setPar2Redundancy.value) }
+ };
+ const out = await post("/api/settings", payload);
+ settingsOut.textContent = JSON.stringify(out, null, 2);
+ if(out.ok) settingsCache = out.settings;
+}
 render();
 </script>
 </body>
 </html>"""
-
