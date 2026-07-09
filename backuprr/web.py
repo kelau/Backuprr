@@ -150,6 +150,11 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .field { display:grid; gap:5px; }
 .field span { color:var(--muted); font-size:12px; font-weight:600; }
 .full { grid-column:1 / -1; }
+.host-list { display:grid; gap:12px; }
+.host-row { border:1px solid var(--line); background:#fff; border-radius:8px; padding:12px; }
+.host-row h3 { margin:0 0 10px; font-size:14px; }
+.host-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
+.danger { color:var(--bad); }
 .hidden { display:none; }
 .muted { color:var(--muted); }
 .error { color:var(--bad); }
@@ -227,10 +232,59 @@ function settingsForm(s){
   <label class="field"><span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
   <label class="field"><span>PAR2 redundancy percent</span><input id="setPar2Redundancy" type="number" min="0" value="${esc(s.par2?.redundancy_percent ?? 10)}"></label>
   <label class="field full"><span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
-  <label class="field full"><span>Usenet hosts JSON</span><textarea id="setHosts">${esc(JSON.stringify(s.usenet_hosts || [], null, 2))}</textarea></label>
+  <div class="field full"><span>Usenet hosts</span><div id="hostList" class="host-list">${hostRows(s.usenet_hosts || [])}</div></div>
  </div>
- <div class="toolbar"><button class="primary" onclick="saveSettings()">Save settings</button><button onclick="render()">Reset</button></div>
+ <div class="toolbar"><button onclick="addHost()">Add host</button><button class="primary" onclick="saveSettings()">Save settings</button><button onclick="render()">Reset</button></div>
  <pre id="settingsOut"></pre>`;
+}
+function hostRows(hosts){
+ return hosts.map((host, index) => hostRow(host, index)).join("") || hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username_env:"", password_env:"" }, 0);
+}
+function hostRow(host, index){
+ return `<div class="host-row" data-host-index="${index}">
+  <div class="toolbar"><h3>Host ${index + 1}</h3><button class="danger" onclick="removeHost(this)">Remove</button></div>
+  <div class="host-grid">
+   <label class="field"><span>Name</span><input class="hostName" value="${esc(host.name)}" placeholder="eweka-read"></label>
+   <label class="field"><span>Mode</span><select class="hostMode"><option value="read" ${host.mode==="read"?"selected":""}>read</option><option value="post" ${host.mode==="post"?"selected":""}>post</option></select></label>
+   <label class="field"><span>Server</span><input class="hostServer" value="${esc(host.host)}" placeholder="news.example.com"></label>
+   <label class="field"><span>Port</span><input class="hostPort" type="number" min="1" value="${esc(host.port || 563)}"></label>
+   <label class="field"><span>TLS mode</span><select class="hostTls"><option value="implicit" ${host.tls==="implicit"?"selected":""}>implicit</option><option value="starttls" ${host.tls==="starttls"?"selected":""}>starttls</option><option value="plain" ${host.tls==="plain"?"selected":""}>plain</option></select></label>
+   <label class="field"><span>Username env</span><input class="hostUsernameEnv" value="${esc(host.username_env || "")}" placeholder="BACKUPRR_USENET_USER"></label>
+   <label class="field"><span>Password env</span><input class="hostPasswordEnv" value="${esc(host.password_env || "")}" placeholder="BACKUPRR_USENET_PASSWORD"></label>
+   <label class="field"><span>Username</span><input class="hostUsername" value="${esc(host.username || "")}" autocomplete="off"></label>
+   <label class="field"><span>Password</span><input class="hostPassword" type="password" value="${esc(host.password || "")}" autocomplete="new-password" placeholder="leave blank to keep existing"></label>
+  </div>
+ </div>`;
+}
+function addHost(){
+ const list = document.getElementById("hostList");
+ const index = list.querySelectorAll(".host-row").length;
+ list.insertAdjacentHTML("beforeend", hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username_env:"", password_env:"" }, index));
+ renumberHosts();
+}
+function removeHost(button){
+ button.closest(".host-row").remove();
+ if(!document.querySelector(".host-row")) addHost();
+ renumberHosts();
+}
+function renumberHosts(){
+ document.querySelectorAll(".host-row").forEach((row, index) => {
+  row.dataset.hostIndex = index;
+  row.querySelector("h3").textContent = `Host ${index + 1}`;
+ });
+}
+function collectHosts(){
+ return Array.from(document.querySelectorAll(".host-row")).map(row => ({
+  name: row.querySelector(".hostName").value.trim(),
+  mode: row.querySelector(".hostMode").value,
+  host: row.querySelector(".hostServer").value.trim(),
+  port: Number(row.querySelector(".hostPort").value),
+  tls: row.querySelector(".hostTls").value,
+  username_env: row.querySelector(".hostUsernameEnv").value.trim() || null,
+  password_env: row.querySelector(".hostPasswordEnv").value.trim() || null,
+  username: row.querySelector(".hostUsername").value.trim() || null,
+  password: row.querySelector(".hostPassword").value || null
+ })).filter(host => host.name || host.host);
 }
 async function saveSettings(){
  const payload = {
@@ -241,7 +295,7 @@ async function saveSettings(){
   encrypt_bodies: setEncrypt.checked,
   encryption_passphrase_env: setPassEnv.value,
   endpoints: setEndpoints.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
-  usenet_hosts: JSON.parse(setHosts.value),
+  usenet_hosts: collectHosts(),
   par2: { enabled: setPar2.checked, command: setPar2Command.value, redundancy_percent: Number(setPar2Redundancy.value) }
  };
  const out = await post("/api/settings", payload);

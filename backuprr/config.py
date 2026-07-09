@@ -125,8 +125,11 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         config.endpoints = [str(item).strip() for item in data["endpoints"] if str(item).strip()]
     if "usenet_hosts" in data:
         hosts = []
+        existing_passwords = {host.name: host.password for host in config.usenet_hosts if host.password}
         for item in data["usenet_hosts"]:
             host = UsenetHost.from_dict(item)
+            if host.password == "" and host.name in existing_passwords:
+                host.password = existing_passwords[host.name]
             if host.mode not in {"read", "post"}:
                 raise ValueError("Usenet host mode must be read or post")
             if host.tls not in {"plain", "starttls", "implicit"}:

@@ -167,6 +167,27 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.usenet_hosts[0].tls, "implicit")
         self.assertEqual(self.config.par2["redundancy_percent"], 12)
 
+    def test_update_config_preserves_blank_existing_host_password(self):
+        self.config.usenet_hosts = [
+            UsenetHost(name="read", mode="read", host="news.example.test", port=563, tls="implicit", password="secret")
+        ]
+        update_config(
+            self.config,
+            {
+                "usenet_hosts": [
+                    {
+                        "name": "read",
+                        "mode": "read",
+                        "host": "news.example.test",
+                        "port": 563,
+                        "tls": "implicit",
+                        "password": "",
+                    }
+                ]
+            },
+        )
+        self.assertEqual(self.config.usenet_hosts[0].password, "secret")
+
 
 if __name__ == "__main__":
     unittest.main()
