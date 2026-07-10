@@ -98,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.19")
+        self.assertEqual(__version__, "0.2.20")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -415,6 +415,24 @@ class CoreTests(unittest.TestCase):
         row = self.db.list_queue()[0]
         self.assertEqual(row["posted_chunks"], 1)
         self.assertEqual(row["posted_bytes"], 8)
+
+    def test_file_rows_include_live_queue_progress(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.set_queue_status(file_id, "posting")
+        self.db.update_file_state(file_id, "posting")
+        self.db.set_queue_progress(file_id, 1, 8)
+        row = self.db.list_files()[0]
+        self.assertEqual(row["queue_status"], "posting")
+        self.assertEqual(row["progress_chunks"], 1)
+        self.assertEqual(row["progress_bytes"], 8)
 
     def test_queue_file_ignores_backed_up_files(self):
         media = self.root / "media"

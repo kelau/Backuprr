@@ -326,6 +326,9 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .bar-fill.bad { background:var(--bad); }
 .progress-track { height:16px; background:#edf1f2; border-radius:999px; overflow:hidden; }
 .progress-fill { height:100%; background:var(--accent); border-radius:999px; transition:width .2s ease; }
+.file-progress { min-width:160px; max-width:220px; display:grid; gap:3px; }
+.file-progress .progress-track { height:8px; }
+.file-progress span { font-size:12px; color:var(--muted); }
 .thread-meter { display:flex; align-items:baseline; gap:8px; margin-bottom:10px; }
 .thread-meter b { font-size:32px; }
 .refresh-note { margin-left:auto; }
@@ -452,6 +455,7 @@ function connectChanges(){
   const previous = lastChangeToken;
   lastChangeToken = token;
   if(previous) refreshPageForChanges(previous, token);
+  else refreshCurrentLivePage();
  });
  eventSource.onerror = () => { document.querySelectorAll(".push-state").forEach(el => el.textContent = "Waiting for change stream"); };
 }
@@ -512,6 +516,14 @@ async function render(){
  if(page==="Settings"){ settingsCache = await api("/api/settings"); c.innerHTML = settingsForm(settingsCache); }
  if(page==="About"){ c.innerHTML = `<h1><span class="ui-icon">&#128230;</span>Backuprr</h1><p><span class="ui-icon">&#128278;</span>Version <span id="aboutVersion"></span></p><p><span class="ui-icon">&#128274;</span>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
 }
+async function refreshCurrentLivePage(){
+ if(page==="Status") await updateStatusPage();
+ if(page==="Files") await updateFilesPage();
+ if(page==="Queue") await updateQueuePage();
+ if(page==="Tasks") await updateTasksPage();
+ if(page==="Verification") await updateVerificationPage();
+ if(page==="Statistics") await updateStatisticsPage();
+}
 async function refreshPageForChanges(previous, token){
  const filesChanged = previous.files_updated !== token.files_updated || previous.files_total !== token.files_total;
  const queueChanged = previous.queue_updated !== token.queue_updated || previous.queue_total !== token.queue_total;
@@ -520,7 +532,7 @@ async function refreshPageForChanges(previous, token){
  const chunksChanged = previous.chunks_total !== token.chunks_total;
  const tasksChanged = previous.task_revision !== token.task_revision;
  if(page==="Status" && (filesChanged || queueChanged || chunksChanged || tasksChanged || transferChanged)) await updateStatusPage();
- if(page==="Files" && filesChanged) await updateFilesPage();
+ if(page==="Files" && (filesChanged || queueChanged || transferChanged)) await updateFilesPage();
  if(page==="Log" && eventsChanged) await updateLogPage(false);
  if(page==="Queue" && (queueChanged || filesChanged || transferChanged)) await updateQueuePage();
  if(page==="Tasks" && (eventsChanged || tasksChanged)) await updateTasksPage();
@@ -872,6 +884,7 @@ function fileRow(file){
  const canQueue = !["backed_up", "deleted", "posting", "queued"].includes(file.state);
  const hasChunks = Number(file.chunk_count || 0) > 0;
  const checked = selectedFiles.has(Number(file.id)) ? "checked" : "";
+ const progress = fileProgress(file);
  return `<li><div class="tree-row">
   <input type="checkbox" class="fileSelect" value="${Number(file.id)}" ${checked} onchange="setFileSelected(${Number(file.id)}, this.checked)">
   <span>&#128196;</span>
@@ -879,10 +892,24 @@ function fileRow(file){
   <span class="tree-meta">${formatBytes(file.size)}</span>
   ${statePill(file.state)}
   <span class="tree-meta">${Number(file.chunk_count || 0)} chunks${file.last_verify_at ? ` &middot; verified ${esc(formatDateTime(file.last_verify_at))}` : ""}</span>
+  ${progress}
   ${canQueue ? `<button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>` : ""}
   ${file.state !== "backed_up" && file.state !== "deleted" ? `<button class="icon-btn" title="Increase queue priority" onclick="boostFile(${Number(file.id)})">&#8593;</button>` : ""}
   ${hasChunks ? `<button class="icon-btn" title="Restore file" onclick="restoreCatalogFile(${Number(file.id)})">&#8635;</button>` : ""}
  </div></li>`;
+}
+function fileProgress(file){
+ const active = file.state === "posting" || file.queue_status === "posting";
+ const queued = file.state === "queued" || file.queue_status === "queued";
+ const expected = Math.max(1, Math.ceil(Number(file.size || 0) / Number(settingsCache?.article_size || 786432)));
+ const chunks = Number(file.progress_chunks || 0);
+ const bytes = Number(file.progress_bytes || 0);
+ const pct = active ? Math.min(100, Math.round((chunks / expected) * 100)) : queued ? 0 : file.state === "backed_up" ? 100 : 0;
+ if(!active && !queued && file.state !== "backed_up") return "";
+ const label = active
+  ? `${chunks}/${expected} chunks · ${formatBytes(bytes)} posted · ${pct}%`
+  : queued ? `Queued · 0/${expected} chunks` : `Protected · ${Number(file.chunk_count || 0)} chunks`;
+ return `<div class="file-progress"><div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div><span>${esc(label)}</span></div>`;
 }
 function setFileSelected(fileId, checked){
  const id = Number(fileId);

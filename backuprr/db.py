@@ -623,9 +623,13 @@ class Database:
                        COUNT(c.id) AS chunk_count,
                        SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END) AS verified_chunks,
                        SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) AS missing_chunks,
-                       COALESCE(SUM(c.size), 0) AS chunk_bytes
+                       COALESCE(SUM(c.size), 0) AS chunk_bytes,
+                       q.status AS queue_status,
+                       q.progress_chunks AS progress_chunks,
+                       q.progress_bytes AS progress_bytes
                 FROM files f
                 LEFT JOIN chunks c ON c.file_id = f.id
+                LEFT JOIN queue q ON q.file_id = f.id
                 {where}
                 GROUP BY f.id
                 ORDER BY f.relative_path
