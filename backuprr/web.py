@@ -10,7 +10,8 @@ from . import __version__
 from .cloud_backup import backup_config_and_database
 from .config import Config, update_config
 from .db import Database
-from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor
+from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, MaintenanceMonitor, RestoreDrillMonitor
+from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
 
@@ -70,6 +71,8 @@ class Handler(BaseHTTPRequestHandler):
     backup_monitor: BackupMonitor
     verification_monitor: VerificationMonitor
     cloud_backup_monitor: CloudBackupMonitor
+    maintenance_monitor: MaintenanceMonitor
+    restore_drill_monitor: RestoreDrillMonitor
 
     def log_message(self, fmt: str, *args: Any) -> None:
         self.db.log("verbose", "web.access", fmt % args)
@@ -112,6 +115,9 @@ class Handler(BaseHTTPRequestHandler):
                     "verification_task_interval_seconds": self.config.verification_task_interval_seconds,
                     "verification_files_per_run": self.config.verification_files_per_run,
                     "cloud_backup_interval_seconds": self.config.cloud_backup_interval_seconds,
+                    "maintenance_interval_seconds": self.config.maintenance_interval_seconds,
+                    "restore_drill_task_interval_seconds": self.config.restore_drill_task_interval_seconds,
+                    "paused_workers": self.db.paused_kinds(),
                 }
             )
         elif parsed.path == "/api/speed":
@@ -142,8 +148,22 @@ class Handler(BaseHTTPRequestHandler):
                     "tasks": self.all_tasks(),
                     "speed": self.db.speed_samples(120, 300),
                     "events": rowdicts(self.db.list_events(limit=50, exclude_event_types=["web.access"])),
+                    "backup_runs": rowdicts(self.db.backup_run_rows(20)),
+                    "host_health": rowdicts(self.db.host_health_rows(20)),
+                    "maintenance": rowdicts(self.db.maintenance_rows(20)),
+                    "restore_drills": rowdicts(self.db.restore_drill_rows(20)),
                 }
             )
+        elif parsed.path == "/api/dry-run":
+            self.send_json(dry_run_plan(self.db, self.config))
+        elif parsed.path == "/api/health":
+            self.send_json({"hosts": rowdicts(self.db.host_health_rows(50))})
+        elif parsed.path == "/api/backup-runs":
+            self.send_json(rowdicts(self.db.backup_run_rows(int(query.get("limit", ["50"])[0]))))
+        elif parsed.path == "/api/maintenance":
+            self.send_json(rowdicts(self.db.maintenance_rows(int(query.get("limit", ["50"])[0]))))
+        elif parsed.path == "/api/restore-drills":
+            self.send_json(rowdicts(self.db.restore_drill_rows(int(query.get("limit", ["50"])[0]))))
         elif parsed.path == "/api/verification":
             page = max(1, int(query.get("page", ["1"])[0]))
             page_size = max(1, min(200, int(query.get("page_size", ["25"])[0])))
@@ -209,6 +229,22 @@ class Handler(BaseHTTPRequestHandler):
                 results = backup_config_and_database(self.db, self.config)
                 self.db.log("info", "cloud.backup", f"Backed up config/database to {len(results)} cloud targets")
                 self.send_json({"ok": True, "results": results})
+            elif parsed.path == "/api/worker/pause":
+                kind = str(data.get("kind", "all"))
+                self.db.set_paused(kind, True)
+                self.send_json({"ok": True, "paused": self.db.paused_kinds()})
+            elif parsed.path == "/api/worker/resume":
+                kind = str(data.get("kind", "all"))
+                self.db.set_paused(kind, False)
+                self.send_json({"ok": True, "paused": self.db.paused_kinds()})
+            elif parsed.path == "/api/health/check":
+                self.send_json({"hosts": check_usenet_hosts(self.db, self.config)})
+            elif parsed.path == "/api/maintenance/run":
+                self.send_json(run_maintenance(self.db, self.config, vacuum=bool(data.get("vacuum"))))
+            elif parsed.path == "/api/restore-drill/run":
+                self.send_json(run_restore_drill(self.db, self.config))
+            elif parsed.path == "/api/restore/confidence":
+                self.send_json(restore_confidence(self.db, data["path"]))
             elif parsed.path == "/api/restore":
                 if data.get("folder"):
                     self.send_json({"restored": restore_folder(self.db, self.config, data["path"], data.get("dest"))})
@@ -238,7 +274,14 @@ class Handler(BaseHTTPRequestHandler):
         return payload
 
     def all_tasks(self) -> list[dict]:
-        return self.monitor.tasks() + self.backup_monitor.tasks() + self.verification_monitor.tasks() + self.cloud_backup_monitor.tasks()
+        return (
+            self.monitor.tasks()
+            + self.backup_monitor.tasks()
+            + self.verification_monitor.tasks()
+            + self.cloud_backup_monitor.tasks()
+            + self.maintenance_monitor.tasks()
+            + self.restore_drill_monitor.tasks()
+        )
 
     def stream_changes(self) -> None:
         self.send_response(200)
@@ -272,6 +315,8 @@ def run_web(config: Config, db: Database, host: str, port: int) -> None:
     Handler.backup_monitor = BackupMonitor(db, config)
     Handler.verification_monitor = VerificationMonitor(db, config)
     Handler.cloud_backup_monitor = CloudBackupMonitor(db, config)
+    Handler.maintenance_monitor = MaintenanceMonitor(db, config)
+    Handler.restore_drill_monitor = RestoreDrillMonitor(db, config)
     recovered = db.recover_interrupted_posting()
     if recovered:
         db.log("warning", "startup.recover", f"Recovered {recovered} interrupted posting queue item(s) before workers started")
@@ -279,6 +324,8 @@ def run_web(config: Config, db: Database, host: str, port: int) -> None:
     Handler.backup_monitor.start()
     Handler.verification_monitor.start()
     Handler.cloud_backup_monitor.start()
+    Handler.maintenance_monitor.start()
+    Handler.restore_drill_monitor.start()
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Backuprr {__version__} listening on http://{host}:{port}")
     try:
@@ -288,6 +335,8 @@ def run_web(config: Config, db: Database, host: str, port: int) -> None:
         Handler.backup_monitor.stop()
         Handler.verification_monitor.stop()
         Handler.cloud_backup_monitor.stop()
+        Handler.maintenance_monitor.stop()
+        Handler.restore_drill_monitor.stop()
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -397,7 +446,7 @@ pre { white-space:pre-wrap; background:#fff; border:1px solid var(--line); paddi
 <section id="content"></section>
 </main>
 <script>
-const pages = ["Status","Files","Search","Log","Queue","Tasks","Verification","Statistics","Settings","About"];
+const pages = ["Status","Files","Search","Log","Queue","Tasks","Verification","Statistics","Operations","Settings","About"];
 let page = "Status";
 let settingsCache = null;
 let fileRowsCache = [];
@@ -427,11 +476,11 @@ function table(rows, cols){
  rows.map(r=>`<tr>${cols.map(c=>`<td>${formatCellHtml(c, r[c], r)}</td>`).join("")}</tr>`).join("")+"</tbody></table>";
 }
 function formatCell(col, value){
- return ["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total"].includes(col) ? formatBytes(value) : value;
+ return ["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked"].includes(col) ? formatBytes(value) : value;
 }
 function formatCellHtml(col, value, row={}){
- if(["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total"].includes(col)) return esc(formatBytes(value));
- if(["ts","created_at","updated_at","last_backup_at","last_verify_at","last_chunk_verify_at","posted_at","verified_at","last_run"].includes(col)) return esc(formatDateTime(value));
+ if(["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked"].includes(col)) return esc(formatBytes(value));
+ if(["ts","created_at","updated_at","last_backup_at","last_verify_at","last_chunk_verify_at","posted_at","verified_at","last_run","started_at","finished_at","checked_at"].includes(col)) return esc(formatDateTime(value));
  if(["state","status"].includes(col)) return statePill(value);
  if(col === "level") return levelPill(value);
  if(col === "kind") return iconText(kindIcon(value), value);
@@ -443,7 +492,7 @@ function iconText(icon, text, cls=""){
  return `<span class="${cls}"><span class="ui-icon">${icon}</span>${esc(text)}</span>`;
 }
 function pageIcon(name){
- return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
+ return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Operations:"&#128736;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
 }
 function stateIcon(value){
  return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",unreadable:"&#128274;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;"}[String(value || "")] || "&#8226;");
@@ -462,7 +511,7 @@ function levelPill(value){
  return `<span class="pill ${tone}"><span class="ui-icon">${icon}</span>${esc(value || "-")}</span>`;
 }
 function kindIcon(value){
- return ({catalog:"&#128193;",backup:"&#128230;",verification:"&#10003;",cloud_backup:"&#9729;"}[String(value || "")] || "&#9881;");
+ return ({catalog:"&#128193;",backup:"&#128230;",verification:"&#10003;",cloud_backup:"&#9729;",maintenance:"&#128736;",restore_drill:"&#8635;"}[String(value || "")] || "&#9881;");
 }
 function iconForProgress(value){
  const pct = Number(value || 0);
@@ -539,6 +588,10 @@ async function render(){
   c.innerHTML = `<div id="statisticsPanel"></div>`;
   await updateStatisticsPage();
  }
+ if(page==="Operations"){
+  c.innerHTML = `<div id="operationsPanel"></div>`;
+  await updateOperationsPage();
+ }
  if(page==="Settings"){ settingsCache = await api("/api/settings"); c.innerHTML = settingsForm(settingsCache); }
  if(page==="About"){ c.innerHTML = `<h1><span class="ui-icon">&#128230;</span>Backuprr</h1><p><span class="ui-icon">&#128278;</span>Version <span id="aboutVersion"></span></p><p><span class="ui-icon">&#128274;</span>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
 }
@@ -549,6 +602,7 @@ async function refreshCurrentLivePage(){
  if(page==="Tasks") await updateTasksPage();
  if(page==="Verification") await updateVerificationPage();
  if(page==="Statistics") await updateStatisticsPage();
+ if(page==="Operations") await updateOperationsPage();
 }
 async function refreshPageForChanges(previous, token){
  const filesChanged = previous.files_updated !== token.files_updated || previous.files_total !== token.files_total;
@@ -564,6 +618,7 @@ async function refreshPageForChanges(previous, token){
  if(page==="Tasks" && (eventsChanged || tasksChanged)) await updateTasksPage();
  if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged)) await updateVerificationPage();
  if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged || transferChanged)) await updateStatisticsPage();
+ if(page==="Operations" && (eventsChanged || tasksChanged || transferChanged)) await updateOperationsPage();
  document.querySelectorAll(".push-state").forEach(el => el.textContent = "Updated after change");
 }
 async function updateStatusPage(){
@@ -660,6 +715,18 @@ async function updateStatisticsPage(){
  if(!settingsCache) settingsCache = await api("/api/settings");
  const target = document.getElementById("statisticsPanel");
  if(target) target.innerHTML = statisticsDashboard(data);
+}
+async function updateOperationsPage(){
+ const [tasks, plan, health, maintenance, drills, runs] = await Promise.all([
+  api("/api/tasks"),
+  api("/api/dry-run"),
+  api("/api/health"),
+  api("/api/maintenance"),
+  api("/api/restore-drills"),
+  api("/api/backup-runs?limit=20")
+ ]);
+ const target = document.getElementById("operationsPanel");
+ if(target) target.innerHTML = operationsDashboard(tasks, plan, health.hosts || [], maintenance || [], drills || [], runs || []);
 }
 function paginationControls(result, pageVar, updateFn){
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || 1)));
@@ -781,7 +848,7 @@ function taskCard(task){
  const running = task.status === "running";
  return `<div class="task-card">
   <h3><span class="ui-icon">${kindIcon(task.kind)}</span>${esc(task.name)}</h3>
-  <span class="badge ${running ? "running" : ""}"><span class="ui-icon">${stateIcon(task.status)}</span>${esc(task.status)}</span>
+  <span class="badge ${running ? "running" : ""}"><span class="ui-icon">${task.paused ? "&#9208;" : stateIcon(task.status)}</span>${esc(task.paused ? "paused" : task.status)}</span>
   <div class="muted"><span class="ui-icon">&#9201;</span>Last run: ${esc(formatDateTime(task.last_run) || "not yet")}</div>
   <div><span class="ui-icon">&#9201;</span>Duration: ${esc(task.last_run_duration || "-")}</div>
   <div><span class="ui-icon">&#9202;</span>Next run: ${esc(task.time_until_next_run || "-")}</div>
@@ -800,6 +867,10 @@ function statisticsDashboard(data){
  const tasks = data.tasks || [];
  const speed = data.speed || [];
  const events = data.events || [];
+ const backupRuns = data.backup_runs || [];
+ const hostHealth = data.host_health || [];
+ const maintenance = data.maintenance || [];
+ const restoreDrills = data.restore_drills || [];
  const eventCounts = {};
  for(const event of events){ eventCounts[event.event_type] = (eventCounts[event.event_type] || 0) + 1; }
  const eventRows = Object.entries(eventCounts).sort((a,b)=>b[1]-a[1]).slice(0, 10).map(([label, value]) => [label, value, "ok"]);
@@ -818,6 +889,43 @@ function statisticsDashboard(data){
   </div>
   <h2 class="section-title"><span class="ui-icon">&#9881;</span>Workers</h2>
   ${table(tasks, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"])}
+  <h2 class="section-title"><span class="ui-icon">&#128230;</span>Backup runs</h2>
+  ${table(backupRuns, ["id","file_id","status","reason","host","started_at","finished_at","chunks_done","chunks_total","bytes_done","bytes_total","error"])}
+  <h2 class="section-title"><span class="ui-icon">&#128225;</span>Host health</h2>
+  ${table(hostHealth, ["host_name","mode","status","latency_ms","checked_at","message"])}
+  <h2 class="section-title"><span class="ui-icon">&#128736;</span>Maintenance</h2>
+  ${table(maintenance, ["kind","started_at","finished_at","result","details"])}
+  <h2 class="section-title"><span class="ui-icon">&#8635;</span>Restore drills</h2>
+  ${table(restoreDrills, ["file_id","path","status","checked_at","bytes_checked","message"])}
+ </div>`;
+}
+function operationsDashboard(tasks, plan, health, maintenance, drills, runs){
+ return `<div class="dashboard">
+  <div class="toolbar">
+   <button class="primary" onclick="post('/api/health/check').then(updateOperationsPage)"><span class="ui-icon">&#128225;</span>Check Usenet hosts</button>
+   <button onclick="post('/api/maintenance/run', { vacuum:false }).then(updateOperationsPage)"><span class="ui-icon">&#128736;</span>Prune logs</button>
+   <button onclick="post('/api/maintenance/run', { vacuum:true }).then(updateOperationsPage)"><span class="ui-icon">&#128190;</span>Vacuum database</button>
+   <button onclick="post('/api/restore-drill/run').then(updateOperationsPage)"><span class="ui-icon">&#8635;</span>Run restore drill</button>
+   ${pushLabel()}
+  </div>
+  <h2 class="section-title"><span class="ui-icon">&#9208;</span>Worker controls</h2>
+  <div class="task-strip">${tasks.map(task => `<div class="task-card"><h3><span class="ui-icon">${kindIcon(task.kind)}</span>${esc(task.name)}</h3><div>${statePill(task.paused ? "paused" : task.status)}</div><div class="toolbar"><button onclick="post('/api/worker/pause',{kind:${jsString(task.kind)}}).then(updateOperationsPage)">Pause</button><button onclick="post('/api/worker/resume',{kind:${jsString(task.kind)}}).then(updateOperationsPage)">Resume</button></div></div>`).join("")}</div>
+  <h2 class="section-title"><span class="ui-icon">&#128221;</span>Dry-run backup plan</h2>
+  <div class="stats">
+   ${statCard("Files", plan.files_total || 0, "&#128196;")}
+   ${statCard("Unprotected", plan.files_unprotected || 0, "&#9888;")}
+   ${statCard("Data to protect", formatBytes(plan.bytes_unprotected || 0), "&#128190;")}
+   ${statCard("Estimated articles", plan.estimated_articles || 0, "&#129513;")}
+   ${statCard("Estimated time", plan.estimated_days_at_limit == null ? "No limit" : `${plan.estimated_days_at_limit} days`, "&#9201;")}
+  </div>
+  <h2 class="section-title"><span class="ui-icon">&#128225;</span>Provider health</h2>
+  ${table(health, ["host_name","mode","status","latency_ms","checked_at","message"])}
+  <h2 class="section-title"><span class="ui-icon">&#128230;</span>Recent backup sessions</h2>
+  ${table(runs, ["id","file_id","status","reason","host","chunks_done","chunks_total","bytes_done","bytes_total","error"])}
+  <h2 class="section-title"><span class="ui-icon">&#128736;</span>Maintenance history</h2>
+  ${table(maintenance, ["kind","started_at","finished_at","result","details"])}
+  <h2 class="section-title"><span class="ui-icon">&#8635;</span>Restore drill history</h2>
+  ${table(drills, ["file_id","path","status","checked_at","bytes_checked","message"])}
  </div>`;
 }
 function speedChart(title, rows){
@@ -1071,6 +1179,8 @@ async function restoreSelectedFiles(){
  const dest = prompt("Restore destination folder, blank for original locations", "");
  let restored = 0;
  for(const file of selectedRows){
+  const confidence = await post("/api/restore/confidence", { path:file.path });
+  if(confidence.warning && !confirm(`${file.relative_path || file.path}\n${confidence.warning}\nContinue restore?`)) continue;
   const out = await post("/api/restore", { path:file.path, dest:dest || null });
   if(out.error) return alert(out.error);
   restored++;
@@ -1080,6 +1190,8 @@ async function restoreSelectedFiles(){
 async function restoreCatalogFile(fileId){
  const file = fileRowsCache.find(row => Number(row.id) === Number(fileId));
  if(!file) return;
+ const confidence = await post("/api/restore/confidence", { path:file.path });
+ if(confidence.warning && !confirm(`${confidence.warning}\nContinue restore?`)) return;
  const dest = prompt("Restore destination, blank for original location", "");
  const out = await post("/api/restore", { path:file.path, dest:dest || null });
  alert(out.error || `Restored to ${out.target}`);
@@ -1100,6 +1212,8 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#129513;</span>Article size</span><div class="range-field"><input id="setArticleSizeKib" type="range" min="100" max="5120" step="100" value="${esc(bytesToKib(s.article_size || 786432))}" oninput="setArticleSizeLabel.textContent=articleSizeLabel(this.value)"><span id="setArticleSizeLabel">${esc(articleSizeLabel(bytesToKib(s.article_size || 786432)))}</span></div></label>
   <label class="field"><span><span class="ui-icon">&#128225;</span>NNTP threads</span><div class="range-field"><input id="setNntpThreads" type="range" min="1" max="50" step="1" value="${esc(s.nntp_threads || 4)}" oninput="setNntpThreadsLabel.textContent=countLabel(this.value, 'threads')"><span id="setNntpThreadsLabel">${esc(countLabel(s.nntp_threads || 4, "threads"))}</span></div></label>
   <label class="field"><span><span class="ui-icon">&#9201;</span>Post limit per hour</span><div class="range-field"><input id="setHourlyPostLimitGb" type="range" min="0" max="1000" step="10" value="${esc(bytesToGb(s.hourly_post_limit_bytes || 0))}" oninput="setHourlyPostLimitLabel.textContent=postLimitLabel(this.value)"><span id="setHourlyPostLimitLabel">${esc(postLimitLabel(bytesToGb(s.hourly_post_limit_bytes || 0)))}</span></div></label>
+  <label class="field"><span><span class="ui-icon">&#8635;</span>NNTP retry attempts</span><input id="setRetryAttempts" type="number" min="1" max="10" value="${esc(s.usenet_retry_attempts || 2)}"></label>
+  <label class="field"><span><span class="ui-icon">&#9201;</span>NNTP retry backoff seconds</span><input id="setRetryBackoff" type="number" min="0" max="3600" value="${esc(s.usenet_retry_backoff_seconds || 5)}"></label>
  </div></div>
  <div id="tabSchedules" class="tab-panel"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#10003;</span>Verify interval</span><div class="range-field"><input id="setVerifyDays" type="range" min="1" max="180" step="1" value="${esc(s.verification_interval_days)}" oninput="setVerifyDaysLabel.textContent=countLabel(this.value, 'days')"><span id="setVerifyDaysLabel">${esc(countLabel(s.verification_interval_days, "days"))}</span></div></label>
@@ -1108,6 +1222,8 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128193;</span>Catalog scan interval seconds</span><input id="setScanInterval" type="number" min="1" value="${esc(s.scan_interval_seconds || 300)}"></label>
   <label class="field"><span><span class="ui-icon">&#128230;</span>Backup task interval seconds</span><input id="setBackupInterval" type="number" min="1" value="${esc(s.backup_interval_seconds || 300)}"></label>
   <label class="field"><span><span class="ui-icon">&#9729;</span>Cloud backup interval seconds</span><input id="setCloudBackupInterval" type="number" min="1" value="${esc(s.cloud_backup_interval_seconds || 3600)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128736;</span>Maintenance interval seconds</span><input id="setMaintenanceInterval" type="number" min="1" value="${esc(s.maintenance_interval_seconds || 86400)}"></label>
+  <label class="field"><span><span class="ui-icon">&#8635;</span>Restore drill task interval seconds</span><input id="setRestoreDrillTaskInterval" type="number" min="1" value="${esc(s.restore_drill_task_interval_seconds || 86400)}"></label>
  </div></div>
  <div id="tabProtection" class="tab-panel"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#128274;</span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
@@ -1116,6 +1232,10 @@ function settingsForm(s){
   <label><input id="setPar2" type="checkbox" ${s.par2?.enabled?"checked":""}> <span class="ui-icon">&#128737;</span>Generate PAR2 recovery files</label>
   <label class="field"><span><span class="ui-icon">&#9881;</span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
   <label class="field"><span><span class="ui-icon">&#128737;</span>PAR2 redundancy</span><div class="range-field"><input id="setPar2Redundancy" type="range" min="1" max="50" step="1" value="${esc(s.par2?.redundancy_percent ?? 10)}" oninput="setPar2RedundancyLabel.textContent=this.value + '%'"><span id="setPar2RedundancyLabel">${esc(s.par2?.redundancy_percent ?? 10)}%</span></div></label>
+  <label class="field"><span><span class="ui-icon">&#128221;</span>Log retention days</span><input id="setLogRetentionDays" type="number" min="1" max="3650" value="${esc(s.log_retention_days || 30)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128269;</span>Verbose log retention days</span><input id="setVerboseLogRetentionDays" type="number" min="1" max="3650" value="${esc(s.verbose_log_retention_days || 7)}"></label>
+  <label class="field"><span><span class="ui-icon">&#8635;</span>Restore drill interval days</span><input id="setRestoreDrillDays" type="number" min="1" max="3650" value="${esc(s.restore_drill_interval_days || 30)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128207;</span>Restore drill sample bytes</span><input id="setRestoreDrillBytes" type="number" min="1" value="${esc(s.restore_drill_sample_bytes || 1048576)}"></label>
  </div></div>
  <div id="tabEndpoints" class="tab-panel"><div class="form-grid">
  <label class="field full"><span><span class="ui-icon">&#128193;</span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
@@ -1232,8 +1352,16 @@ async function saveSettings(){
   scan_interval_seconds: Number(setScanInterval.value),
   backup_interval_seconds: Number(setBackupInterval.value),
   cloud_backup_interval_seconds: Number(setCloudBackupInterval.value),
+  maintenance_interval_seconds: Number(setMaintenanceInterval.value),
+  restore_drill_task_interval_seconds: Number(setRestoreDrillTaskInterval.value),
   nntp_threads: Number(setNntpThreads.value),
   hourly_post_limit_bytes: gbToBytes(setHourlyPostLimitGb.value),
+  usenet_retry_attempts: Number(setRetryAttempts.value),
+  usenet_retry_backoff_seconds: Number(setRetryBackoff.value),
+  log_retention_days: Number(setLogRetentionDays.value),
+  verbose_log_retention_days: Number(setVerboseLogRetentionDays.value),
+  restore_drill_interval_days: Number(setRestoreDrillDays.value),
+  restore_drill_sample_bytes: Number(setRestoreDrillBytes.value),
   zip_subfolders: setZip.checked,
   encrypt_bodies: setEncrypt.checked,
   encryption_passphrase_env: setPassEnv.value,

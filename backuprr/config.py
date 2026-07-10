@@ -61,8 +61,16 @@ class Config:
     scan_interval_seconds: int = 300
     backup_interval_seconds: int = 300
     cloud_backup_interval_seconds: int = 3600
+    maintenance_interval_seconds: int = 86400
+    restore_drill_task_interval_seconds: int = 86400
     nntp_threads: int = 4
     hourly_post_limit_bytes: int = 0
+    usenet_retry_attempts: int = 2
+    usenet_retry_backoff_seconds: int = 5
+    log_retention_days: int = 30
+    verbose_log_retention_days: int = 7
+    restore_drill_interval_days: int = 30
+    restore_drill_sample_bytes: int = 1024 * 1024
     auto_queue_exclude_patterns: List[str] = field(default_factory=list)
     usenet_hosts: List[UsenetHost] = field(default_factory=list)
     cloud_backups: List[CloudBackupTarget] = field(default_factory=list)
@@ -114,8 +122,16 @@ class Config:
             "scan_interval_seconds": self.scan_interval_seconds,
             "backup_interval_seconds": self.backup_interval_seconds,
             "cloud_backup_interval_seconds": self.cloud_backup_interval_seconds,
+            "maintenance_interval_seconds": self.maintenance_interval_seconds,
+            "restore_drill_task_interval_seconds": self.restore_drill_task_interval_seconds,
             "nntp_threads": self.nntp_threads,
             "hourly_post_limit_bytes": self.hourly_post_limit_bytes,
+            "usenet_retry_attempts": self.usenet_retry_attempts,
+            "usenet_retry_backoff_seconds": self.usenet_retry_backoff_seconds,
+            "log_retention_days": self.log_retention_days,
+            "verbose_log_retention_days": self.verbose_log_retention_days,
+            "restore_drill_interval_days": self.restore_drill_interval_days,
+            "restore_drill_sample_bytes": self.restore_drill_sample_bytes,
             "auto_queue_exclude_patterns": self.auto_queue_exclude_patterns,
             "usenet_hosts": [host.__dict__ for host in self.usenet_hosts],
             "cloud_backups": [target.__dict__ for target in self.cloud_backups],
@@ -173,6 +189,16 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if interval <= 0:
             raise ValueError("cloud_backup_interval_seconds must be greater than zero")
         config.cloud_backup_interval_seconds = interval
+    if "maintenance_interval_seconds" in data:
+        interval = int(data["maintenance_interval_seconds"])
+        if interval <= 0:
+            raise ValueError("maintenance_interval_seconds must be greater than zero")
+        config.maintenance_interval_seconds = interval
+    if "restore_drill_task_interval_seconds" in data:
+        interval = int(data["restore_drill_task_interval_seconds"])
+        if interval <= 0:
+            raise ValueError("restore_drill_task_interval_seconds must be greater than zero")
+        config.restore_drill_task_interval_seconds = interval
     if "nntp_threads" in data:
         threads = int(data["nntp_threads"])
         if threads < 1 or threads > 50:
@@ -183,6 +209,36 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if limit < 0:
             raise ValueError("hourly_post_limit_bytes cannot be negative")
         config.hourly_post_limit_bytes = limit
+    if "usenet_retry_attempts" in data:
+        attempts = int(data["usenet_retry_attempts"])
+        if attempts < 1 or attempts > 10:
+            raise ValueError("usenet_retry_attempts must be between 1 and 10")
+        config.usenet_retry_attempts = attempts
+    if "usenet_retry_backoff_seconds" in data:
+        backoff = int(data["usenet_retry_backoff_seconds"])
+        if backoff < 0 or backoff > 3600:
+            raise ValueError("usenet_retry_backoff_seconds must be between 0 and 3600")
+        config.usenet_retry_backoff_seconds = backoff
+    if "log_retention_days" in data:
+        days = int(data["log_retention_days"])
+        if days < 1 or days > 3650:
+            raise ValueError("log_retention_days must be between 1 and 3650")
+        config.log_retention_days = days
+    if "verbose_log_retention_days" in data:
+        days = int(data["verbose_log_retention_days"])
+        if days < 1 or days > 3650:
+            raise ValueError("verbose_log_retention_days must be between 1 and 3650")
+        config.verbose_log_retention_days = days
+    if "restore_drill_interval_days" in data:
+        days = int(data["restore_drill_interval_days"])
+        if days < 1 or days > 3650:
+            raise ValueError("restore_drill_interval_days must be between 1 and 3650")
+        config.restore_drill_interval_days = days
+    if "restore_drill_sample_bytes" in data:
+        size = int(data["restore_drill_sample_bytes"])
+        if size < 1:
+            raise ValueError("restore_drill_sample_bytes must be greater than zero")
+        config.restore_drill_sample_bytes = size
     if "auto_queue_exclude_patterns" in data:
         config.auto_queue_exclude_patterns = [str(item).strip() for item in data["auto_queue_exclude_patterns"] if str(item).strip()]
     if "zip_subfolders" in data:

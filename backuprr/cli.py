@@ -7,6 +7,7 @@ from .backup import post_next, verify_due_chunks
 from .cloud_backup import backup_config_and_database
 from .config import Config
 from .db import Database
+from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
 from .scanner import scan_all
@@ -42,6 +43,15 @@ def main(argv=None) -> int:
     verify = sub.add_parser("verify")
     verify.add_argument("--force", action="store_true")
     sub.add_parser("cloud-backup")
+    sub.add_parser("dry-run")
+    sub.add_parser("health-check")
+    maintenance = sub.add_parser("maintenance")
+    maintenance.add_argument("--vacuum", action="store_true")
+    sub.add_parser("restore-drill")
+    pause = sub.add_parser("pause")
+    pause.add_argument("kind", nargs="?", default="all")
+    resume = sub.add_parser("resume")
+    resume.add_argument("kind", nargs="?", default="all")
     restore = sub.add_parser("restore")
     restore.add_argument("--path", required=True)
     restore.add_argument("--dest")
@@ -87,7 +97,22 @@ def main(argv=None) -> int:
         print(f"Verified {verify_due_chunks(db, config, force=args.force)} chunks")
     elif args.command == "cloud-backup":
         print(json.dumps(backup_config_and_database(db, config), indent=2))
+    elif args.command == "dry-run":
+        print(json.dumps(dry_run_plan(db, config), indent=2))
+    elif args.command == "health-check":
+        print(json.dumps(check_usenet_hosts(db, config), indent=2))
+    elif args.command == "maintenance":
+        print(json.dumps(run_maintenance(db, config, vacuum=args.vacuum), indent=2))
+    elif args.command == "restore-drill":
+        print(json.dumps(run_restore_drill(db, config), indent=2))
+    elif args.command == "pause":
+        db.set_paused(args.kind, True)
+        print(f"Paused {args.kind}")
+    elif args.command == "resume":
+        db.set_paused(args.kind, False)
+        print(f"Resumed {args.kind}")
     elif args.command == "restore":
+        print(json.dumps(restore_confidence(db, args.path), indent=2))
         if args.folder:
             print(f"Restored {restore_folder(db, config, args.path, args.dest)} files")
         else:

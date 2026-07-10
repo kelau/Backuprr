@@ -12,8 +12,9 @@ from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
+from backuprr.operations import dry_run_plan, restore_confidence, run_maintenance, run_restore_drill
 from backuprr.queueing import enqueue_unbacked, prioritize
-from backuprr.restore import restore_file
+from backuprr.restore import restore_file, restore_sample
 from backuprr.scanner import scan_all
 from backuprr.web import hourly_post_budget, thread_usage_summary, throughput_summary
 
@@ -106,7 +107,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.35")
+        self.assertEqual(__version__, "0.2.36")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -118,6 +119,17 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
         self.assertIn("article_size", columns)
+
+    def test_operational_tables_exist(self):
+        with self.db.connect() as conn:
+            tables = {
+                row["name"]
+                for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            }
+        self.assertIn("backup_runs", tables)
+        self.assertIn("host_stats", tables)
+        self.assertIn("maintenance_runs", tables)
+        self.assertIn("restore_drills", tables)
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -418,6 +430,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertEqual(file_row["state"], "backed_up")
         self.assertNotIn("movie.mkv", chunks[0]["subject"])
+        runs = self.db.backup_run_rows()
+        self.assertEqual(runs[0]["status"], "done")
+        self.assertEqual(runs[0]["chunks_done"], 2)
 
     def test_post_next_honors_hourly_post_limit(self):
         media = self.root / "media"
@@ -469,6 +484,30 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(queue_row["progress_chunks"], 2)
         self.assertEqual(file_row["state"], "backed_up")
         self.assertEqual(len(CountingPostClient.posts), 1)
+
+    def test_dry_run_plan_estimates_articles_and_limit_time(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"0123456789abcdef")
+        self.config.article_size = 8
+        self.config.hourly_post_limit_bytes = 16
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        plan = dry_run_plan(self.db, self.config)
+        self.assertEqual(plan["estimated_articles"], 2)
+        self.assertEqual(plan["estimated_hours_at_limit"], 1.0)
+
+    def test_maintenance_prunes_old_verbose_events(self):
+        with self.db.connect() as conn:
+            conn.execute(
+                "INSERT INTO events(ts, level, event_type, message, data) VALUES(?,?,?,?,?)",
+                ("2000-01-01T00:00:00+00:00", "verbose", "old", "old", ""),
+            )
+        self.config.log_retention_days = 3650
+        self.config.verbose_log_retention_days = 1
+        result = run_maintenance(self.db, self.config)
+        self.assertGreaterEqual(result["pruned_events"], 1)
+        self.assertEqual(len(self.db.maintenance_rows()), 1)
 
     def test_post_next_replaces_chunks_after_successful_retry(self):
         media = self.root / "media"
@@ -902,8 +941,16 @@ class CoreTests(unittest.TestCase):
                 "scan_interval_seconds": 15,
                 "backup_interval_seconds": 20,
                 "cloud_backup_interval_seconds": 55,
+                "maintenance_interval_seconds": 66,
+                "restore_drill_task_interval_seconds": 77,
                 "nntp_threads": 6,
                 "hourly_post_limit_bytes": 123456,
+                "usenet_retry_attempts": 4,
+                "usenet_retry_backoff_seconds": 8,
+                "log_retention_days": 40,
+                "verbose_log_retention_days": 5,
+                "restore_drill_interval_days": 9,
+                "restore_drill_sample_bytes": 2048,
                 "auto_queue_exclude_patterns": ["*.sample", ".tmp"],
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
@@ -934,8 +981,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.scan_interval_seconds, 15)
         self.assertEqual(self.config.backup_interval_seconds, 20)
         self.assertEqual(self.config.cloud_backup_interval_seconds, 55)
+        self.assertEqual(self.config.maintenance_interval_seconds, 66)
+        self.assertEqual(self.config.restore_drill_task_interval_seconds, 77)
         self.assertEqual(self.config.nntp_threads, 6)
         self.assertEqual(self.config.hourly_post_limit_bytes, 123456)
+        self.assertEqual(self.config.usenet_retry_attempts, 4)
+        self.assertEqual(self.config.usenet_retry_backoff_seconds, 8)
+        self.assertEqual(self.config.log_retention_days, 40)
+        self.assertEqual(self.config.verbose_log_retention_days, 5)
+        self.assertEqual(self.config.restore_drill_interval_days, 9)
+        self.assertEqual(self.config.restore_drill_sample_bytes, 2048)
         self.assertEqual(self.config.auto_queue_exclude_patterns, ["*.sample", ".tmp"])
         self.assertTrue(self.config.zip_subfolders)
         self.assertTrue(self.config.encrypt_bodies)
@@ -1191,6 +1246,40 @@ class CoreTests(unittest.TestCase):
         with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
             self.assertEqual(restore_file(self.db, self.config, str(path), str(target)), target)
         self.assertEqual(target.read_bytes(), b"restored payload")
+
+    def test_restore_confidence_reports_chunk_state(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"placeholder")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
+        confidence = restore_confidence(self.db, str(path))
+        self.assertTrue(confidence["restorable"])
+        self.assertEqual(confidence["chunk_count"], 1)
+
+    def test_restore_sample_and_restore_drill_download_limited_bytes(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"placeholder")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='backed_up' WHERE id=?", (file_id,))
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        self.config.restore_drill_sample_bytes = 4
+        with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
+            self.assertEqual(restore_sample(self.db, self.config, str(path), 4), b"rest")
+        with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
+            result = run_restore_drill(self.db, self.config)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["bytes_checked"], 4)
 
     def test_restore_to_original_path_stays_backed_up_and_unqueued(self):
         media = self.root / "media"

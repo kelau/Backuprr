@@ -4,6 +4,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -89,14 +90,15 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         db.set_queue_status(file_id, "failed")
         db.log("error", "post", f"Queued file no longer exists: {original}", file_id)
         return file_id
-    host = select_host(config, "post")
     db.set_queue_status(file_id, "posting")
     db.update_file_state(file_id, "posting")
     payload = original
+    run_id: Optional[int] = None
     try:
         payload = prepare_payload(original, config)
         article_size = max(1, int(config.article_size))
         expected_chunks = max(1, math.ceil(payload.stat().st_size / article_size))
+        run_id = db.start_backup_run(file_id, str(original), expected_chunks, int(payload.stat().st_size), str(item["reason"] or ""))
         can_reuse_chunks = payload == original and str(item["reason"] or "") in {
             "startup-posting-retry",
             "stale-posting-retry",
@@ -108,6 +110,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         posted_count = len(reusable_chunks)
         posted_bytes = sum(reusable_chunks.values())
         db.set_queue_progress(file_id, posted_count, posted_bytes)
+        db.update_backup_run(run_id, posted_count, posted_bytes)
         if reusable_chunks:
             db.log("info", "post.resume", f"Resuming {original}: {posted_count}/{expected_chunks} chunks already cataloged", file_id)
 
@@ -116,9 +119,28 @@ def post_next(db: Database, config: Config) -> Optional[int]:
             body = encode_chunk(chunk, config, salt)
             digest = hashlib.sha256(body).hexdigest()
             subject = obfuscated_subject(file_id, chunk_index, digest)
-            with UsenetClient(host) as client:
-                message_id = client.post(config.newsgroup, subject, body)
-            return chunk_index, message_id, len(body), digest, subject
+            attempts = max(1, int(getattr(config, "usenet_retry_attempts", 1)))
+            backoff = max(0, int(getattr(config, "usenet_retry_backoff_seconds", 0)))
+            hosts = config.hosts_for_mode("post")
+            if not hosts:
+                hosts = [select_host(config, "post")]
+            last_error: Optional[Exception] = None
+            for attempt in range(attempts):
+                for host in hosts:
+                    try:
+                        with UsenetClient(host) as client:
+                            message_id = client.post(config.newsgroup, subject, body)
+                        db.record_host_check(host.name, host.mode, "ok", "posted chunk")
+                        if run_id is not None:
+                            db.update_backup_run(run_id, posted_count, posted_bytes, host.name)
+                        return chunk_index, message_id, len(body), digest, subject
+                    except Exception as exc:
+                        last_error = exc
+                        db.record_host_check(host.name, host.mode, "failed", str(exc))
+                        db.log("warning", "post.retry", f"Post attempt {attempt + 1}/{attempts} failed on {host.name}: {exc}", file_id)
+                if attempt + 1 < attempts and backoff:
+                    time.sleep(backoff)
+            raise RuntimeError(f"All post hosts failed: {last_error}")
 
         max_workers = max(1, int(config.nntp_threads))
         futures = []
@@ -154,6 +176,8 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                 posted_count += 1
                 posted_bytes += body_size
                 db.set_queue_progress(file_id, posted_count, posted_bytes)
+                if run_id is not None:
+                    db.update_backup_run(run_id, posted_count, posted_bytes)
                 db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
         final_chunks = db.chunk_count_for_file(file_id)
         if throttled_by_hourly_limit and final_chunks < expected_chunks:
@@ -161,6 +185,8 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                 raise RuntimeError("Hourly post limit interrupted a temporary payload; increase the hourly limit or disable zip/par2 for resumable throttling")
             db.set_queue_progress(file_id, final_chunks, posted_bytes)
             db.requeue_file(file_id, "hourly-limit")
+            if run_id is not None:
+                db.finish_backup_run(run_id, "paused", "hourly-limit")
             db.log(
                 "info",
                 "post.throttle",
@@ -177,11 +203,15 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         with db.connect() as conn:
             conn.execute("UPDATE files SET state='backed_up', last_backup_at=?, updated_at=? WHERE id=?", (utcnow(), utcnow(), file_id))
             conn.execute("UPDATE queue SET status='done', updated_at=? WHERE file_id=?", (utcnow(), file_id))
+        if run_id is not None:
+            db.finish_backup_run(run_id, "done")
         db.log("info", "post", f"Posted backup for {original}", file_id)
         return file_id
     except Exception as exc:
         db.update_file_state(file_id, "failed")
         db.set_queue_status(file_id, "failed")
+        if run_id is not None:
+            db.finish_backup_run(run_id, "failed", str(exc))
         db.log("error", "post", f"Failed posting {original}: {exc}", file_id)
         raise
     finally:

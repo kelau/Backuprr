@@ -57,6 +57,33 @@ def restore_file(db: Database, config: Config, source_path: str, dest: Optional[
     return target
 
 
+def restore_sample(db: Database, config: Config, source_path: str, max_bytes: int) -> bytes:
+    with db.connect() as conn:
+        file_row = conn.execute("SELECT * FROM files WHERE path=? OR relative_path=?", (source_path, source_path)).fetchone()
+        if not file_row:
+            raise FileNotFoundError(f"No cataloged file matches {source_path}")
+        chunks = conn.execute("SELECT * FROM chunks WHERE file_id=? ORDER BY chunk_index LIMIT 2", (file_row["id"],)).fetchall()
+    if not chunks:
+        raise RuntimeError(f"No Usenet chunks recorded for {source_path}")
+    host = select_host(config, "read")
+    passphrase = config.encryption_passphrase()
+    restored = bytearray()
+    with UsenetClient(host) as client:
+        if not client.conn:
+            raise RuntimeError("NNTP connection not open")
+        for chunk in chunks:
+            raw = b"\n".join(article_lines(client.conn.article(chunk["message_id"])))
+            msg = email.message_from_bytes(raw)
+            payload = msg.get_payload(decode=True) or b""
+            db.record_transfer_sample("download", len(payload))
+            restored.extend(decode_chunk(payload, passphrase))
+            if len(restored) >= max_bytes:
+                break
+    sample = bytes(restored[:max_bytes])
+    db.log("info", "restore.sample", f"Restored {len(sample)} sample bytes for {source_path}", int(file_row["id"]))
+    return sample
+
+
 def restore_folder(db: Database, config: Config, folder_path: str, dest: Optional[str] = None) -> int:
     restored = 0
     raw_folder = str(folder_path).rstrip("\\/")

@@ -7,6 +7,7 @@ from .backup import post_next, verify_due_chunks, verify_file_chunks
 from .cloud_backup import backup_config_and_database_if_changed
 from .config import Config
 from .db import Database
+from .operations import restore_drill_due, run_maintenance, run_restore_drill
 from .queueing import enqueue_unbacked
 from .scanner import scan_all
 
@@ -91,6 +92,10 @@ class ScheduledTask:
             self._thread.join(timeout=5)
 
     def run_once(self) -> str:
+        if self.db.is_paused(self.kind) or self.db.is_paused("all"):
+            result = "paused"
+            self.db.log("debug", f"{self.kind}.task", f"{self.name} skipped because it is paused")
+            return result
         if not self._lock.acquire(blocking=False):
             self.db.log("verbose", f"{self.kind}.task", f"{self.name} already running")
             return "already running"
@@ -119,6 +124,7 @@ class ScheduledTask:
                 "name": self.name,
                 "kind": self.kind,
                 "status": "running" if self._running else "scheduled",
+                "paused": self.db.is_paused(self.kind) or self.db.is_paused("all"),
                 "interval_seconds": self.interval_seconds,
                 "last_run": iso_or_empty(self._last_finished_at),
                 "last_run_duration": format_duration(duration_seconds),
@@ -289,6 +295,40 @@ class CloudBackupMonitor(ScheduledTask):
             result = f"backed up config/database to {len(results)} cloud targets"
         self.db.log("debug", "monitor.cloud_backup", f"Automatic cloud backup task completed: {result}")
         return result
+
+    def tasks(self):
+        return [self.task_info()]
+
+
+class MaintenanceMonitor(ScheduledTask):
+    def __init__(self, db: Database, config: Config):
+        super().__init__(db, config, "Database maintenance worker", "maintenance")
+
+    @property
+    def interval_seconds(self) -> int:
+        return self.config.maintenance_interval_seconds
+
+    def execute(self) -> str:
+        result = run_maintenance(self.db, self.config, vacuum=False)
+        return str(result["details"])
+
+    def tasks(self):
+        return [self.task_info()]
+
+
+class RestoreDrillMonitor(ScheduledTask):
+    def __init__(self, db: Database, config: Config):
+        super().__init__(db, config, "Restore drill worker", "restore_drill")
+
+    @property
+    def interval_seconds(self) -> int:
+        return self.config.restore_drill_task_interval_seconds
+
+    def execute(self) -> str:
+        if not restore_drill_due(self.db, self.config):
+            return "restore drill not due"
+        result = run_restore_drill(self.db, self.config)
+        return f"{result.get('status')}: {result.get('message') or result.get('path') or ''}".strip()
 
     def tasks(self):
         return [self.task_info()]

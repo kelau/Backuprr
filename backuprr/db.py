@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 STALE_POSTING_SECONDS = 15 * 60
 
 
@@ -47,6 +47,9 @@ class Database:
         chunk_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
         if "article_size" not in chunk_columns:
             conn.execute("ALTER TABLE chunks ADD COLUMN article_size INTEGER")
+        self._create_operational_tables(conn)
+
+    def _create_operational_tables(self, conn: sqlite3.Connection) -> None:
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS transfer_samples (
@@ -54,6 +57,63 @@ class Database:
               ts TEXT NOT NULL,
               direction TEXT NOT NULL,
               size INTEGER NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backup_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              file_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
+              path TEXT NOT NULL,
+              status TEXT NOT NULL,
+              reason TEXT NOT NULL DEFAULT '',
+              host TEXT NOT NULL DEFAULT '',
+              started_at TEXT NOT NULL,
+              finished_at TEXT,
+              chunks_total INTEGER NOT NULL DEFAULT 0,
+              chunks_done INTEGER NOT NULL DEFAULT 0,
+              bytes_total INTEGER NOT NULL DEFAULT 0,
+              bytes_done INTEGER NOT NULL DEFAULT 0,
+              error TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS host_stats (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              host_name TEXT NOT NULL,
+              mode TEXT NOT NULL,
+              status TEXT NOT NULL,
+              message TEXT NOT NULL DEFAULT '',
+              latency_ms INTEGER,
+              checked_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS maintenance_runs (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              kind TEXT NOT NULL,
+              started_at TEXT NOT NULL,
+              finished_at TEXT NOT NULL,
+              result TEXT NOT NULL,
+              details TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS restore_drills (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              file_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
+              path TEXT NOT NULL,
+              status TEXT NOT NULL,
+              checked_at TEXT NOT NULL,
+              bytes_checked INTEGER NOT NULL DEFAULT 0,
+              message TEXT NOT NULL DEFAULT ''
             )
             """
         )
@@ -66,6 +126,18 @@ class Database:
     def set_meta(self, key: str, value: str) -> None:
         with self.connect() as conn:
             conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES(?,?)", (key, value))
+
+    def paused_kinds(self) -> List[str]:
+        with self.connect() as conn:
+            rows = conn.execute("SELECT key FROM app_meta WHERE key LIKE 'pause.%' AND value='1'").fetchall()
+            return [str(row["key"]).removeprefix("pause.") for row in rows]
+
+    def set_paused(self, kind: str, paused: bool) -> None:
+        self.set_meta(f"pause.{kind}", "1" if paused else "0")
+        self.log("info", "worker.pause", f"{'Paused' if paused else 'Resumed'} {kind} worker")
+
+    def is_paused(self, kind: str) -> bool:
+        return self.get_meta(f"pause.{kind}") == "1"
 
     def log(self, level: str, event_type: str, message: str, file_id: Optional[int] = None, data: str = "") -> None:
         with self.connect() as conn:
@@ -463,6 +535,106 @@ class Database:
                 (utcnow(), direction, int(size)),
             )
 
+    def start_backup_run(self, file_id: int, path: str, chunks_total: int, bytes_total: int, reason: str) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO backup_runs(file_id, path, status, reason, started_at, chunks_total, bytes_total)
+                VALUES(?,?,?,?,?,?,?)
+                """,
+                (file_id, path, "running", reason, utcnow(), chunks_total, bytes_total),
+            )
+            return int(cur.lastrowid)
+
+    def update_backup_run(self, run_id: int, chunks_done: int, bytes_done: int, host: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE backup_runs SET chunks_done=?, bytes_done=?, host=COALESCE(NULLIF(?, ''), host) WHERE id=?",
+                (chunks_done, bytes_done, host, run_id),
+            )
+
+    def finish_backup_run(self, run_id: int, status: str, error: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE backup_runs SET status=?, error=?, finished_at=? WHERE id=?",
+                (status, error, utcnow(), run_id),
+            )
+
+    def backup_run_rows(self, limit: int = 50) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM backup_runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def record_host_check(self, host_name: str, mode: str, status: str, message: str = "", latency_ms: Optional[int] = None) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO host_stats(host_name, mode, status, message, latency_ms, checked_at) VALUES(?,?,?,?,?,?)",
+                (host_name, mode, status, message, latency_ms, utcnow()),
+            )
+
+    def host_health_rows(self, limit: int = 50) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM host_stats ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def record_maintenance(self, kind: str, started_at: str, result: str, details: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO maintenance_runs(kind, started_at, finished_at, result, details) VALUES(?,?,?,?,?)",
+                (kind, started_at, utcnow(), result, details),
+            )
+
+    def maintenance_rows(self, limit: int = 50) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM maintenance_runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def prune_events(self, log_retention_days: int, verbose_retention_days: int) -> int:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        general_cutoff = (now - timedelta(days=log_retention_days)).isoformat()
+        verbose_cutoff = (now - timedelta(days=verbose_retention_days)).isoformat()
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM events
+                WHERE ts < ?
+                   OR (level IN ('debug', 'verbose') AND ts < ?)
+                """,
+                (general_cutoff, verbose_cutoff),
+            )
+            return int(cur.rowcount)
+
+    def vacuum_analyze(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(self.path)
+        try:
+            conn.execute("ANALYZE")
+            conn.execute("VACUUM")
+        finally:
+            conn.close()
+
+    def restore_drill_candidate(self) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT f.*
+                FROM files f
+                JOIN chunks c ON c.file_id = f.id
+                WHERE f.state='backed_up'
+                GROUP BY f.id
+                ORDER BY COALESCE(f.last_verify_at, f.last_backup_at, f.updated_at) ASC
+                LIMIT 1
+                """
+            ).fetchone()
+
+    def record_restore_drill(self, file_id: Optional[int], path: str, status: str, bytes_checked: int, message: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO restore_drills(file_id, path, status, checked_at, bytes_checked, message) VALUES(?,?,?,?,?,?)",
+                (file_id, path, status, utcnow(), bytes_checked, message),
+            )
+
+    def restore_drill_rows(self, limit: int = 50) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM restore_drills ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
     def transfer_bytes_since(self, direction: str, since: str) -> int:
         with self.connect() as conn:
             return int(
@@ -719,7 +891,7 @@ class Database:
             self.queue_file(missing_file_id, priority=10, reason="missing-chunks")
 
     def list_rows(self, table: str, limit: int = 200) -> List[sqlite3.Row]:
-        allowed = {"files", "events", "queue", "chunks", "endpoints"}
+        allowed = {"files", "events", "queue", "chunks", "endpoints", "backup_runs", "host_stats", "maintenance_runs", "restore_drills"}
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")
         with self.connect() as conn:
@@ -908,6 +1080,10 @@ class Database:
                 "chunks_verified": conn.execute("SELECT COUNT(*) FROM chunks WHERE status='verified'").fetchone()[0],
                 "chunks_missing": conn.execute("SELECT COUNT(*) FROM chunks WHERE status='missing'").fetchone()[0],
                 "chunks_bytes_total": conn.execute("SELECT COALESCE(SUM(size), 0) FROM chunks").fetchone()[0],
+                "backup_runs_total": conn.execute("SELECT COUNT(*) FROM backup_runs").fetchone()[0],
+                "backup_runs_failed": conn.execute("SELECT COUNT(*) FROM backup_runs WHERE status='failed'").fetchone()[0],
+                "restore_drills_total": conn.execute("SELECT COUNT(*) FROM restore_drills").fetchone()[0],
+                "restore_drills_failed": conn.execute("SELECT COUNT(*) FROM restore_drills WHERE status!='ok'").fetchone()[0],
             }
 
 
@@ -981,5 +1157,50 @@ CREATE TABLE IF NOT EXISTS transfer_samples (
   ts TEXT NOT NULL,
   direction TEXT NOT NULL,
   size INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS backup_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
+  path TEXT NOT NULL,
+  status TEXT NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  host TEXT NOT NULL DEFAULT '',
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  chunks_total INTEGER NOT NULL DEFAULT 0,
+  chunks_done INTEGER NOT NULL DEFAULT 0,
+  bytes_total INTEGER NOT NULL DEFAULT 0,
+  bytes_done INTEGER NOT NULL DEFAULT 0,
+  error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS host_stats (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  host_name TEXT NOT NULL,
+  mode TEXT NOT NULL,
+  status TEXT NOT NULL,
+  message TEXT NOT NULL DEFAULT '',
+  latency_ms INTEGER,
+  checked_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS maintenance_runs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT NOT NULL,
+  result TEXT NOT NULL,
+  details TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS restore_drills (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
+  path TEXT NOT NULL,
+  status TEXT NOT NULL,
+  checked_at TEXT NOT NULL,
+  bytes_checked INTEGER NOT NULL DEFAULT 0,
+  message TEXT NOT NULL DEFAULT ''
 );
 """

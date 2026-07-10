@@ -29,6 +29,12 @@ a CLI and an AJAX-enabled Web UI.
   Statistics, Settings, and About.
 - Live-refreshing operational pages and a Status dashboard with task progress,
   queue/file summaries, and simple charts.
+- Operations page and CLI commands for worker pause/resume, provider health
+  checks, dry-run planning, database maintenance, and restore drills.
+- Backup run history, host health history, maintenance history, and restore
+  drill history for production troubleshooting.
+- Chunk-level hourly throttling, resumable posts, and retry/failover across
+  configured post hosts.
 - CLI commands matching the Web UI operations.
 
 ## Quick start
@@ -97,6 +103,12 @@ backuprr queue list --config config.json
 backuprr queue prioritize --filter older-first --config config.json
 backuprr post-next --config config.json
 backuprr verify --config config.json
+backuprr dry-run --config config.json
+backuprr health-check --config config.json
+backuprr maintenance --vacuum --config config.json
+backuprr restore-drill --config config.json
+backuprr pause backup --config config.json
+backuprr resume backup --config config.json
 backuprr restore --path /srv/media/movie/file.mkv --dest /restore-test --config config.json
 backuprr web --config config.json
 ```
