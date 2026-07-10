@@ -10,7 +10,7 @@ from backuprr.cloud_backup import backup_config_and_database
 from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
-from backuprr.monitor import BackupMonitor, CatalogMonitor
+from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor
 from backuprr.queueing import enqueue_unbacked, prioritize
 from backuprr.scanner import scan_all
 
@@ -27,6 +27,12 @@ class FakePostClient:
 
     def post(self, newsgroup, subject, body):
         return f"<{subject.strip('[] ()').replace(' ', '-')}@example.test>"
+
+
+class FakeSocketPermissionError(OSError):
+    @property
+    def winerror(self):
+        return 10013
 
 
 class CoreTests(unittest.TestCase):
@@ -47,7 +53,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.8")
+        self.assertEqual(__version__, "0.2.9")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -534,6 +540,14 @@ class CoreTests(unittest.TestCase):
         result = monitor.run_once()
         self.assertIn("0 newly queued", result)
         self.assertIn("1 posting", result)
+
+    def test_verification_monitor_warns_on_socket_permission_block(self):
+        monitor = VerificationMonitor(self.db, self.config)
+        with patch("backuprr.monitor.verify_due_chunks", side_effect=FakeSocketPermissionError("blocked")):
+            self.assertEqual(monitor.verify_once(force=True), 0)
+        rows = self.db.list_events(["warning"], event_types=["verify.network"])
+        self.assertEqual(len(rows), 1)
+        self.assertIn("socket access is blocked", rows[0]["message"])
 
 
 if __name__ == "__main__":

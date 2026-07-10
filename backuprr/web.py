@@ -284,17 +284,18 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .push-note { margin-left:auto; }
 .section-title { margin:16px 0 8px; font-size:16px; }
 .pagination { display:flex; gap:8px; align-items:center; margin:8px 0 14px; }
-.form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; margin-bottom:12px; }
+.form-grid { display:grid; grid-template-columns:minmax(0,720px); gap:12px; margin-bottom:12px; align-items:start; }
 .field { display:grid; gap:5px; }
 .field span { color:var(--muted); font-size:12px; font-weight:600; }
 .full { grid-column:1 / -1; }
 .host-list { display:grid; gap:12px; }
-.host-row { border:1px solid var(--line); background:#fff; border-radius:8px; padding:12px; }
-.host-row h3 { margin:0 0 10px; font-size:14px; }
-.host-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:10px; }
+.host-row, .cloud-row { border:1px solid var(--line); background:#fff; border-radius:8px; padding:12px; }
+.host-row h3, .cloud-row h3 { margin:0 0 10px; font-size:14px; }
+.host-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; }
 .tabs { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; }
 .tab-panel { display:none; }
 .tab-panel.active { display:block; }
+.selection-summary { position:sticky; bottom:0; margin-top:12px; background:#fff; border:1px solid var(--line); border-radius:8px; padding:10px 12px; box-shadow:0 -6px 18px rgba(23,32,38,.06); }
 .danger { color:var(--bad); }
 .tree { background:#fff; border:1px solid var(--line); border-radius:8px; padding:8px; }
 .tree ul { list-style:none; margin:0; padding-left:20px; }
@@ -334,6 +335,7 @@ let completedQueuePage = 1;
 let filesPage = 1;
 let verificationPage = 1;
 let selectedFiles = new Set();
+let selectedFileData = new Map();
 const queuePageSize = 10;
 const filesPageSize = 100;
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
@@ -423,7 +425,7 @@ async function render(){
    <button onclick="boostSelectedFiles()"><span class="ui-icon">&#8593;</span>Bump selected</button>
    <button onclick="restoreSelectedFiles()"><span class="ui-icon">&#8635;</span>Restore selected</button>
    ${pushLabel()}
-  </div><div id="filesTree"></div>`;
+  </div><div id="filesTree"></div><div id="filesSelectionSummary" class="selection-summary"></div>`;
   await updateFilesPage();
  }
  if(page==="Search"){
@@ -493,12 +495,17 @@ async function updateFilesPage(){
  const q = document.getElementById("filesSearch")?.value || "";
  const result = await api(`/api/files?page=${filesPage}&page_size=${filesPageSize}&include_deleted=${showDeleted ? 1 : 0}&unbacked=${unbacked ? 1 : 0}&q=${encodeURIComponent(q)}`);
  fileRowsCache = result.rows || [];
+ for(const row of fileRowsCache){
+  if(selectedFiles.has(Number(row.id))) selectedFileData.set(Number(row.id), row);
+ }
  const target = document.getElementById("filesTree");
  if(target){
   target.innerHTML = fileTree(fileRowsCache, showDeleted) + paginationControls(result, "filesPage", "updateFilesPage");
   target.querySelectorAll("details[data-path]").forEach(details => {
    if(openFolders.has(details.dataset.path)) details.open = true;
   });
+  updateFolderCheckboxStates();
+  updateFilesSelectionSummary();
  }
 }
 async function updateQueuePage(){
@@ -724,7 +731,8 @@ function treeNode(node, prefix, showDeleted){
   const path = prefix ? prefix+"/"+name : name;
   const state = folderState(node.dirs[name]);
   const canRestore = folderChunkCount(node.dirs[name]) > 0;
-  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row"><span>&#128193;</span><span class="tree-name">${esc(name)}</span>${statePill(state)}<span class="tree-meta">${countFiles(node.dirs[name])} files &middot; ${formatBytes(node.dirs[name].total_size || 0)}</span><button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button>${canRestore ? `<button class="icon-btn" title="Restore folder" onclick="event.preventDefault();restoreCatalogFolder(${jsString(path)})">&#8635;</button>` : ""}</summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
+  const ids = collectNodeFiles(node.dirs[name]).map(file => Number(file.id));
+  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span>${statePill(state)}<span class="tree-meta">${countFiles(node.dirs[name])} files &middot; ${formatBytes(node.dirs[name].total_size || 0)}</span><button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button>${canRestore ? `<button class="icon-btn" title="Restore folder" onclick="event.preventDefault();restoreCatalogFolder(${jsString(path)})">&#8635;</button>` : ""}</summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
  }).join("");
  const fileHtml = node.files.sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name))).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
@@ -763,15 +771,70 @@ function fileRow(file){
  </div></li>`;
 }
 function setFileSelected(fileId, checked){
- if(checked) selectedFiles.add(Number(fileId));
- else selectedFiles.delete(Number(fileId));
+ const id = Number(fileId);
+ if(checked){
+  selectedFiles.add(id);
+  const row = fileRowsCache.find(item => Number(item.id) === id);
+  if(row) selectedFileData.set(id, row);
+ } else {
+  selectedFiles.delete(id);
+  selectedFileData.delete(id);
+ }
+ updateFolderCheckboxStates();
+ updateFilesSelectionSummary();
+}
+function selectFolderFiles(idList, checked){
+ const ids = String(idList || "").split(",").map(Number).filter(Boolean);
+ for(const id of ids){
+  if(checked){
+   selectedFiles.add(id);
+   const row = fileRowsCache.find(item => Number(item.id) === id);
+   if(row) selectedFileData.set(id, row);
+  } else {
+   selectedFiles.delete(id);
+   selectedFileData.delete(id);
+  }
+ }
+ updateFilesPage();
 }
 function toggleSelectAllFiles(checked){
  for(const row of fileRowsCache){
-  if(checked) selectedFiles.add(Number(row.id));
-  else selectedFiles.delete(Number(row.id));
+  const id = Number(row.id);
+  if(checked){
+   selectedFiles.add(id);
+   selectedFileData.set(id, row);
+  } else {
+   selectedFiles.delete(id);
+   selectedFileData.delete(id);
+  }
  }
  updateFilesPage();
+}
+function updateFolderCheckboxStates(){
+ document.querySelectorAll(".folderSelect").forEach(box => {
+  const ids = String(box.dataset.fileIds || "").split(",").map(Number).filter(Boolean);
+  const selected = ids.filter(id => selectedFiles.has(id)).length;
+  box.checked = ids.length > 0 && selected === ids.length;
+  box.indeterminate = selected > 0 && selected < ids.length;
+ });
+ const selectAll = document.getElementById("selectAllFiles");
+ if(selectAll){
+  const ids = fileRowsCache.map(row => Number(row.id));
+  const selected = ids.filter(id => selectedFiles.has(id)).length;
+  selectAll.checked = ids.length > 0 && selected === ids.length;
+  selectAll.indeterminate = selected > 0 && selected < ids.length;
+ }
+}
+function updateFilesSelectionSummary(){
+ const target = document.getElementById("filesSelectionSummary");
+ if(!target) return;
+ const selectedRows = Array.from(selectedFileData.values());
+ const totalSize = selectedRows.reduce((total, row) => total + Number(row.size || 0), 0);
+ const restorable = selectedRows.filter(row => Number(row.chunk_count || 0) > 0).length;
+ const unbacked = selectedRows.filter(row => row.state !== "backed_up" && row.state !== "deleted").length;
+ target.innerHTML = selectedRows.length
+  ? `<b>${selectedRows.length}</b> selected &middot; ${formatBytes(totalSize)} &middot; ${restorable} restorable &middot; ${unbacked} unbacked`
+  : `<span class="muted">No files selected.</span>`;
 }
 async function queueFile(fileId){
  const out = await post("/api/files/queue", { file_id:fileId });
@@ -796,7 +859,7 @@ async function boostSelectedFiles(){
  await updateFilesPage();
 }
 async function restoreSelectedFiles(){
- const selectedRows = fileRowsCache.filter(row => selectedFiles.has(Number(row.id)) && Number(row.chunk_count || 0) > 0);
+ const selectedRows = Array.from(selectedFileData.values()).filter(row => Number(row.chunk_count || 0) > 0);
  if(!selectedRows.length) return alert("Select files with recorded chunks first");
  const dest = prompt("Restore destination folder, blank for original locations", "");
  let restored = 0;
@@ -883,7 +946,7 @@ function cloudRows(targets){
  return targets.map((target, index) => cloudRow(target, index)).join("") || cloudRow({ name:"", provider:"local", target:"", command:"", enabled:true }, 0);
 }
 function cloudRow(target, index){
- return `<div class="host-row cloud-row" data-cloud-index="${index}">
+ return `<div class="cloud-row" data-cloud-index="${index}">
   <div class="toolbar"><h3><span class="ui-icon">&#9729;</span>Cloud target ${index + 1}</h3><button class="danger" onclick="removeCloudTarget(this)"><span class="ui-icon">&#128465;</span>Remove</button></div>
   <div class="host-grid">
    <label><input class="cloudEnabled" type="checkbox" ${target.enabled === false ? "" : "checked"}> Enabled</label>
@@ -919,17 +982,17 @@ function renumberCloudTargets(){
 }
 function removeHost(button){
  button.closest(".host-row").remove();
- if(!document.querySelector(".host-row")) addHost();
+ if(!document.querySelector("#hostList > .host-row")) addHost();
  renumberHosts();
 }
 function renumberHosts(){
- document.querySelectorAll(".host-row").forEach((row, index) => {
+ document.querySelectorAll("#hostList > .host-row").forEach((row, index) => {
   row.dataset.hostIndex = index;
   row.querySelector("h3").textContent = `Host ${index + 1}`;
  });
 }
 function collectHosts(){
- return Array.from(document.querySelectorAll(".host-row")).map(row => ({
+ return Array.from(document.querySelectorAll("#hostList > .host-row")).map(row => ({
   name: row.querySelector(".hostName").value.trim(),
   mode: row.querySelector(".hostMode").value,
   host: row.querySelector(".hostServer").value.trim(),

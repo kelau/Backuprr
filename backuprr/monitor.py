@@ -30,6 +30,10 @@ def format_duration(seconds: Optional[float]) -> str:
     return f"{secs}s"
 
 
+def is_socket_permission_error(exc: Exception) -> bool:
+    return isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10013
+
+
 class ScheduledTask:
     def __init__(self, db: Database, config: Config, name: str, kind: str):
         self.db = db
@@ -221,7 +225,13 @@ class VerificationMonitor(ScheduledTask):
 
     def verify_once(self, force: bool = False) -> int:
         if force:
-            result = verify_due_chunks(self.db, self.config, force=True)
+            try:
+                result = verify_due_chunks(self.db, self.config, force=True)
+            except OSError as exc:
+                if not is_socket_permission_error(exc):
+                    raise
+                self.db.log("warning", "verify.network", f"Verification skipped: NNTP socket access is blocked by the OS or sandbox ({exc})")
+                return 0
             self.db.log("info", "verify.manual", f"Manual verification checked {result} chunks")
             return result
         result = self.run_once()
@@ -231,7 +241,14 @@ class VerificationMonitor(ScheduledTask):
             return 0
 
     def execute(self) -> str:
-        count = verify_due_chunks(self.db, self.config, force=False)
+        try:
+            count = verify_due_chunks(self.db, self.config, force=False)
+        except OSError as exc:
+            if not is_socket_permission_error(exc):
+                raise
+            message = f"verification skipped: NNTP socket access is blocked by the OS or sandbox ({exc})"
+            self.db.log("warning", "verify.network", message)
+            return message
         result = f"{count} chunks verified"
         self.db.log("debug", "monitor.verify", f"Automatic verification task completed: {result}")
         return result
