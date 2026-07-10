@@ -289,7 +289,7 @@ class Database:
         with self.connect() as conn:
             return conn.execute(
                 """
-                SELECT q.*, f.path, f.size, f.sha256 FROM queue q
+                SELECT q.*, f.path, f.size, f.sha256, f.state FROM queue q
                 JOIN files f ON f.id = q.file_id
                 WHERE q.status='queued'
                   AND f.state NOT IN ('backed_up', 'deleted', 'posting')
@@ -507,6 +507,10 @@ class Database:
                 """
                 INSERT INTO chunks(file_id, chunk_index, message_id, size, sha256, subject, status, posted_at)
                 VALUES(?,?,?,?,?,?,?,?)
+                ON CONFLICT(file_id, chunk_index) DO UPDATE SET
+                  message_id=excluded.message_id, size=excluded.size, sha256=excluded.sha256,
+                  subject=excluded.subject, status=excluded.status, posted_at=excluded.posted_at,
+                  verified_at=NULL
                 """,
                 (file_id, chunk_index, message_id, size, sha256, subject, "posted", now),
             )
@@ -516,6 +520,18 @@ class Database:
                 "INSERT INTO transfer_samples(ts, direction, size) VALUES(?,?,?)",
                 (now, "upload", int(size)),
             )
+
+    def reusable_chunk_indexes(self, file_id: int) -> Dict[int, int]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT chunk_index, size FROM chunks WHERE file_id=? AND status != 'missing'",
+                (file_id,),
+            ).fetchall()
+            return {int(row["chunk_index"]): int(row["size"]) for row in rows}
+
+    def chunk_count_for_file(self, file_id: int) -> int:
+        with self.connect() as conn:
+            return int(conn.execute("SELECT COUNT(*) FROM chunks WHERE file_id=?", (file_id,)).fetchone()[0])
 
     def replace_chunks(self, file_id: int, chunks: Iterable[Dict[str, Any]]) -> int:
         now = utcnow()
@@ -548,6 +564,14 @@ class Database:
     def clear_chunks(self, file_id: int) -> int:
         with self.connect() as conn:
             cur = conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
+            return cur.rowcount
+
+    def trim_chunks(self, file_id: int, expected_chunks: int) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM chunks WHERE file_id=? AND chunk_index >= ?",
+                (file_id, max(0, int(expected_chunks))),
+            )
             return cur.rowcount
 
     def update_file_state(self, file_id: int, state: str) -> None:

@@ -1,4 +1,5 @@
 import hashlib
+import math
 import os
 import shutil
 import subprocess
@@ -87,11 +88,23 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         return file_id
     host = select_host(config, "post")
     db.set_queue_status(file_id, "posting")
-    db.set_queue_progress(file_id, 0, 0)
     db.update_file_state(file_id, "posting")
     payload = original
     try:
         payload = prepare_payload(original, config)
+        expected_chunks = max(1, math.ceil(payload.stat().st_size / max(1, int(config.article_size))))
+        can_reuse_chunks = payload == original and str(item["reason"] or "") in {
+            "startup-posting-retry",
+            "stale-posting-retry",
+            "missing-chunks",
+        }
+        reusable_chunks = db.reusable_chunk_indexes(file_id) if can_reuse_chunks else {}
+        reusable_chunks = {index: size for index, size in reusable_chunks.items() if 0 <= index < expected_chunks}
+        posted_count = len(reusable_chunks)
+        posted_bytes = sum(reusable_chunks.values())
+        db.set_queue_progress(file_id, posted_count, posted_bytes)
+        if reusable_chunks:
+            db.log("info", "post.resume", f"Resuming {original}: {posted_count}/{expected_chunks} chunks already cataloged", file_id)
 
         def post_chunk(chunk_index: int, chunk: bytes) -> tuple[int, str, int, str, str]:
             salt = os.urandom(16)
@@ -104,31 +117,25 @@ def post_next(db: Database, config: Config) -> Optional[int]:
 
         max_workers = max(1, int(config.nntp_threads))
         futures = []
-        posted_chunks = []
-        posted_count = 0
-        posted_bytes = 0
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backuprr-post") as executor:
             for chunk_index, chunk in enumerate(iter_chunks(payload, config.article_size)):
+                if chunk_index in reusable_chunks:
+                    continue
                 futures.append(executor.submit(post_chunk, chunk_index, chunk))
             for future in as_completed(futures):
                 chunk_index, message_id, body_size, digest, subject = future.result()
-                posted_chunks.append(
-                    {
-                        "chunk_index": chunk_index,
-                        "message_id": message_id,
-                        "size": body_size,
-                        "sha256": digest,
-                        "subject": subject,
-                    }
-                )
+                db.add_chunk(file_id, chunk_index, message_id, body_size, digest, subject)
                 posted_count += 1
                 posted_bytes += body_size
                 db.set_queue_progress(file_id, posted_count, posted_bytes)
-                db.record_transfer_sample("upload", body_size)
                 db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
-        replaced = db.replace_chunks(file_id, posted_chunks)
-        db.set_queue_progress(file_id, replaced, sum(int(chunk["size"]) for chunk in posted_chunks))
-        db.log("debug", "post.retry", f"Replaced chunk catalog with {replaced} newly posted chunks for {original}", file_id)
+        final_chunks = db.chunk_count_for_file(file_id)
+        if final_chunks < expected_chunks:
+            raise RuntimeError(f"Only {final_chunks} of {expected_chunks} chunks are cataloged")
+        trimmed = db.trim_chunks(file_id, expected_chunks)
+        final_chunks = db.chunk_count_for_file(file_id)
+        db.set_queue_progress(file_id, final_chunks, posted_bytes)
+        db.log("debug", "post.retry", f"Chunk catalog has {final_chunks} chunks for {original}, {trimmed} stale chunk rows trimmed", file_id)
         with db.connect() as conn:
             conn.execute("UPDATE files SET state='backed_up', last_backup_at=?, updated_at=? WHERE id=?", (utcnow(), utcnow(), file_id))
             conn.execute("UPDATE queue SET status='done', updated_at=? WHERE file_id=?", (utcnow(), file_id))
