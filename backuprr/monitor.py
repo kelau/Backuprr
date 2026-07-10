@@ -112,13 +112,16 @@ class ScheduledTask:
             until_next = ""
             if self._next_run_at:
                 until_next = format_duration((self._next_run_at - now).total_seconds())
+            duration_seconds = self._last_duration_seconds
+            if self._running and self._last_started_monotonic is not None:
+                duration_seconds = time.perf_counter() - self._last_started_monotonic
             return {
                 "name": self.name,
                 "kind": self.kind,
                 "status": "running" if self._running else "scheduled",
                 "interval_seconds": self.interval_seconds,
                 "last_run": iso_or_empty(self._last_finished_at),
-                "last_run_duration": format_duration(self._last_duration_seconds),
+                "last_run_duration": format_duration(duration_seconds),
                 "time_until_next_run": until_next,
                 "runs": self._runs,
                 "last_result": self._last_result,

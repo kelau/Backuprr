@@ -250,7 +250,10 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 token = self.db.change_token()
-                token["task_revision"] = sum(int(task.get("revision", 0)) for task in self.all_tasks())
+                tasks = self.all_tasks()
+                token["task_revision"] = sum(int(task.get("revision", 0)) for task in tasks)
+                if any(task.get("status") == "running" for task in tasks):
+                    token["running_task_tick"] = int(time.time())
                 payload = json.dumps(token, default=str)
                 if payload != last_payload:
                     self.wfile.write(f"event: change\ndata: {payload}\n\n".encode("utf-8"))
@@ -855,9 +858,22 @@ function bytesToGb(value){
 function gbToBytes(value){
  return Math.round(Number(value || 0) * 1073741824);
 }
+function bytesToKib(value){
+ return Math.round(Number(value || 0) / 1024);
+}
+function kibToBytes(value){
+ return Math.round(Number(value || 0) * 1024);
+}
 function postLimitLabel(gb){
  const value = Number(gb || 0);
  return value <= 0 ? "No limit" : `${value} GB/hour`;
+}
+function articleSizeLabel(kib){
+ const value = Number(kib || 0);
+ return value >= 1024 ? `${(value / 1024).toFixed(value % 1024 ? 1 : 0)} MiB` : `${value} KiB`;
+}
+function countLabel(value, unit){
+ return `${Number(value || 0)} ${unit}`;
 }
 function formatDateTime(value){
  if(!value) return "";
@@ -1081,12 +1097,12 @@ function settingsForm(s){
  </div>
  <div id="tabGeneral" class="tab-panel active"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#128101;</span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
-  <label class="field"><span><span class="ui-icon">&#129513;</span>Article size bytes</span><input id="setArticleSize" type="number" min="1" value="${esc(s.article_size)}"></label>
-  <label class="field"><span><span class="ui-icon">&#128225;</span>NNTP threads</span><input id="setNntpThreads" type="number" min="1" max="64" value="${esc(s.nntp_threads || 4)}"></label>
+  <label class="field"><span><span class="ui-icon">&#129513;</span>Article size</span><div class="range-field"><input id="setArticleSizeKib" type="range" min="100" max="5120" step="1" value="${esc(bytesToKib(s.article_size || 786432))}" oninput="setArticleSizeLabel.textContent=articleSizeLabel(this.value)"><span id="setArticleSizeLabel">${esc(articleSizeLabel(bytesToKib(s.article_size || 786432)))}</span></div></label>
+  <label class="field"><span><span class="ui-icon">&#128225;</span>NNTP threads</span><div class="range-field"><input id="setNntpThreads" type="range" min="1" max="50" step="1" value="${esc(s.nntp_threads || 4)}" oninput="setNntpThreadsLabel.textContent=countLabel(this.value, 'threads')"><span id="setNntpThreadsLabel">${esc(countLabel(s.nntp_threads || 4, "threads"))}</span></div></label>
   <label class="field"><span><span class="ui-icon">&#9201;</span>Post limit per hour</span><div class="range-field"><input id="setHourlyPostLimitGb" type="range" min="0" max="1000" step="10" value="${esc(bytesToGb(s.hourly_post_limit_bytes || 0))}" oninput="setHourlyPostLimitLabel.textContent=postLimitLabel(this.value)"><span id="setHourlyPostLimitLabel">${esc(postLimitLabel(bytesToGb(s.hourly_post_limit_bytes || 0)))}</span></div></label>
  </div></div>
  <div id="tabSchedules" class="tab-panel"><div class="form-grid">
-  <label class="field"><span><span class="ui-icon">&#10003;</span>Verify interval days</span><input id="setVerifyDays" type="number" min="1" value="${esc(s.verification_interval_days)}"></label>
+  <label class="field"><span><span class="ui-icon">&#10003;</span>Verify interval</span><div class="range-field"><input id="setVerifyDays" type="range" min="1" max="180" step="1" value="${esc(s.verification_interval_days)}" oninput="setVerifyDaysLabel.textContent=countLabel(this.value, 'days')"><span id="setVerifyDaysLabel">${esc(countLabel(s.verification_interval_days, "days"))}</span></div></label>
   <label class="field"><span><span class="ui-icon">&#10003;</span>Verification task interval seconds</span><input id="setVerifyTaskInterval" type="number" min="1" value="${esc(s.verification_task_interval_seconds || 3600)}"></label>
   <label class="field"><span><span class="ui-icon">&#128196;</span>Files verified per task run</span><input id="setVerifyFilesPerRun" type="number" min="1" value="${esc(s.verification_files_per_run || 1)}"></label>
   <label class="field"><span><span class="ui-icon">&#128193;</span>Catalog scan interval seconds</span><input id="setScanInterval" type="number" min="1" value="${esc(s.scan_interval_seconds || 300)}"></label>
@@ -1099,7 +1115,7 @@ function settingsForm(s){
   <label><input id="setEncrypt" type="checkbox" ${s.encrypt_bodies?"checked":""}> <span class="ui-icon">&#128274;</span>Encrypt article bodies</label>
   <label><input id="setPar2" type="checkbox" ${s.par2?.enabled?"checked":""}> <span class="ui-icon">&#128737;</span>Generate PAR2 recovery files</label>
   <label class="field"><span><span class="ui-icon">&#9881;</span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
-  <label class="field"><span><span class="ui-icon">&#128737;</span>PAR2 redundancy percent</span><input id="setPar2Redundancy" type="number" min="0" value="${esc(s.par2?.redundancy_percent ?? 10)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128737;</span>PAR2 redundancy</span><div class="range-field"><input id="setPar2Redundancy" type="range" min="1" max="50" step="1" value="${esc(s.par2?.redundancy_percent ?? 10)}" oninput="setPar2RedundancyLabel.textContent=this.value + '%'"><span id="setPar2RedundancyLabel">${esc(s.par2?.redundancy_percent ?? 10)}%</span></div></label>
  </div></div>
  <div id="tabEndpoints" class="tab-panel"><div class="form-grid">
  <label class="field full"><span><span class="ui-icon">&#128193;</span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
@@ -1209,7 +1225,7 @@ function collectCloudTargets(){
 async function saveSettings(){
  const payload = {
   newsgroup: setNewsgroup.value,
-  article_size: Number(setArticleSize.value),
+  article_size: kibToBytes(setArticleSizeKib.value),
   verification_interval_days: Number(setVerifyDays.value),
   verification_task_interval_seconds: Number(setVerifyTaskInterval.value),
   verification_files_per_run: Number(setVerifyFilesPerRun.value),

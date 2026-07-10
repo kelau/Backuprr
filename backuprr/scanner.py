@@ -42,8 +42,12 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
     for path in root.rglob("*"):
         if not path.is_file():
             continue
-        stat = path.stat()
         resolved = str(path.resolve())
+        try:
+            stat = path.stat()
+        except OSError as exc:
+            db.log("warning", "scan.file_error", f"Skipped unreadable file metadata {resolved}: {exc}")
+            continue
         seen.append(resolved)
         existing = snapshot.get(resolved)
         if existing and existing["state"] != "deleted" and existing["size"] == stat.st_size and existing["mtime_ns"] == stat.st_mtime_ns:
@@ -51,7 +55,14 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
             count += 1
             continue
         candidate = None if existing else move_candidate(stat.st_size, stat.st_mtime_ns, resolved)
-        digest = candidate["sha256"] if candidate else sha256_file(path)
+        if candidate:
+            digest = candidate["sha256"]
+        else:
+            try:
+                digest = sha256_file(path)
+            except OSError as exc:
+                db.log("warning", "scan.file_error", f"Skipped unreadable file content {resolved}: {exc}")
+                continue
         hashed += 0 if candidate else 1
         file_id = db.upsert_file(
             {

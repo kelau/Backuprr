@@ -135,8 +135,8 @@ class Config:
 def update_config(config: Config, data: Dict[str, Any]) -> None:
     if "article_size" in data:
         article_size = int(data["article_size"])
-        if article_size <= 0:
-            raise ValueError("article_size must be greater than zero")
+        if article_size < 100 * 1024 or article_size > 5 * 1024 * 1024:
+            raise ValueError("article_size must be between 100 KiB and 5 MiB")
         config.article_size = article_size
     if "newsgroup" in data:
         newsgroup = str(data["newsgroup"]).strip()
@@ -145,8 +145,8 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         config.newsgroup = newsgroup
     if "verification_interval_days" in data:
         interval = int(data["verification_interval_days"])
-        if interval <= 0:
-            raise ValueError("verification_interval_days must be greater than zero")
+        if interval < 1 or interval > 180:
+            raise ValueError("verification_interval_days must be between 1 and 180")
         config.verification_interval_days = interval
     if "verification_task_interval_seconds" in data:
         interval = int(data["verification_task_interval_seconds"])
@@ -175,9 +175,9 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         config.cloud_backup_interval_seconds = interval
     if "nntp_threads" in data:
         threads = int(data["nntp_threads"])
-        if threads <= 0:
-            raise ValueError("nntp_threads must be greater than zero")
-        config.nntp_threads = min(64, threads)
+        if threads < 1 or threads > 50:
+            raise ValueError("nntp_threads must be between 1 and 50")
+        config.nntp_threads = threads
     if "hourly_post_limit_bytes" in data:
         limit = int(data["hourly_post_limit_bytes"] or 0)
         if limit < 0:
@@ -237,6 +237,6 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         par2.update(data["par2"] or {})
         par2["enabled"] = bool(par2.get("enabled"))
         par2["redundancy_percent"] = int(par2.get("redundancy_percent", 10))
-        if par2["redundancy_percent"] < 0:
-            raise ValueError("PAR2 redundancy percent cannot be negative")
+        if par2["redundancy_percent"] < 1 or par2["redundancy_percent"] > 50:
+            raise ValueError("PAR2 redundancy percent must be between 1 and 50")
         config.par2 = par2

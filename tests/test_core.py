@@ -106,7 +106,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.29")
+        self.assertEqual(__version__, "0.2.30")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -204,6 +204,18 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(row["state"], "discovered")
         with patch("backuprr.scanner.sha256_file", side_effect=AssertionError("revived unchanged file should not be rehashed")):
             self.assertEqual(scan_all(self.db), 1)
+
+    def test_scan_skips_unreadable_file_content(self):
+        media = self.root / "media"
+        media.mkdir()
+        movie = media / "locked.iso"
+        movie.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        with patch("backuprr.scanner.sha256_file", side_effect=PermissionError("locked")):
+            self.assertEqual(scan_all(self.db), 0)
+        rows = self.db.list_events(["warning"], event_types=["scan.file_error"])
+        self.assertEqual(len(rows), 1)
+        self.assertIn("Skipped unreadable file content", rows[0]["message"])
 
     def test_scan_updates_moved_file_without_rehash_when_metadata_matches(self):
         media = self.root / "media"
@@ -714,7 +726,7 @@ class CoreTests(unittest.TestCase):
         update_config(
             self.config,
             {
-                "article_size": 1024,
+                "article_size": 256 * 1024,
                 "newsgroup": "alt.binaries.example",
                 "verification_interval_days": 30,
                 "verification_task_interval_seconds": 45,
@@ -746,7 +758,7 @@ class CoreTests(unittest.TestCase):
                 ],
             },
         )
-        self.assertEqual(self.config.article_size, 1024)
+        self.assertEqual(self.config.article_size, 256 * 1024)
         self.assertEqual(self.config.newsgroup, "alt.binaries.example")
         self.assertEqual(self.config.verification_interval_days, 30)
         self.assertEqual(self.config.verification_task_interval_seconds, 45)
@@ -850,6 +862,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(format_duration(0), "1ms")
         self.assertEqual(format_duration(0.124), "124ms")
         self.assertEqual(format_duration(1.2), "1s")
+
+    def test_running_task_duration_reports_current_elapsed_time(self):
+        monitor = CatalogMonitor(self.db, self.config)
+        with patch("backuprr.monitor.time.perf_counter", side_effect=[100.0, 102.4]):
+            monitor._mark_started()
+            task = monitor.tasks()[0]
+        self.assertEqual(task["status"], "running")
+        self.assertEqual(task["last_run_duration"], "2s")
 
     def test_old_env_host_keys_are_ignored_when_loading_hosts(self):
         host = UsenetHost.from_dict(
