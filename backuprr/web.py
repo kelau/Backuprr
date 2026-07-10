@@ -1,4 +1,5 @@
 import json
+import math
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -15,6 +16,36 @@ from .restore import restore_file, restore_folder
 
 def rowdicts(rows):
     return [dict(row) for row in rows]
+
+
+def mbps_from_bps(value: float) -> float:
+    return round((float(value or 0) * 8) / 1_000_000, 2)
+
+
+def throughput_summary(samples: list[dict[str, Any]]) -> dict[str, float]:
+    if not samples:
+        return {"upload_mbps": 0.0, "download_mbps": 0.0, "average_upload_mbps": 0.0, "average_download_mbps": 0.0}
+    recent = samples[-5:]
+    current = samples[-1]
+    avg_upload = sum(float(sample.get("upload_bps") or 0) for sample in recent) / max(1, len(recent))
+    avg_download = sum(float(sample.get("download_bps") or 0) for sample in recent) / max(1, len(recent))
+    return {
+        "upload_mbps": mbps_from_bps(float(current.get("upload_bps") or 0)),
+        "download_mbps": mbps_from_bps(float(current.get("download_bps") or 0)),
+        "average_upload_mbps": mbps_from_bps(avg_upload),
+        "average_download_mbps": mbps_from_bps(avg_download),
+    }
+
+
+def thread_usage_summary(posting_rows: list[dict[str, Any]], article_size: int, configured_threads: int) -> dict[str, int]:
+    total = max(1, int(configured_threads or 1))
+    size = max(1, int(article_size or 1))
+    remaining_chunks = 0
+    for row in posting_rows:
+        expected = max(1, math.ceil(int(row.get("size") or 0) / size))
+        posted = int(row.get("posted_chunks") or row.get("progress_chunks") or 0)
+        remaining_chunks += max(0, expected - posted)
+    return {"in_use": min(total, remaining_chunks), "total": total}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -53,10 +84,14 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(INDEX_HTML.encode("utf-8"))
         elif parsed.path == "/api/status":
             self.db.cleanup_completed_queue()
+            speed = self.db.speed_samples(5, 60)
+            posting_rows = [dict(row) for row in self.db.list_queue(status="posting")]
             self.send_json(
                 {
                     "version": __version__,
                     "stats": self.db.stats(),
+                    "throughput": throughput_summary(speed),
+                    "nntp_threads": thread_usage_summary(posting_rows, self.config.article_size, self.config.nntp_threads),
                     "scan_interval_seconds": self.config.scan_interval_seconds,
                     "backup_interval_seconds": self.config.backup_interval_seconds,
                     "verification_task_interval_seconds": self.config.verification_task_interval_seconds,
@@ -261,8 +296,10 @@ table { width:100%; border-collapse:collapse; background:#fff; border:1px solid 
 th, td { padding:8px 10px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; overflow-wrap:anywhere; }
 th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-bottom:16px; }
+.compact-stats { grid-template-columns:repeat(auto-fit,minmax(130px,1fr)); margin-bottom:0; }
 .stat { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px; }
 .stat b { display:block; font-size:24px; }
+.compact-stats .stat b { font-size:18px; }
 .dashboard { display:grid; gap:14px; }
 .hero-status { background:#fff; border:1px solid var(--line); border-radius:8px; padding:14px; display:grid; gap:10px; }
 .hero-status h2 { margin:0; font-size:20px; }
@@ -289,6 +326,8 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .bar-fill.bad { background:var(--bad); }
 .progress-track { height:16px; background:#edf1f2; border-radius:999px; overflow:hidden; }
 .progress-fill { height:100%; background:var(--accent); border-radius:999px; transition:width .2s ease; }
+.thread-meter { display:flex; align-items:baseline; gap:8px; margin-bottom:10px; }
+.thread-meter b { font-size:32px; }
 .refresh-note { margin-left:auto; }
 .push-note { margin-left:auto; }
 .section-title { margin:16px 0 8px; font-size:16px; }
@@ -609,6 +648,8 @@ function statusDashboard(status, tasks, speed){
  const doneQueue = Number(stats.queue_done || 0);
  const queuedQueue = Number(stats.queue_queued || 0);
  const postingQueue = Number(stats.queue_posting || 0);
+ const throughput = status.throughput || {};
+ const nntpThreads = status.nntp_threads || {};
  const protectedPct = total ? Math.round((backed / total) * 100) : 0;
  const activeTask = tasks.find(task => task.status === "running");
  const nextTask = tasks
@@ -635,6 +676,10 @@ function statusDashboard(status, tasks, speed){
    ${statCard("Missing chunks", missingChunks, "&#9888;")}
   </div>
   <div class="chart-grid">
+   ${throughputPanel(throughput)}
+   ${threadPanel(nntpThreads)}
+  </div>
+  <div class="chart-grid">
    ${speedChart("Transfer speed", speed || [])}
    ${barChart("File states", [
     ["backed up", backed, "ok"],
@@ -658,6 +703,28 @@ function statusDashboard(status, tasks, speed){
 }
 function statCard(label, value, icon="&#8226;"){
  return `<div class="stat"><span><span class="ui-icon">${icon}</span>${esc(label)}</span><b>${esc(value)}</b></div>`;
+}
+function throughputPanel(throughput){
+ return `<div class="chart-card">
+  <h3><span class="ui-icon">&#128225;</span>Mbps throughput</h3>
+  <div class="stats compact-stats">
+   ${statCard("Upload now", `${Number(throughput.upload_mbps || 0).toFixed(2)} Mbps`, "&#8679;")}
+   ${statCard("Download now", `${Number(throughput.download_mbps || 0).toFixed(2)} Mbps`, "&#8681;")}
+   ${statCard("5 min upload", `${Number(throughput.average_upload_mbps || 0).toFixed(2)} Mbps`, "&#128200;")}
+   ${statCard("5 min download", `${Number(throughput.average_download_mbps || 0).toFixed(2)} Mbps`, "&#128201;")}
+  </div>
+ </div>`;
+}
+function threadPanel(threads){
+ const total = Math.max(1, Number(threads.total || 1));
+ const inUse = Math.max(0, Math.min(total, Number(threads.in_use || 0)));
+ const pct = Math.round((inUse / total) * 100);
+ return `<div class="chart-card">
+  <h3><span class="ui-icon">&#129489;</span>NNTP threads</h3>
+  <div class="thread-meter"><b>${inUse}</b><span class="muted">of ${total} in use</span></div>
+  <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+  <div class="muted">${pct}% active capacity</div>
+ </div>`;
 }
 function taskCard(task){
  const running = task.status === "running";

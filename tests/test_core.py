@@ -13,6 +13,7 @@ from backuprr.db import Database
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor
 from backuprr.queueing import enqueue_unbacked, prioritize
 from backuprr.scanner import scan_all
+from backuprr.web import thread_usage_summary, throughput_summary
 
 
 class FakePostClient:
@@ -67,7 +68,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.14")
+        self.assertEqual(__version__, "0.2.15")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -419,6 +420,28 @@ class CoreTests(unittest.TestCase):
         self.db.add_chunk(file_id, 0, "<chunk@example.test>", 120, "abc", "[hidden]")
         samples = self.db.speed_samples(minutes=5, bucket_seconds=60)
         self.assertTrue(any(sample["upload_bps"] > 0 for sample in samples))
+
+    def test_status_throughput_summary_reports_mbps(self):
+        summary = throughput_summary(
+            [
+                {"upload_bps": 125000, "download_bps": 0},
+                {"upload_bps": 250000, "download_bps": 500000},
+            ]
+        )
+        self.assertEqual(summary["upload_mbps"], 2.0)
+        self.assertEqual(summary["download_mbps"], 4.0)
+        self.assertEqual(summary["average_upload_mbps"], 1.5)
+
+    def test_status_thread_usage_caps_at_configured_threads(self):
+        usage = thread_usage_summary(
+            [
+                {"size": 100, "posted_chunks": 1},
+                {"size": 40, "posted_chunks": 0},
+            ],
+            article_size=10,
+            configured_threads=4,
+        )
+        self.assertEqual(usage, {"in_use": 4, "total": 4})
 
     def test_queue_pagination_and_folder_priority(self):
         media = self.root / "media"
