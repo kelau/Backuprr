@@ -95,6 +95,7 @@ class Handler(BaseHTTPRequestHandler):
                     "scan_interval_seconds": self.config.scan_interval_seconds,
                     "backup_interval_seconds": self.config.backup_interval_seconds,
                     "verification_task_interval_seconds": self.config.verification_task_interval_seconds,
+                    "verification_files_per_run": self.config.verification_files_per_run,
                     "cloud_backup_interval_seconds": self.config.cloud_backup_interval_seconds,
                 }
             )
@@ -1035,6 +1036,7 @@ function settingsForm(s){
  <div id="tabSchedules" class="tab-panel"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#10003;</span>Verify interval days</span><input id="setVerifyDays" type="number" min="1" value="${esc(s.verification_interval_days)}"></label>
   <label class="field"><span><span class="ui-icon">&#10003;</span>Verification task interval seconds</span><input id="setVerifyTaskInterval" type="number" min="1" value="${esc(s.verification_task_interval_seconds || 3600)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128196;</span>Files verified per task run</span><input id="setVerifyFilesPerRun" type="number" min="1" value="${esc(s.verification_files_per_run || 1)}"></label>
   <label class="field"><span><span class="ui-icon">&#128193;</span>Catalog scan interval seconds</span><input id="setScanInterval" type="number" min="1" value="${esc(s.scan_interval_seconds || 300)}"></label>
   <label class="field"><span><span class="ui-icon">&#128230;</span>Backup task interval seconds</span><input id="setBackupInterval" type="number" min="1" value="${esc(s.backup_interval_seconds || 300)}"></label>
   <label class="field"><span><span class="ui-icon">&#9729;</span>Cloud backup interval seconds</span><input id="setCloudBackupInterval" type="number" min="1" value="${esc(s.cloud_backup_interval_seconds || 3600)}"></label>
@@ -1158,6 +1160,7 @@ async function saveSettings(){
   article_size: Number(setArticleSize.value),
   verification_interval_days: Number(setVerifyDays.value),
   verification_task_interval_seconds: Number(setVerifyTaskInterval.value),
+  verification_files_per_run: Number(setVerifyFilesPerRun.value),
   scan_interval_seconds: Number(setScanInterval.value),
   backup_interval_seconds: Number(setBackupInterval.value),
   cloud_backup_interval_seconds: Number(setCloudBackupInterval.value),

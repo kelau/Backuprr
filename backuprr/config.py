@@ -56,6 +56,7 @@ class Config:
     newsgroup: str = "alt.binaries.backup"
     verification_interval_days: int = 90
     verification_task_interval_seconds: int = 3600
+    verification_files_per_run: int = 1
     scan_interval_seconds: int = 300
     backup_interval_seconds: int = 300
     cloud_backup_interval_seconds: int = 3600
@@ -108,6 +109,7 @@ class Config:
             "newsgroup": self.newsgroup,
             "verification_interval_days": self.verification_interval_days,
             "verification_task_interval_seconds": self.verification_task_interval_seconds,
+            "verification_files_per_run": self.verification_files_per_run,
             "scan_interval_seconds": self.scan_interval_seconds,
             "backup_interval_seconds": self.backup_interval_seconds,
             "cloud_backup_interval_seconds": self.cloud_backup_interval_seconds,
@@ -150,6 +152,11 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if interval <= 0:
             raise ValueError("verification_task_interval_seconds must be greater than zero")
         config.verification_task_interval_seconds = interval
+    if "verification_files_per_run" in data:
+        files_per_run = int(data["verification_files_per_run"])
+        if files_per_run <= 0:
+            raise ValueError("verification_files_per_run must be greater than zero")
+        config.verification_files_per_run = files_per_run
     if "scan_interval_seconds" in data:
         interval = int(data["scan_interval_seconds"])
         if interval <= 0:

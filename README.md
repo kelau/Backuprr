@@ -19,11 +19,12 @@ a CLI and an AJAX-enabled Web UI.
 - Obfuscated post subjects.
 - Optional body encryption, zip grouping for subfolders, and PAR2 generation
   hooks.
-- Periodic chunk existence checks, defaulting to 90 days.
+- Periodic chunk existence checks, defaulting to 90 days per file and spread
+  across worker runs by each file's last verification or backup time.
 - Restore support for individual files and folders to the original location or
   an alternate destination.
-- Web pages for Status, Files, Search, Log, Queue, Tasks, Settings, Restore,
-  and About.
+- Web pages for Status, Files, Search, Log, Queue, Tasks, Verification,
+  Statistics, Settings, and About.
 - Live-refreshing operational pages and a Status dashboard with task progress,
   queue/file summaries, and simple charts.
 - CLI commands matching the Web UI operations.
@@ -55,6 +56,8 @@ direct provider username/password used for NNTP authentication:
   "article_size": 786432,
   "newsgroup": "alt.binaries.backup",
   "verification_interval_days": 90,
+  "verification_task_interval_seconds": 3600,
+  "verification_files_per_run": 1,
   "scan_interval_seconds": 300,
   "backup_interval_seconds": 300,
   "usenet_hosts": [

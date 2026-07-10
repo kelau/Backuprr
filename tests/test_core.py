@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backuprr import __version__
-from backuprr.backup import decode_chunk, encode_chunk, post_next, verify_file_chunks
+from backuprr.backup import decode_chunk, encode_chunk, post_next, verify_due_chunks, verify_file_chunks
 from backuprr.cloud_backup import backup_config_and_database, backup_config_and_database_if_changed
 from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
@@ -98,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.21")
+        self.assertEqual(__version__, "0.2.22")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -605,6 +605,7 @@ class CoreTests(unittest.TestCase):
                 "newsgroup": "alt.binaries.example",
                 "verification_interval_days": 30,
                 "verification_task_interval_seconds": 45,
+                "verification_files_per_run": 3,
                 "scan_interval_seconds": 15,
                 "backup_interval_seconds": 20,
                 "cloud_backup_interval_seconds": 55,
@@ -636,6 +637,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.newsgroup, "alt.binaries.example")
         self.assertEqual(self.config.verification_interval_days, 30)
         self.assertEqual(self.config.verification_task_interval_seconds, 45)
+        self.assertEqual(self.config.verification_files_per_run, 3)
         self.assertEqual(self.config.scan_interval_seconds, 15)
         self.assertEqual(self.config.backup_interval_seconds, 20)
         self.assertEqual(self.config.cloud_backup_interval_seconds, 55)
@@ -807,6 +809,38 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             verified = conn.execute("SELECT file_id FROM chunks WHERE status='verified'").fetchall()
         self.assertEqual([row["file_id"] for row in verified], [rows[0]["id"]])
+
+    def test_automatic_verification_uses_per_file_due_dates_and_batch_limit(self):
+        media = self.root / "media"
+        media.mkdir()
+        for name in ("old-one.mkv", "old-two.mkv", "recent.mkv"):
+            (media / name).write_bytes(name.encode())
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT id, relative_path FROM files ORDER BY relative_path").fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE files SET state='backed_up', last_backup_at=? WHERE id=?",
+                    ("2999-01-01T00:00:00+00:00" if row["relative_path"] == "recent.mkv" else "2000-01-01T00:00:00+00:00", row["id"]),
+                )
+        for row in rows:
+            self.db.add_chunk(row["id"], 0, f"<{row['relative_path']}@example.test>", 3, "abc", "[hidden]")
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        self.config.verification_files_per_run = 1
+        with patch("backuprr.backup.UsenetClient", FakeReadClient):
+            self.assertEqual(verify_due_chunks(self.db, self.config), 1)
+        with self.db.connect() as conn:
+            verified = conn.execute(
+                """
+                SELECT f.relative_path
+                FROM chunks c
+                JOIN files f ON f.id = c.file_id
+                WHERE c.status='verified'
+                ORDER BY f.relative_path
+                """
+            ).fetchall()
+        self.assertEqual([row["relative_path"] for row in verified], ["old-one.mkv"])
 
     def test_restore_file_accepts_modern_nntplib_article_response(self):
         media = self.root / "media"

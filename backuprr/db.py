@@ -554,6 +554,30 @@ class Database:
                 (older_than,),
             ).fetchall()
 
+    def chunks_due_for_file_verification(self, older_than: str, file_limit: int) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            due_files = conn.execute(
+                """
+                SELECT id
+                FROM (
+                    SELECT f.id,
+                           f.relative_path,
+                           COALESCE(f.last_verify_at, f.last_backup_at, MIN(c.posted_at), f.updated_at, f.created_at) AS due_basis
+                    FROM files f
+                    JOIN chunks c ON c.file_id = f.id
+                    WHERE f.state != 'deleted'
+                      AND c.status != 'missing'
+                    GROUP BY f.id
+                )
+                WHERE due_basis IS NOT NULL
+                  AND due_basis <= ?
+                ORDER BY due_basis ASC, relative_path ASC
+                LIMIT ?
+                """,
+                (older_than, max(1, int(file_limit))),
+            ).fetchall()
+        return self.chunks_for_file_ids(row["id"] for row in due_files)
+
     def chunks_for_file_ids(self, file_ids: Iterable[int]) -> List[sqlite3.Row]:
         ids = [int(file_id) for file_id in file_ids]
         if not ids:

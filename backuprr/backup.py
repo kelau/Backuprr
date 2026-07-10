@@ -171,7 +171,12 @@ def verify_chunks(db: Database, config: Config, chunks: Iterable[Any]) -> int:
 def verify_due_chunks(db: Database, config: Config, force: bool = False) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=config.verification_interval_days)
     older_than = datetime.max.replace(tzinfo=timezone.utc).isoformat() if force else cutoff.replace(microsecond=0).isoformat()
-    return verify_chunks(db, config, db.chunks_due_for_verification(older_than))
+    chunks = (
+        db.chunks_due_for_verification(older_than)
+        if force
+        else db.chunks_due_for_file_verification(older_than, config.verification_files_per_run)
+    )
+    return verify_chunks(db, config, chunks)
 
 
 def verify_file_chunks(db: Database, config: Config, file_ids: Iterable[int]) -> int:
