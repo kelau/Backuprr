@@ -15,7 +15,7 @@ from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor,
 from backuprr.queueing import enqueue_unbacked, prioritize
 from backuprr.restore import restore_file
 from backuprr.scanner import scan_all
-from backuprr.web import thread_usage_summary, throughput_summary
+from backuprr.web import hourly_post_budget, thread_usage_summary, throughput_summary
 
 
 class FakePostClient:
@@ -98,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.23")
+        self.assertEqual(__version__, "0.2.24")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -513,6 +513,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(summary["upload_mbps"], 2.0)
         self.assertEqual(summary["download_mbps"], 4.0)
         self.assertEqual(summary["average_upload_mbps"], 1.5)
+
+    def test_hourly_post_budget_reports_used_limit_and_remaining_bytes(self):
+        self.config.hourly_post_limit_bytes = 10
+        self.db.record_transfer_sample("upload", 4)
+        budget = hourly_post_budget(self.db, self.config)
+        self.assertEqual(budget["used_bytes"], 4)
+        self.assertEqual(budget["limit_bytes"], 10)
+        self.assertEqual(budget["remaining_bytes"], 6)
+        self.assertEqual(budget["percent"], 40)
+        self.assertEqual(budget["enabled"], 1)
 
     def test_status_thread_usage_caps_at_configured_threads(self):
         usage = thread_usage_summary(

@@ -1,6 +1,7 @@
 import json
 import math
 import time
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
@@ -48,6 +49,19 @@ def thread_usage_summary(posting_rows: list[dict[str, Any]], article_size: int, 
     return {"in_use": min(total, remaining_chunks), "total": total}
 
 
+def hourly_post_budget(db: Database, config: Config) -> dict[str, Any]:
+    limit = max(0, int(getattr(config, "hourly_post_limit_bytes", 0) or 0))
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0).isoformat()
+    used = db.transfer_bytes_since("upload", cutoff)
+    return {
+        "used_bytes": used,
+        "limit_bytes": limit,
+        "remaining_bytes": max(0, limit - used) if limit else 0,
+        "percent": min(100.0, round((used / limit) * 100, 1)) if limit else 0,
+        "enabled": 1 if limit else 0,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     config: Config
     config_path: str
@@ -91,6 +105,7 @@ class Handler(BaseHTTPRequestHandler):
                     "version": __version__,
                     "stats": self.db.stats(),
                     "throughput": throughput_summary(speed),
+                    "hourly_post_budget": hourly_post_budget(self.db, self.config),
                     "nntp_threads": thread_usage_summary(posting_rows, self.config.article_size, self.config.nntp_threads),
                     "scan_interval_seconds": self.config.scan_interval_seconds,
                     "backup_interval_seconds": self.config.backup_interval_seconds,
@@ -316,6 +331,7 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .pill.info { background:#eff6ff; color:#1d4ed8; }
 .pill.debug { background:#f5f3ff; color:#6d28d9; }
 .pill.verbose { background:#f8fafc; color:var(--muted); }
+.pill.verified { padding:2px 6px; }
 .stat span, .section-title, .chart-card h3, .task-card h3 { display:flex; align-items:center; gap:6px; }
 .chart-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
 .chart-card { background:#fff; border:1px solid var(--line); border-radius:8px; padding:12px; }
@@ -660,6 +676,7 @@ function statusDashboard(status, tasks, speed){
  const queuedQueue = Number(stats.queue_queued || 0);
  const postingQueue = Number(stats.queue_posting || 0);
  const throughput = status.throughput || {};
+ const hourlyPostBudget = status.hourly_post_budget || {};
  const nntpThreads = status.nntp_threads || {};
  const protectedPct = total ? Math.round((backed / total) * 100) : 0;
  const activeTask = tasks.find(task => task.status === "running");
@@ -688,6 +705,7 @@ function statusDashboard(status, tasks, speed){
   </div>
   <div class="chart-grid">
    ${throughputPanel(throughput)}
+   ${hourlyPostBudgetPanel(hourlyPostBudget)}
    ${threadPanel(nntpThreads)}
   </div>
   <div class="chart-grid">
@@ -724,6 +742,19 @@ function throughputPanel(throughput){
    ${statCard("5 min upload", `${Number(throughput.average_upload_mbps || 0).toFixed(2)} Mbps`, "&#128200;")}
    ${statCard("5 min download", `${Number(throughput.average_download_mbps || 0).toFixed(2)} Mbps`, "&#128201;")}
   </div>
+ </div>`;
+}
+function hourlyPostBudgetPanel(budget){
+ const enabled = Boolean(Number(budget.enabled || 0));
+ const used = Number(budget.used_bytes || 0);
+ const limit = Number(budget.limit_bytes || 0);
+ const remaining = Number(budget.remaining_bytes || 0);
+ const pct = enabled ? Math.min(100, Math.max(0, Number(budget.percent || 0))) : 0;
+ return `<div class="chart-card">
+  <h3><span class="ui-icon">&#9201;</span>Hourly posting limit</h3>
+  <div class="thread-meter"><b>${formatBytes(used)}</b><span class="muted">used in the last hour</span></div>
+  <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+  <div class="muted">${enabled ? `${pct}% of ${formatBytes(limit)} used, ${formatBytes(remaining)} remaining` : "No hourly posting limit configured"}</div>
  </div>`;
 }
 function threadPanel(threads){
@@ -892,12 +923,17 @@ function fileRow(file){
   <span class="tree-name">${esc(file.display_name)}</span>
   <span class="tree-meta">${formatBytes(file.size)}</span>
   ${statePill(file.state)}
-  <span class="tree-meta">${Number(file.chunk_count || 0)} chunks${file.last_verify_at ? ` &middot; verified ${esc(formatDateTime(file.last_verify_at))}` : ""}</span>
+  <span class="tree-meta">${Number(file.chunk_count || 0)} chunks</span>
+  ${verifiedPill(file.last_verify_at)}
   ${progress}
   ${canQueue ? `<button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>` : ""}
   ${file.state !== "backed_up" && file.state !== "deleted" ? `<button class="icon-btn" title="Increase queue priority" onclick="boostFile(${Number(file.id)})">&#8593;</button>` : ""}
   ${hasChunks ? `<button class="icon-btn" title="Restore file" onclick="restoreCatalogFile(${Number(file.id)})">&#8635;</button>` : ""}
  </div></li>`;
+}
+function verifiedPill(timestamp){
+ if(!timestamp) return "";
+ return `<span class="pill ok verified" title="Verified ${esc(formatDateTime(timestamp))}"><span class="ui-icon">&#10003;</span>Verified</span>`;
 }
 function fileProgress(file){
  const active = file.state === "posting" || file.queue_status === "posting";
