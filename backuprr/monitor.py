@@ -1,4 +1,5 @@
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -21,6 +22,8 @@ def iso_or_empty(value: Optional[datetime]) -> str:
 def format_duration(seconds: Optional[float]) -> str:
     if seconds is None:
         return ""
+    if 0 <= seconds < 1:
+        return f"{max(1, int(round(seconds * 1000)))}ms"
     total = max(0, int(round(seconds)))
     minutes, secs = divmod(total, 60)
     hours, minutes = divmod(minutes, 60)
@@ -55,6 +58,7 @@ class ScheduledTask:
         self._last_started_at: Optional[datetime] = None
         self._last_finished_at: Optional[datetime] = None
         self._next_run_at: Optional[datetime] = None
+        self._last_started_monotonic: Optional[float] = None
         self._last_duration_seconds: Optional[float] = None
         self._last_result = ""
         self._last_error = ""
@@ -135,6 +139,7 @@ class ScheduledTask:
         with self._state_lock:
             self._running = True
             self._last_started_at = utcnow_dt()
+            self._last_started_monotonic = time.perf_counter()
             self._last_error = ""
             self._revision += 1
 
@@ -143,8 +148,8 @@ class ScheduledTask:
         with self._state_lock:
             self._running = False
             self._last_finished_at = finished
-            if self._last_started_at:
-                self._last_duration_seconds = (finished - self._last_started_at).total_seconds()
+            if self._last_started_monotonic is not None:
+                self._last_duration_seconds = time.perf_counter() - self._last_started_monotonic
             self._runs += 1
             self._last_result = result
             self._last_error = error

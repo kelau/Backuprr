@@ -11,7 +11,7 @@ from backuprr.cloud_backup import backup_config_and_database, backup_config_and_
 from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
-from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor
+from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
 from backuprr.queueing import enqueue_unbacked, prioritize
 from backuprr.restore import restore_file
 from backuprr.scanner import scan_all
@@ -98,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.26")
+        self.assertEqual(__version__, "0.2.27")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -787,6 +787,11 @@ class CoreTests(unittest.TestCase):
         loaded = Config.load(str(config_path))
         self.assertEqual(loaded.database, "test.sqlite3")
 
+    def test_subsecond_duration_formats_as_milliseconds(self):
+        self.assertEqual(format_duration(0), "1ms")
+        self.assertEqual(format_duration(0.124), "124ms")
+        self.assertEqual(format_duration(1.2), "1s")
+
     def test_old_env_host_keys_are_ignored_when_loading_hosts(self):
         host = UsenetHost.from_dict(
             {
@@ -828,6 +833,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(tasks[0]["runs"], 1)
         self.assertIn("last_run", tasks[0])
         self.assertIn("last_run_duration", tasks[0])
+        self.assertNotEqual(tasks[0]["last_run_duration"], "0s")
         self.assertIn("time_until_next_run", tasks[0])
         self.assertNotIn("last_started_at", tasks[0])
         self.assertIn("files scanned", tasks[0]["last_result"])
