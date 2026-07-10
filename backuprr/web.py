@@ -900,15 +900,12 @@ function fileRow(file){
 }
 function fileProgress(file){
  const active = file.state === "posting" || file.queue_status === "posting";
- const queued = file.state === "queued" || file.queue_status === "queued";
+ if(!active) return "";
  const expected = Math.max(1, Math.ceil(Number(file.size || 0) / Number(settingsCache?.article_size || 786432)));
  const chunks = Number(file.progress_chunks || 0);
  const bytes = Number(file.progress_bytes || 0);
- const pct = active ? Math.min(100, Math.round((chunks / expected) * 100)) : queued ? 0 : file.state === "backed_up" ? 100 : 0;
- if(!active && !queued && file.state !== "backed_up") return "";
- const label = active
-  ? `${chunks}/${expected} chunks · ${formatBytes(bytes)} posted · ${pct}%`
-  : queued ? `Queued · 0/${expected} chunks` : `Protected · ${Number(file.chunk_count || 0)} chunks`;
+ const pct = Math.min(100, Math.round((chunks / expected) * 100));
+ const label = `${chunks}/${expected} chunks · ${formatBytes(bytes)} posted · ${pct}%`;
  return `<div class="file-progress"><div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div><span>${esc(label)}</span></div>`;
 }
 function setFileSelected(fileId, checked){
