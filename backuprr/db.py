@@ -93,9 +93,10 @@ class Database:
     def upsert_file(self, record: Dict[str, Any]) -> int:
         now = utcnow()
         with self.connect() as conn:
-            row = conn.execute("SELECT id, size, mtime_ns, sha256 FROM files WHERE path = ?", (record["path"],)).fetchone()
+            row = conn.execute("SELECT id, size, mtime_ns, sha256, state FROM files WHERE path = ?", (record["path"],)).fetchone()
             if row:
                 changed = row["size"] != record["size"] or row["mtime_ns"] != record["mtime_ns"] or row["sha256"] != record["sha256"]
+                revived = row["state"] == "deleted"
                 state = "changed" if changed else record.get("state", "discovered")
                 conn.execute(
                     """
@@ -110,7 +111,7 @@ class Database:
                         record["size"],
                         record["mtime_ns"],
                         record["sha256"],
-                        1 if changed else 0,
+                        1 if changed or revived else 0,
                         state,
                         now,
                         row["id"],

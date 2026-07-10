@@ -98,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.25")
+        self.assertEqual(__version__, "0.2.26")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -179,6 +179,22 @@ class CoreTests(unittest.TestCase):
         self.db.add_endpoint(str(media))
         self.assertEqual(scan_all(self.db), 1)
         with patch("backuprr.scanner.sha256_file", side_effect=AssertionError("unchanged file should not be rehashed")):
+            self.assertEqual(scan_all(self.db), 1)
+
+    def test_scan_revives_deleted_file_at_same_path(self):
+        media = self.root / "media"
+        media.mkdir()
+        movie = media / "movie.mkv"
+        movie.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        self.assertEqual(scan_all(self.db), 1)
+        with self.db.connect() as conn:
+            conn.execute("UPDATE files SET state='deleted' WHERE path=?", (str(movie.resolve()),))
+        self.assertEqual(scan_all(self.db), 1)
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT state FROM files WHERE path=?", (str(movie.resolve()),)).fetchone()
+        self.assertEqual(row["state"], "discovered")
+        with patch("backuprr.scanner.sha256_file", side_effect=AssertionError("revived unchanged file should not be rehashed")):
             self.assertEqual(scan_all(self.db), 1)
 
     def test_scan_updates_moved_file_without_rehash_when_metadata_matches(self):
@@ -814,7 +830,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("last_run_duration", tasks[0])
         self.assertIn("time_until_next_run", tasks[0])
         self.assertNotIn("last_started_at", tasks[0])
-        self.assertIn("files cataloged", tasks[0]["last_result"])
+        self.assertIn("files scanned", tasks[0]["last_result"])
         self.assertGreater(tasks[0]["revision"], 0)
 
     def test_backup_monitor_posts_next_queued_file(self):

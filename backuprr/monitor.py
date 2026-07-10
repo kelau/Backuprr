@@ -175,7 +175,7 @@ class CatalogMonitor(ScheduledTask):
     def execute(self) -> str:
         count = scan_all(self.db)
         queued = enqueue_unbacked(self.db, self.config)
-        result = f"{count} files cataloged, {queued} queued"
+        result = f"{count} files scanned, {queued} queued"
         self.db.log("debug", "monitor.scan", f"Automatic catalog scan completed: {result}")
         return result
 

@@ -66,7 +66,7 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
         )
         if candidate:
             moved_by_metadata += 1
-        db.log("verbose", "scan.file", f"Cataloged {resolved}", file_id=file_id)
+        db.log("verbose", "scan.file", f"Updated catalog record for {resolved}", file_id=file_id)
         count += 1
     missing = db.mark_missing_files(seen, endpoint_id)
     reconciled = db.reconcile_moved_duplicates(endpoint_id)
