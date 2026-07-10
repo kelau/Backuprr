@@ -493,6 +493,22 @@ class Database:
         with self.connect() as conn:
             conn.execute("UPDATE files SET state=?, updated_at=? WHERE id=?", (state, utcnow(), file_id))
 
+    def mark_restored_backed_up(self, file_id: int, size: int, mtime_ns: int, sha256: str) -> None:
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE files
+                SET size=?, mtime_ns=?, sha256=?, state='backed_up', updated_at=?
+                WHERE id=?
+                """,
+                (size, mtime_ns, sha256, now, file_id),
+            )
+            conn.execute(
+                "UPDATE queue SET status='done', updated_at=? WHERE file_id=? AND status != 'done'",
+                (now, file_id),
+            )
+
     def chunks_due_for_verification(self, older_than: str) -> List[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(

@@ -1,4 +1,5 @@
 import email
+import hashlib
 from pathlib import Path
 from typing import Any, Optional
 
@@ -16,6 +17,14 @@ def article_lines(article_response: Any) -> list[bytes]:
         if hasattr(info, "lines"):
             return list(info.lines)
     raise RuntimeError("Unexpected NNTP article response format")
+
+
+def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(block_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
 def restore_file(db: Database, config: Config, source_path: str, dest: Optional[str] = None) -> Path:
@@ -40,7 +49,9 @@ def restore_file(db: Database, config: Config, source_path: str, dest: Optional[
             msg = email.message_from_bytes(raw)
             payload = msg.get_payload(decode=True) or b""
             output.write(decode_chunk(payload, passphrase))
-    db.update_file_state(int(file_row["id"]), "restored")
+    if target.resolve() == Path(file_row["path"]).resolve():
+        stat = target.stat()
+        db.mark_restored_backed_up(int(file_row["id"]), stat.st_size, stat.st_mtime_ns, sha256_file(target))
     db.log("info", "restore", f"Restored {source_path} to {target}", int(file_row["id"]))
     return target
 

@@ -98,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.17")
+        self.assertEqual(__version__, "0.2.18")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -767,6 +767,28 @@ class CoreTests(unittest.TestCase):
         with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
             self.assertEqual(restore_file(self.db, self.config, str(path), str(target)), target)
         self.assertEqual(target.read_bytes(), b"restored payload")
+
+    def test_restore_to_original_path_stays_backed_up_and_unqueued(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"placeholder")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
+        self.db.update_file_state(file_id, "backed_up")
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
+            self.assertEqual(restore_file(self.db, self.config, str(path)), path)
+        scan_all(self.db)
+        self.assertEqual(enqueue_unbacked(self.db), 0)
+        with self.db.connect() as conn:
+            file_row = conn.execute("SELECT state, size, sha256 FROM files WHERE id=?", (file_id,)).fetchone()
+        self.assertEqual(file_row["state"], "backed_up")
+        self.assertEqual(file_row["size"], len(b"restored payload"))
+        self.assertEqual(len(self.db.list_queue()), 0)
 
     def test_cloud_backup_monitor_reports_no_changes_after_first_backup(self):
         config_path = self.root / "config.json"
