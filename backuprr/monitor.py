@@ -2,7 +2,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from .backup import post_next, verify_due_chunks
+from .backup import post_next, verify_due_chunks, verify_file_chunks
+from .cloud_backup import backup_config_and_database_if_changed
 from .config import Config
 from .db import Database
 from .queueing import enqueue_unbacked
@@ -31,7 +32,13 @@ def format_duration(seconds: Optional[float]) -> str:
 
 
 def is_socket_permission_error(exc: Exception) -> bool:
-    return isinstance(exc, OSError) and getattr(exc, "winerror", None) == 10013
+    text = str(exc)
+    return isinstance(exc, OSError) and (
+        getattr(exc, "winerror", None) == 10013
+        or getattr(exc, "errno", None) == 10013
+        or "WinError 10013" in text
+        or "forbidden by its access permissions" in text
+    )
 
 
 class ScheduledTask:
@@ -223,10 +230,10 @@ class VerificationMonitor(ScheduledTask):
         self._thread.start()
         self._schedule_next(self.interval_seconds)
 
-    def verify_once(self, force: bool = False) -> int:
+    def verify_once(self, force: bool = False, file_ids: Optional[list[int]] = None) -> int:
         if force:
             try:
-                result = verify_due_chunks(self.db, self.config, force=True)
+                result = verify_file_chunks(self.db, self.config, file_ids) if file_ids else verify_due_chunks(self.db, self.config, force=True)
             except OSError as exc:
                 if not is_socket_permission_error(exc):
                     raise
@@ -251,6 +258,27 @@ class VerificationMonitor(ScheduledTask):
             return message
         result = f"{count} chunks verified"
         self.db.log("debug", "monitor.verify", f"Automatic verification task completed: {result}")
+        return result
+
+    def tasks(self):
+        return [self.task_info()]
+
+
+class CloudBackupMonitor(ScheduledTask):
+    def __init__(self, db: Database, config: Config):
+        super().__init__(db, config, "Config cloud backup worker", "cloud_backup")
+
+    @property
+    def interval_seconds(self) -> int:
+        return self.config.cloud_backup_interval_seconds
+
+    def execute(self) -> str:
+        results = backup_config_and_database_if_changed(self.db, self.config)
+        if not results:
+            result = "no config/catalog changes to back up"
+        else:
+            result = f"backed up config/database to {len(results)} cloud targets"
+        self.db.log("debug", "monitor.cloud_backup", f"Automatic cloud backup task completed: {result}")
         return result
 
     def tasks(self):

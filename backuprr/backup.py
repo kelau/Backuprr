@@ -6,7 +6,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 from .config import Config
 from .crypto import xor_crypt
@@ -114,10 +114,8 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         cleanup_payload(payload, original)
 
 
-def verify_due_chunks(db: Database, config: Config, force: bool = False) -> int:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=config.verification_interval_days)
-    older_than = datetime.max.replace(tzinfo=timezone.utc).isoformat() if force else cutoff.replace(microsecond=0).isoformat()
-    chunks = db.chunks_due_for_verification(older_than)
+def verify_chunks(db: Database, config: Config, chunks: Iterable[Any]) -> int:
+    chunks = list(chunks)
     if not chunks:
         return 0
     host = select_host(config, "read")
@@ -137,3 +135,13 @@ def verify_due_chunks(db: Database, config: Config, force: bool = False) -> int:
             db.log("debug" if exists else "warning", "verify.chunk", f"Chunk {message_id} exists={exists}", file_id)
             count += 1
     return count
+
+
+def verify_due_chunks(db: Database, config: Config, force: bool = False) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=config.verification_interval_days)
+    older_than = datetime.max.replace(tzinfo=timezone.utc).isoformat() if force else cutoff.replace(microsecond=0).isoformat()
+    return verify_chunks(db, config, db.chunks_due_for_verification(older_than))
+
+
+def verify_file_chunks(db: Database, config: Config, file_ids: Iterable[int]) -> int:
+    return verify_chunks(db, config, db.chunks_for_file_ids(file_ids))

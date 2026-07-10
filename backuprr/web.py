@@ -8,7 +8,7 @@ from . import __version__
 from .cloud_backup import backup_config_and_database
 from .config import Config, update_config
 from .db import Database
-from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor
+from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
 
@@ -24,6 +24,7 @@ class Handler(BaseHTTPRequestHandler):
     monitor: CatalogMonitor
     backup_monitor: BackupMonitor
     verification_monitor: VerificationMonitor
+    cloud_backup_monitor: CloudBackupMonitor
 
     def log_message(self, fmt: str, *args: Any) -> None:
         self.db.log("verbose", "web.access", fmt % args)
@@ -59,6 +60,7 @@ class Handler(BaseHTTPRequestHandler):
                     "scan_interval_seconds": self.config.scan_interval_seconds,
                     "backup_interval_seconds": self.config.backup_interval_seconds,
                     "verification_task_interval_seconds": self.config.verification_task_interval_seconds,
+                    "cloud_backup_interval_seconds": self.config.cloud_backup_interval_seconds,
                 }
             )
         elif parsed.path == "/api/speed":
@@ -86,7 +88,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(
                 {
                     "stats": self.db.stats(),
-                    "tasks": self.monitor.tasks() + self.backup_monitor.tasks() + self.verification_monitor.tasks(),
+                    "tasks": self.all_tasks(),
                     "speed": self.db.speed_samples(120, 300),
                     "events": rowdicts(self.db.list_events(limit=50, exclude_event_types=["web.access"])),
                 }
@@ -114,7 +116,7 @@ class Handler(BaseHTTPRequestHandler):
             rows = [self.queue_row_payload(row) for row in self.db.list_queue(status=status, limit=page_size, offset=offset)]
             self.send_json({"rows": rows, "page": page, "page_size": page_size, "total": self.db.queue_count(status=status)})
         elif parsed.path == "/api/tasks":
-            self.send_json(self.monitor.tasks() + self.backup_monitor.tasks() + self.verification_monitor.tasks())
+            self.send_json(self.all_tasks())
         elif parsed.path == "/api/settings":
             self.send_json(self.config.public_dict())
         else:
@@ -150,7 +152,8 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/post-next":
                 self.send_json({"file_id": self.backup_monitor.post_once()})
             elif parsed.path == "/api/verify":
-                self.send_json({"verified": self.verification_monitor.verify_once(force=bool(data.get("force")))})
+                file_ids = [int(file_id) for file_id in data.get("file_ids", [])]
+                self.send_json({"verified": self.verification_monitor.verify_once(force=bool(data.get("force")) or bool(file_ids), file_ids=file_ids)})
             elif parsed.path == "/api/cloud-backup":
                 results = backup_config_and_database(self.db, self.config)
                 self.db.log("info", "cloud.backup", f"Backed up config/database to {len(results)} cloud targets")
@@ -183,6 +186,9 @@ class Handler(BaseHTTPRequestHandler):
         payload["progress"] = f"{posted}/{expected} chunks ({payload['progress_percent']}%)"
         return payload
 
+    def all_tasks(self) -> list[dict]:
+        return self.monitor.tasks() + self.backup_monitor.tasks() + self.verification_monitor.tasks() + self.cloud_backup_monitor.tasks()
+
     def stream_changes(self) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -193,7 +199,7 @@ class Handler(BaseHTTPRequestHandler):
         try:
             while True:
                 token = self.db.change_token()
-                token["task_revision"] = sum(int(task.get("revision", 0)) for task in self.monitor.tasks() + self.backup_monitor.tasks() + self.verification_monitor.tasks())
+                token["task_revision"] = sum(int(task.get("revision", 0)) for task in self.all_tasks())
                 payload = json.dumps(token, default=str)
                 if payload != last_payload:
                     self.wfile.write(f"event: change\ndata: {payload}\n\n".encode("utf-8"))
@@ -211,9 +217,11 @@ def run_web(config: Config, db: Database, host: str, port: int) -> None:
     Handler.monitor = CatalogMonitor(db, config)
     Handler.backup_monitor = BackupMonitor(db, config)
     Handler.verification_monitor = VerificationMonitor(db, config)
+    Handler.cloud_backup_monitor = CloudBackupMonitor(db, config)
     Handler.monitor.start()
     Handler.backup_monitor.start()
     Handler.verification_monitor.start()
+    Handler.cloud_backup_monitor.start()
     server = ThreadingHTTPServer((host, port), Handler)
     print(f"Backuprr {__version__} listening on http://{host}:{port}")
     try:
@@ -222,6 +230,7 @@ def run_web(config: Config, db: Database, host: str, port: int) -> None:
         Handler.monitor.stop()
         Handler.backup_monitor.stop()
         Handler.verification_monitor.stop()
+        Handler.cloud_backup_monitor.stop()
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -336,6 +345,7 @@ let filesPage = 1;
 let verificationPage = 1;
 let selectedFiles = new Set();
 let selectedFileData = new Map();
+let selectedVerificationFiles = new Set();
 const queuePageSize = 10;
 const filesPageSize = 100;
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
@@ -383,7 +393,7 @@ function levelPill(value){
  return `<span class="pill ${tone}"><span class="ui-icon">${icon}</span>${esc(value || "-")}</span>`;
 }
 function kindIcon(value){
- return ({catalog:"&#128193;",backup:"&#128230;",verification:"&#10003;"}[String(value || "")] || "&#9881;");
+ return ({catalog:"&#128193;",backup:"&#128230;",verification:"&#10003;",cloud_backup:"&#9729;"}[String(value || "")] || "&#9881;");
 }
 function iconForProgress(value){
  const pct = Number(value || 0);
@@ -452,7 +462,7 @@ async function render(){
   await updateTasksPage();
  }
  if(page==="Verification"){
-  c.innerHTML = `<div class="toolbar"><button class="primary" onclick="post('/api/verify',{force:true}).then(updateVerificationPage)"><span class="ui-icon">&#10003;</span>Verify now</button>${pushLabel()}</div><div id="verificationRows"></div>`;
+  c.innerHTML = `<div class="toolbar"><label><input id="selectAllVerification" type="checkbox" onchange="toggleSelectAllVerification(this.checked)"> Select page</label><button class="primary" onclick="verifySelectedFiles()"><span class="ui-icon">&#10003;</span>Verify selected</button><button onclick="post('/api/verify',{force:true}).then(updateVerificationPage)"><span class="ui-icon">&#10003;</span>Verify all</button>${pushLabel()}</div><div id="verificationRows"></div>`;
   await updateVerificationPage();
  }
  if(page==="Statistics"){
@@ -521,6 +531,40 @@ function pagedTable(result, pageVar, cols){
  const pageNo = Number(result.page || 1);
  return table(result.rows || [], cols) + `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);updateQueuePage()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${Number(result.total || 0)} rows</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;updateQueuePage()">Next</button></div>`;
 }
+function verificationTable(rows){
+ if(!rows.length) return "<p class='muted'>No rows.</p>";
+ const cols = ["relative_path","state","chunk_count","verified_chunks","missing_chunks","last_verify_at","last_chunk_verify_at"];
+ return `<table><thead><tr><th></th>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>`+
+ rows.map(row => `<tr><td><input class="verificationSelect" type="checkbox" value="${Number(row.id)}" ${selectedVerificationFiles.has(Number(row.id)) ? "checked" : ""} onchange="setVerificationSelected(${Number(row.id)}, this.checked)"></td>${cols.map(c=>`<td>${formatCellHtml(c, row[c], row)}</td>`).join("")}</tr>`).join("")+
+ "</tbody></table>";
+}
+function setVerificationSelected(fileId, checked){
+ if(checked) selectedVerificationFiles.add(Number(fileId));
+ else selectedVerificationFiles.delete(Number(fileId));
+ updateVerificationSelectionState();
+}
+function toggleSelectAllVerification(checked){
+ document.querySelectorAll(".verificationSelect").forEach(box => {
+  box.checked = checked;
+  setVerificationSelected(Number(box.value), checked);
+ });
+}
+function updateVerificationSelectionState(rows=[]){
+ const ids = rows.length ? rows.map(row => Number(row.id)) : Array.from(document.querySelectorAll(".verificationSelect")).map(box => Number(box.value));
+ const selected = ids.filter(id => selectedVerificationFiles.has(id)).length;
+ const selectAll = document.getElementById("selectAllVerification");
+ if(selectAll){
+  selectAll.checked = ids.length > 0 && selected === ids.length;
+  selectAll.indeterminate = selected > 0 && selected < ids.length;
+ }
+}
+async function verifySelectedFiles(){
+ const ids = Array.from(selectedVerificationFiles);
+ if(!ids.length) return alert("Select files to verify first");
+ const out = await post("/api/verify", { file_ids:ids });
+ if(out.error) alert(out.error);
+ await updateVerificationPage();
+}
 async function updateTasksPage(){
  const rows = await api("/api/tasks");
  const target = document.getElementById("taskRows");
@@ -529,7 +573,8 @@ async function updateTasksPage(){
 async function updateVerificationPage(){
  const result = await api(`/api/verification?page=${verificationPage}&page_size=25`);
  const target = document.getElementById("verificationRows");
- if(target) target.innerHTML = table(result.rows || [], ["id","relative_path","state","chunk_count","verified_chunks","missing_chunks","last_verify_at","last_chunk_verify_at"]) + paginationControls(result, "verificationPage", "updateVerificationPage");
+ if(target) target.innerHTML = verificationTable(result.rows || []) + paginationControls(result, "verificationPage", "updateVerificationPage");
+ updateVerificationSelectionState(result.rows || []);
 }
 async function updateStatisticsPage(){
  const data = await api("/api/statistics");
@@ -898,6 +943,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#10003;</span>Verification task interval seconds</span><input id="setVerifyTaskInterval" type="number" min="1" value="${esc(s.verification_task_interval_seconds || 3600)}"></label>
   <label class="field"><span><span class="ui-icon">&#128193;</span>Catalog scan interval seconds</span><input id="setScanInterval" type="number" min="1" value="${esc(s.scan_interval_seconds || 300)}"></label>
   <label class="field"><span><span class="ui-icon">&#128230;</span>Backup task interval seconds</span><input id="setBackupInterval" type="number" min="1" value="${esc(s.backup_interval_seconds || 300)}"></label>
+  <label class="field"><span><span class="ui-icon">&#9729;</span>Cloud backup interval seconds</span><input id="setCloudBackupInterval" type="number" min="1" value="${esc(s.cloud_backup_interval_seconds || 3600)}"></label>
  </div></div>
  <div id="tabProtection" class="tab-panel"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#128274;</span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
@@ -1019,6 +1065,7 @@ async function saveSettings(){
   verification_task_interval_seconds: Number(setVerifyTaskInterval.value),
   scan_interval_seconds: Number(setScanInterval.value),
   backup_interval_seconds: Number(setBackupInterval.value),
+  cloud_backup_interval_seconds: Number(setCloudBackupInterval.value),
   nntp_threads: Number(setNntpThreads.value),
   zip_subfolders: setZip.checked,
   encrypt_bodies: setEncrypt.checked,

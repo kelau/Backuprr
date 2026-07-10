@@ -37,6 +37,15 @@ class Database:
                 (str(SCHEMA_VERSION),),
             )
 
+    def get_meta(self, key: str) -> Optional[str]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT value FROM app_meta WHERE key=?", (key,)).fetchone()
+            return None if row is None else str(row["value"])
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self.connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES(?,?)", (key, value))
+
     def log(self, level: str, event_type: str, message: str, file_id: Optional[int] = None, data: str = "") -> None:
         with self.connect() as conn:
             conn.execute(
@@ -425,6 +434,23 @@ class Database:
                 ORDER BY c.verified_at IS NULL DESC, c.verified_at ASC
                 """,
                 (older_than,),
+            ).fetchall()
+
+    def chunks_for_file_ids(self, file_ids: Iterable[int]) -> List[sqlite3.Row]:
+        ids = [int(file_id) for file_id in file_ids]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as conn:
+            return conn.execute(
+                f"""
+                SELECT c.*, f.path FROM chunks c
+                JOIN files f ON f.id = c.file_id
+                WHERE c.file_id IN ({placeholders})
+                  AND c.status != 'missing'
+                ORDER BY c.file_id, c.chunk_index
+                """,
+                ids,
             ).fetchall()
 
     def mark_chunk_verified(self, chunk_id: int, exists: bool) -> None:

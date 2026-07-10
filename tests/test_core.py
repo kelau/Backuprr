@@ -5,12 +5,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from backuprr import __version__
-from backuprr.backup import decode_chunk, encode_chunk, post_next
-from backuprr.cloud_backup import backup_config_and_database
+from backuprr.backup import decode_chunk, encode_chunk, post_next, verify_file_chunks
+from backuprr.cloud_backup import backup_config_and_database, backup_config_and_database_if_changed
 from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
-from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor
+from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor
 from backuprr.queueing import enqueue_unbacked, prioritize
 from backuprr.scanner import scan_all
 
@@ -27,6 +27,20 @@ class FakePostClient:
 
     def post(self, newsgroup, subject, body):
         return f"<{subject.strip('[] ()').replace(' ', '-')}@example.test>"
+
+
+class FakeReadClient:
+    def __init__(self, host):
+        self.host = host
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return None
+
+    def article_exists(self, message_id):
+        return True
 
 
 class FakeSocketPermissionError(OSError):
@@ -53,7 +67,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.9")
+        self.assertEqual(__version__, "0.2.10")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -393,6 +407,7 @@ class CoreTests(unittest.TestCase):
                 "verification_task_interval_seconds": 45,
                 "scan_interval_seconds": 15,
                 "backup_interval_seconds": 20,
+                "cloud_backup_interval_seconds": 55,
                 "nntp_threads": 6,
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
@@ -421,6 +436,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.verification_task_interval_seconds, 45)
         self.assertEqual(self.config.scan_interval_seconds, 15)
         self.assertEqual(self.config.backup_interval_seconds, 20)
+        self.assertEqual(self.config.cloud_backup_interval_seconds, 55)
         self.assertEqual(self.config.nntp_threads, 6)
         self.assertTrue(self.config.zip_subfolders)
         self.assertTrue(self.config.encrypt_bodies)
@@ -443,6 +459,19 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(results), 1)
         archives = list(target.glob("backuprr-backup-*.zip"))
         self.assertEqual(len(archives), 1)
+
+    def test_cloud_backup_if_changed_skips_unchanged_state(self):
+        config_path = self.root / "config.json"
+        self.config.source_path = config_path
+        self.config.save(str(config_path))
+        target = self.root / "cloud"
+        self.config.cloud_backups = [
+            type("Target", (), {"name": "local", "provider": "local", "target": str(target), "command": "", "enabled": True})()
+        ]
+        self.assertEqual(len(backup_config_and_database_if_changed(self.db, self.config)), 1)
+        self.assertEqual(backup_config_and_database_if_changed(self.db, self.config), [])
+        self.db.log("info", "test.change", "catalog changed enough to trigger token")
+        self.assertEqual(backup_config_and_database_if_changed(self.db, self.config), [])
 
     def test_update_config_preserves_blank_existing_host_password(self):
         self.config.usenet_hosts = [
@@ -548,6 +577,38 @@ class CoreTests(unittest.TestCase):
         rows = self.db.list_events(["warning"], event_types=["verify.network"])
         self.assertEqual(len(rows), 1)
         self.assertIn("socket access is blocked", rows[0]["message"])
+
+    def test_verify_selected_file_chunks_only_checks_selected_file(self):
+        media = self.root / "media"
+        media.mkdir()
+        first = media / "one.mkv"
+        second = media / "two.mkv"
+        first.write_bytes(b"one")
+        second.write_bytes(b"two")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT id FROM files ORDER BY relative_path").fetchall()
+        self.db.add_chunk(rows[0]["id"], 0, "<one@example.test>", 3, "abc", "[one]")
+        self.db.add_chunk(rows[1]["id"], 0, "<two@example.test>", 3, "def", "[two]")
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        with patch("backuprr.backup.UsenetClient", FakeReadClient):
+            self.assertEqual(verify_file_chunks(self.db, self.config, [rows[0]["id"]]), 1)
+        with self.db.connect() as conn:
+            verified = conn.execute("SELECT file_id FROM chunks WHERE status='verified'").fetchall()
+        self.assertEqual([row["file_id"] for row in verified], [rows[0]["id"]])
+
+    def test_cloud_backup_monitor_reports_no_changes_after_first_backup(self):
+        config_path = self.root / "config.json"
+        self.config.source_path = config_path
+        self.config.save(str(config_path))
+        target = self.root / "cloud"
+        self.config.cloud_backups = [
+            type("Target", (), {"name": "local", "provider": "local", "target": str(target), "command": "", "enabled": True})()
+        ]
+        monitor = CloudBackupMonitor(self.db, self.config)
+        self.assertIn("cloud targets", monitor.run_once())
+        self.assertIn("no config/catalog changes", monitor.run_once())
 
 
 if __name__ == "__main__":

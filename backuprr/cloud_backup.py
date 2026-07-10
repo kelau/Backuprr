@@ -2,12 +2,40 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
 
 from .config import Config
 from .db import Database
+
+
+def cloud_backup_fingerprint(db: Database, config: Config) -> str:
+    source = config.source_path
+    config_stat = source.stat() if source and source.exists() else None
+    token = db.change_token()
+    relevant = {
+        "config_path": str(source or ""),
+        "config_mtime_ns": getattr(config_stat, "st_mtime_ns", 0),
+        "config_size": getattr(config_stat, "st_size", 0),
+        "files_updated": token.get("files_updated", ""),
+        "queue_updated": token.get("queue_updated", ""),
+        "chunks_total": token.get("chunks_total", 0),
+        "files_total": token.get("files_total", 0),
+        "queue_total": token.get("queue_total", 0),
+    }
+    return json.dumps(relevant, sort_keys=True, separators=(",", ":"))
+
+
+def backup_config_and_database_if_changed(db: Database, config: Config) -> List[Dict[str, str]]:
+    fingerprint = cloud_backup_fingerprint(db, config)
+    if db.get_meta("cloud_backup_fingerprint") == fingerprint:
+        return []
+    results = backup_config_and_database(db, config)
+    if results:
+        db.set_meta("cloud_backup_fingerprint", fingerprint)
+    return results
 
 
 def backup_config_and_database(db: Database, config: Config) -> List[Dict[str, str]]:
