@@ -269,6 +269,9 @@ def run_web(config: Config, db: Database, host: str, port: int) -> None:
     Handler.backup_monitor = BackupMonitor(db, config)
     Handler.verification_monitor = VerificationMonitor(db, config)
     Handler.cloud_backup_monitor = CloudBackupMonitor(db, config)
+    recovered = db.recover_interrupted_posting()
+    if recovered:
+        db.log("warning", "startup.recover", f"Recovered {recovered} interrupted posting queue item(s) before workers started")
     Handler.monitor.start()
     Handler.backup_monitor.start()
     Handler.verification_monitor.start()

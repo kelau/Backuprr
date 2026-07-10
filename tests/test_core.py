@@ -98,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.27")
+        self.assertEqual(__version__, "0.2.28")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -622,14 +622,41 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
             conn.execute("UPDATE files SET state='posting' WHERE id=?", (file_id,))
-            conn.execute("UPDATE queue SET status='posting', updated_at='2000-01-01T00:00:00+00:00' WHERE file_id=?", (file_id,))
+            conn.execute(
+                "UPDATE queue SET status='posting', progress_chunks=2, progress_bytes=123, updated_at='2000-01-01T00:00:00+00:00' WHERE file_id=?",
+                (file_id,),
+            )
         self.assertEqual(self.db.recover_stale_posting(stale_after_seconds=1), 1)
         with self.db.connect() as conn:
             file_row = conn.execute("SELECT state FROM files WHERE id=?", (file_id,)).fetchone()
-            queue_row = conn.execute("SELECT status, reason FROM queue WHERE file_id=?", (file_id,)).fetchone()
+            queue_row = conn.execute("SELECT status, reason, progress_chunks, progress_bytes FROM queue WHERE file_id=?", (file_id,)).fetchone()
         self.assertEqual(file_row["state"], "queued")
         self.assertEqual(queue_row["status"], "queued")
         self.assertEqual(queue_row["reason"], "stale-posting-retry")
+        self.assertEqual(queue_row["progress_chunks"], 0)
+        self.assertEqual(queue_row["progress_bytes"], 0)
+
+    def test_recover_interrupted_posting_requeues_immediately_on_startup(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='posting' WHERE id=?", (file_id,))
+            conn.execute("UPDATE queue SET status='posting', progress_chunks=898, progress_bytes=706215936 WHERE file_id=?", (file_id,))
+        self.assertEqual(self.db.recover_interrupted_posting(), 1)
+        with self.db.connect() as conn:
+            file_row = conn.execute("SELECT state FROM files WHERE id=?", (file_id,)).fetchone()
+            queue_row = conn.execute("SELECT status, reason, progress_chunks, progress_bytes FROM queue WHERE file_id=?", (file_id,)).fetchone()
+        self.assertEqual(file_row["state"], "queued")
+        self.assertEqual(queue_row["status"], "queued")
+        self.assertEqual(queue_row["reason"], "startup-posting-retry")
+        self.assertEqual(queue_row["progress_chunks"], 0)
+        self.assertEqual(queue_row["progress_bytes"], 0)
 
     def test_recover_queued_failed_mismatch_requeues_file(self):
         media = self.root / "media"

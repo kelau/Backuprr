@@ -363,25 +363,45 @@ class Database:
 
     def recover_stale_posting(self, stale_after_seconds: int = STALE_POSTING_SECONDS) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)).replace(microsecond=0).isoformat()
+        return self._recover_posting_rows(
+            "q.status='posting' AND q.updated_at <= ?",
+            (cutoff,),
+            "stale-posting-retry",
+            "Recovered stale posting queue item",
+        )
+
+    def recover_interrupted_posting(self) -> int:
+        return self._recover_posting_rows(
+            "q.status='posting'",
+            (),
+            "startup-posting-retry",
+            "Recovered interrupted posting queue item after startup",
+        )
+
+    def _recover_posting_rows(self, where_clause: str, params: Iterable[Any], reason: str, message_prefix: str) -> int:
         now = utcnow()
         with self.connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT q.file_id, f.path FROM queue q
                 JOIN files f ON f.id = q.file_id
-                WHERE q.status='posting' AND q.updated_at <= ?
+                WHERE {where_clause}
                 """,
-                (cutoff,),
+                tuple(params),
             ).fetchall()
             for row in rows:
                 conn.execute(
-                    "UPDATE queue SET status='queued', reason='stale-posting-retry', updated_at=? WHERE file_id=?",
-                    (now, row["file_id"]),
+                    """
+                    UPDATE queue
+                    SET status='queued', reason=?, progress_chunks=0, progress_bytes=0, updated_at=?
+                    WHERE file_id=?
+                    """,
+                    (reason, now, row["file_id"]),
                 )
                 conn.execute("UPDATE files SET state='queued', updated_at=? WHERE id=?", (now, row["file_id"]))
                 conn.execute(
                     "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
-                    (now, "warning", "queue.recover", f"Recovered stale posting queue item: {row['path']}", row["file_id"], ""),
+                    (now, "warning", "queue.recover", f"{message_prefix}: {row['path']}", row["file_id"], ""),
                 )
             return len(rows)
 
