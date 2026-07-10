@@ -1,11 +1,21 @@
 import email
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from .backup import decode_chunk
 from .config import Config
 from .db import Database
 from .usenet import UsenetClient, select_host
+
+
+def article_lines(article_response: Any) -> list[bytes]:
+    if len(article_response) == 3:
+        return list(article_response[2])
+    if len(article_response) == 2:
+        info = article_response[1]
+        if hasattr(info, "lines"):
+            return list(info.lines)
+    raise RuntimeError("Unexpected NNTP article response format")
 
 
 def restore_file(db: Database, config: Config, source_path: str, dest: Optional[str] = None) -> Path:
@@ -26,8 +36,7 @@ def restore_file(db: Database, config: Config, source_path: str, dest: Optional[
         if not client.conn:
             raise RuntimeError("NNTP connection not open")
         for chunk in chunks:
-            _resp, _info, article_lines = client.conn.article(chunk["message_id"])
-            raw = b"\n".join(article_lines)
+            raw = b"\n".join(article_lines(client.conn.article(chunk["message_id"])))
             msg = email.message_from_bytes(raw)
             payload = msg.get_payload(decode=True) or b""
             output.write(decode_chunk(payload, passphrase))

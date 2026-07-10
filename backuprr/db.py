@@ -366,6 +366,32 @@ class Database:
                 )
             return len(rows)
 
+    def recover_queued_failed_mismatches(self) -> int:
+        now = utcnow()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT q.file_id, f.path FROM queue q
+                JOIN files f ON f.id = q.file_id
+                WHERE q.status='failed' AND f.state='queued'
+                """
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE queue
+                    SET status='queued', reason='queued-state-recovery',
+                        progress_chunks=0, progress_bytes=0, updated_at=?
+                    WHERE file_id=?
+                    """,
+                    (now, row["file_id"]),
+                )
+                conn.execute(
+                    "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
+                    (now, "warning", "queue.recover", f"Recovered failed queue row for queued file: {row['path']}", row["file_id"], ""),
+                )
+            return len(rows)
+
     def set_queue_status(self, file_id: int, status: str) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE queue SET status=?, updated_at=? WHERE file_id=?", (status, utcnow(), file_id))

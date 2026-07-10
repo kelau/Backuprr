@@ -1,4 +1,5 @@
 import os
+import email.message
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,7 @@ from backuprr.crypto import xor_crypt
 from backuprr.db import Database
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor
 from backuprr.queueing import enqueue_unbacked, prioritize
+from backuprr.restore import restore_file
 from backuprr.scanner import scan_all
 from backuprr.web import thread_usage_summary, throughput_summary
 
@@ -50,6 +52,34 @@ class FakeSocketPermissionError(OSError):
         return 10013
 
 
+class FakeArticleInfo:
+    def __init__(self, lines):
+        self.lines = lines
+
+
+class FakeRestoreConn:
+    def __init__(self, body: bytes):
+        msg = email.message.EmailMessage()
+        msg["Subject"] = "restore"
+        msg.set_content(body, maintype="application", subtype="octet-stream", cte="base64")
+        self.lines = msg.as_bytes().splitlines()
+
+    def article(self, message_id):
+        return "220 0 article retrieved", FakeArticleInfo(self.lines)
+
+
+class FakeRestoreClient:
+    def __init__(self, host):
+        self.host = host
+        self.conn = FakeRestoreConn(b"restored payload")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return None
+
+
 class CoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -68,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.15")
+        self.assertEqual(__version__, "0.2.17")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -495,6 +525,26 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(queue_row["status"], "queued")
         self.assertEqual(queue_row["reason"], "stale-posting-retry")
 
+    def test_recover_queued_failed_mismatch_requeues_file(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='queued' WHERE id=?", (file_id,))
+            conn.execute("UPDATE queue SET status='failed', progress_chunks=2, progress_bytes=123 WHERE file_id=?", (file_id,))
+        self.assertEqual(self.db.recover_queued_failed_mismatches(), 1)
+        with self.db.connect() as conn:
+            queue_row = conn.execute("SELECT status, reason, progress_chunks, progress_bytes FROM queue WHERE file_id=?", (file_id,)).fetchone()
+        self.assertEqual(queue_row["status"], "queued")
+        self.assertEqual(queue_row["reason"], "queued-state-recovery")
+        self.assertEqual(queue_row["progress_chunks"], 0)
+        self.assertEqual(queue_row["progress_bytes"], 0)
+
     def test_update_config_from_settings_payload(self):
         update_config(
             self.config,
@@ -701,6 +751,22 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             verified = conn.execute("SELECT file_id FROM chunks WHERE status='verified'").fetchall()
         self.assertEqual([row["file_id"] for row in verified], [rows[0]["id"]])
+
+    def test_restore_file_accepts_modern_nntplib_article_response(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"placeholder")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        target = self.root / "restore" / "movie.mkv"
+        with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
+            self.assertEqual(restore_file(self.db, self.config, str(path), str(target)), target)
+        self.assertEqual(target.read_bytes(), b"restored payload")
 
     def test_cloud_backup_monitor_reports_no_changes_after_first_backup(self):
         config_path = self.root / "config.json"

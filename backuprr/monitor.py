@@ -199,15 +199,16 @@ class BackupMonitor(ScheduledTask):
 
     def execute(self) -> str:
         recovered = self.db.recover_stale_posting()
+        recovered_mismatches = self.db.recover_queued_failed_mismatches()
         newly_queued = enqueue_unbacked(self.db)
         file_id = post_next(self.db, self.config)
         stats = self.db.stats()
         queued = int(stats.get("queue_queued", 0))
         posting = int(stats.get("queue_posting", 0))
         if file_id is None:
-            result = f"{recovered} stale recovered, {newly_queued} newly queued, {queued} queued, {posting} posting, no file posted"
+            result = f"{recovered} stale recovered, {recovered_mismatches} queue mismatches recovered, {newly_queued} newly queued, {queued} queued, {posting} posting, no file posted"
         else:
-            result = f"posted file id {file_id}, {recovered} stale recovered, {queued} queued, {posting} posting"
+            result = f"posted file id {file_id}, {recovered} stale recovered, {recovered_mismatches} queue mismatches recovered, {queued} queued, {posting} posting"
         self.db.log("debug", "monitor.backup", f"Automatic backup task completed: {result}")
         return result
 
