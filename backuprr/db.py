@@ -277,8 +277,8 @@ class Database:
             where_parts.append("q.status = ?")
             params.append(status)
         elif not include_done:
-            where_parts.append("q.status != 'done'")
-            where_parts.append("f.state != 'backed_up'")
+            where_parts.append("q.status NOT IN ('done', 'failed')")
+            where_parts.append("f.state NOT IN ('backed_up', 'failed')")
         where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         with self.connect() as conn:
             return conn.execute(
@@ -305,8 +305,8 @@ class Database:
             where_parts.append("q.status = ?")
             params.append(status)
         elif not include_done:
-            where_parts.append("q.status != 'done'")
-            where_parts.append("f.state != 'backed_up'")
+            where_parts.append("q.status NOT IN ('done', 'failed')")
+            where_parts.append("f.state NOT IN ('backed_up', 'failed')")
         where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         with self.connect() as conn:
             return int(
@@ -413,6 +413,34 @@ class Database:
             )
             conn.execute("UPDATE queue SET updated_at=? WHERE file_id=?", (now, file_id))
             conn.execute("UPDATE files SET updated_at=? WHERE id=?", (now, file_id))
+
+    def replace_chunks(self, file_id: int, chunks: Iterable[Dict[str, Any]]) -> int:
+        now = utcnow()
+        chunk_rows = list(chunks)
+        with self.connect() as conn:
+            conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
+            conn.executemany(
+                """
+                INSERT INTO chunks(file_id, chunk_index, message_id, size, sha256, subject, status, posted_at)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                [
+                    (
+                        file_id,
+                        int(chunk["chunk_index"]),
+                        str(chunk["message_id"]),
+                        int(chunk["size"]),
+                        str(chunk["sha256"]),
+                        str(chunk["subject"]),
+                        "posted",
+                        now,
+                    )
+                    for chunk in chunk_rows
+                ],
+            )
+            conn.execute("UPDATE queue SET updated_at=? WHERE file_id=?", (now, file_id))
+            conn.execute("UPDATE files SET updated_at=? WHERE id=?", (now, file_id))
+        return len(chunk_rows)
 
     def clear_chunks(self, file_id: int) -> int:
         with self.connect() as conn:

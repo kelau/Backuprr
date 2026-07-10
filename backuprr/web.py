@@ -341,6 +341,7 @@ let eventSource = null;
 let lastChangeToken = null;
 let activeQueuePage = 1;
 let completedQueuePage = 1;
+let failedQueuePage = 1;
 let filesPage = 1;
 let verificationPage = 1;
 let selectedFiles = new Set();
@@ -454,7 +455,7 @@ async function render(){
   await updateLogPage();
  }
  if(page==="Queue"){
-  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(updateQueuePage)"><span class="ui-icon">&#8593;</span>Apply filter</button><button class="primary" onclick="post('/api/post-next').then(updateQueuePage)"><span class="ui-icon">&#9658;</span>Post next</button>${pushLabel()}</div><h2 class="section-title"><span class="ui-icon">&#9658;</span>Active</h2><div id="activeQueueRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Completed</h2><div id="completedQueueRows"></div>`;
+  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(updateQueuePage)"><span class="ui-icon">&#8593;</span>Apply filter</button><button class="primary" onclick="post('/api/post-next').then(updateQueuePage)"><span class="ui-icon">&#9658;</span>Post next</button>${pushLabel()}</div><h2 class="section-title"><span class="ui-icon">&#9658;</span>Active</h2><div id="activeQueueRows"></div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Failed</h2><div id="failedQueueRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Completed</h2><div id="completedQueueRows"></div>`;
   await updateQueuePage();
  }
  if(page==="Tasks"){
@@ -520,10 +521,13 @@ async function updateFilesPage(){
 }
 async function updateQueuePage(){
  const active = await api(`/api/queue?page=${activeQueuePage}&page_size=${queuePageSize}`);
+ const failed = await api(`/api/queue?status=failed&page=${failedQueuePage}&page_size=${queuePageSize}`);
  const done = await api(`/api/queue?status=done&page=${completedQueuePage}&page_size=${queuePageSize}`);
  const activeTarget = document.getElementById("activeQueueRows");
+ const failedTarget = document.getElementById("failedQueueRows");
  const doneTarget = document.getElementById("completedQueueRows");
  if(activeTarget) activeTarget.innerHTML = pagedTable(active, "activeQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"]);
+ if(failedTarget) failedTarget.innerHTML = pagedTable(failed, "failedQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"]);
  if(doneTarget) doneTarget.innerHTML = pagedTable(done, "completedQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"]);
 }
 function pagedTable(result, pageVar, cols){

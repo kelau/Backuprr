@@ -80,9 +80,6 @@ def post_next(db: Database, config: Config) -> Optional[int]:
     host = select_host(config, "post")
     db.set_queue_status(file_id, "posting")
     db.update_file_state(file_id, "posting")
-    cleared = db.clear_chunks(file_id)
-    if cleared:
-        db.log("debug", "post.retry", f"Cleared {cleared} partial chunk records before retrying {original}", file_id)
     payload = original
     try:
         payload = prepare_payload(original, config)
@@ -98,13 +95,25 @@ def post_next(db: Database, config: Config) -> Optional[int]:
 
         max_workers = max(1, int(config.nntp_threads))
         futures = []
+        posted_chunks = []
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backuprr-post") as executor:
             for chunk_index, chunk in enumerate(iter_chunks(payload, config.article_size)):
                 futures.append(executor.submit(post_chunk, chunk_index, chunk))
             for future in as_completed(futures):
                 chunk_index, message_id, body_size, digest, subject = future.result()
-                db.add_chunk(file_id, chunk_index, message_id, body_size, digest, subject)
+                posted_chunks.append(
+                    {
+                        "chunk_index": chunk_index,
+                        "message_id": message_id,
+                        "size": body_size,
+                        "sha256": digest,
+                        "subject": subject,
+                    }
+                )
+                db.set_queue_status(file_id, "posting")
                 db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
+        replaced = db.replace_chunks(file_id, posted_chunks)
+        db.log("debug", "post.retry", f"Replaced chunk catalog with {replaced} newly posted chunks for {original}", file_id)
         with db.connect() as conn:
             conn.execute("UPDATE files SET state='backed_up', last_backup_at=?, updated_at=? WHERE id=?", (utcnow(), utcnow(), file_id))
             conn.execute("UPDATE queue SET status='done', updated_at=? WHERE file_id=?", (utcnow(), file_id))
