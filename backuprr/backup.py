@@ -92,13 +92,14 @@ def post_next(db: Database, config: Config) -> Optional[int]:
     payload = original
     try:
         payload = prepare_payload(original, config)
-        expected_chunks = max(1, math.ceil(payload.stat().st_size / max(1, int(config.article_size))))
+        article_size = max(1, int(config.article_size))
+        expected_chunks = max(1, math.ceil(payload.stat().st_size / article_size))
         can_reuse_chunks = payload == original and str(item["reason"] or "") in {
             "startup-posting-retry",
             "stale-posting-retry",
             "missing-chunks",
         }
-        reusable_chunks = db.reusable_chunk_indexes(file_id) if can_reuse_chunks else {}
+        reusable_chunks = db.reusable_chunk_indexes(file_id, article_size) if can_reuse_chunks else {}
         reusable_chunks = {index: size for index, size in reusable_chunks.items() if 0 <= index < expected_chunks}
         posted_count = len(reusable_chunks)
         posted_bytes = sum(reusable_chunks.values())
@@ -118,13 +119,13 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         max_workers = max(1, int(config.nntp_threads))
         futures = []
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backuprr-post") as executor:
-            for chunk_index, chunk in enumerate(iter_chunks(payload, config.article_size)):
+            for chunk_index, chunk in enumerate(iter_chunks(payload, article_size)):
                 if chunk_index in reusable_chunks:
                     continue
                 futures.append(executor.submit(post_chunk, chunk_index, chunk))
             for future in as_completed(futures):
                 chunk_index, message_id, body_size, digest, subject = future.result()
-                db.add_chunk(file_id, chunk_index, message_id, body_size, digest, subject)
+                db.add_chunk(file_id, chunk_index, message_id, body_size, digest, subject, article_size=article_size)
                 posted_count += 1
                 posted_bytes += body_size
                 db.set_queue_progress(file_id, posted_count, posted_bytes)

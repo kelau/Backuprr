@@ -106,13 +106,18 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.31")
+        self.assertEqual(__version__, "0.2.32")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(queue)").fetchall()}
         self.assertIn("progress_chunks", columns)
         self.assertIn("progress_bytes", columns)
+
+    def test_chunk_schema_tracks_article_size_for_resume(self):
+        with self.db.connect() as conn:
+            columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+        self.assertIn("article_size", columns)
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -358,7 +363,7 @@ class CoreTests(unittest.TestCase):
             file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
             conn.execute("UPDATE files SET state='queued' WHERE id=?", (file_id,))
             conn.execute("UPDATE queue SET reason='startup-posting-retry' WHERE file_id=?", (file_id,))
-        self.db.add_chunk(file_id, 0, "<old-existing@example.test>", 8, "abc", "[old]")
+        self.db.add_chunk(file_id, 0, "<old-existing@example.test>", 8, "abc", "[old]", article_size=8)
         CountingPostClient.posts = []
         with patch("backuprr.backup.UsenetClient", CountingPostClient):
             self.assertIsNotNone(post_next(self.db, self.config))
@@ -369,6 +374,34 @@ class CoreTests(unittest.TestCase):
         self.assertEqual([row["chunk_index"] for row in chunks], [0, 1])
         self.assertEqual(chunks[0]["message_id"], "<old-existing@example.test>")
         self.assertEqual(queue_row["progress_chunks"], 2)
+
+    def test_post_next_restarts_partial_chunks_when_article_size_changes(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='queued' WHERE id=?", (file_id,))
+            conn.execute("UPDATE queue SET reason='startup-posting-retry' WHERE file_id=?", (file_id,))
+        self.db.add_chunk(file_id, 0, "<old-existing@example.test>", 8, "abc", "[old]", article_size=8)
+        self.config.article_size = 4
+        CountingPostClient.posts = []
+        with patch("backuprr.backup.UsenetClient", CountingPostClient):
+            self.assertIsNotNone(post_next(self.db, self.config))
+        with self.db.connect() as conn:
+            chunks = conn.execute(
+                "SELECT chunk_index, message_id, article_size FROM chunks WHERE file_id=? ORDER BY chunk_index",
+                (file_id,),
+            ).fetchall()
+            queue_row = conn.execute("SELECT progress_chunks FROM queue WHERE file_id=?", (file_id,)).fetchone()
+        self.assertEqual(len(CountingPostClient.posts), 4)
+        self.assertEqual([row["chunk_index"] for row in chunks], [0, 1, 2, 3])
+        self.assertNotEqual(chunks[0]["message_id"], "<old-existing@example.test>")
+        self.assertEqual({row["article_size"] for row in chunks}, {4})
+        self.assertEqual(queue_row["progress_chunks"], 4)
 
     def test_missing_par2_command_fails_queue_item_cleanly(self):
         media = self.root / "media"

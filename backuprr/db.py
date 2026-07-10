@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 STALE_POSTING_SECONDS = 15 * 60
 
 
@@ -44,6 +44,9 @@ class Database:
             conn.execute("ALTER TABLE queue ADD COLUMN progress_chunks INTEGER NOT NULL DEFAULT 0")
         if "progress_bytes" not in queue_columns:
             conn.execute("ALTER TABLE queue ADD COLUMN progress_bytes INTEGER NOT NULL DEFAULT 0")
+        chunk_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
+        if "article_size" not in chunk_columns:
+            conn.execute("ALTER TABLE chunks ADD COLUMN article_size INTEGER")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS transfer_samples (
@@ -500,19 +503,28 @@ class Database:
             self.log("info", "queue.priority", f"Boosted queue priority for {len(rows)} files under {folder_path}")
         return len(rows)
 
-    def add_chunk(self, file_id: int, chunk_index: int, message_id: str, size: int, sha256: str, subject: str) -> None:
+    def add_chunk(
+        self,
+        file_id: int,
+        chunk_index: int,
+        message_id: str,
+        size: int,
+        sha256: str,
+        subject: str,
+        article_size: Optional[int] = None,
+    ) -> None:
         now = utcnow()
         with self.connect() as conn:
             conn.execute(
                 """
-                INSERT INTO chunks(file_id, chunk_index, message_id, size, sha256, subject, status, posted_at)
-                VALUES(?,?,?,?,?,?,?,?)
+                INSERT INTO chunks(file_id, chunk_index, message_id, size, sha256, subject, status, posted_at, article_size)
+                VALUES(?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(file_id, chunk_index) DO UPDATE SET
                   message_id=excluded.message_id, size=excluded.size, sha256=excluded.sha256,
                   subject=excluded.subject, status=excluded.status, posted_at=excluded.posted_at,
-                  verified_at=NULL
+                  article_size=excluded.article_size, verified_at=NULL
                 """,
-                (file_id, chunk_index, message_id, size, sha256, subject, "posted", now),
+                (file_id, chunk_index, message_id, size, sha256, subject, "posted", now, article_size),
             )
             conn.execute("UPDATE queue SET updated_at=? WHERE file_id=?", (now, file_id))
             conn.execute("UPDATE files SET updated_at=? WHERE id=?", (now, file_id))
@@ -521,11 +533,15 @@ class Database:
                 (now, "upload", int(size)),
             )
 
-    def reusable_chunk_indexes(self, file_id: int) -> Dict[int, int]:
+    def reusable_chunk_indexes(self, file_id: int, article_size: int) -> Dict[int, int]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT chunk_index, size FROM chunks WHERE file_id=? AND status != 'missing'",
-                (file_id,),
+                """
+                SELECT chunk_index, size
+                FROM chunks
+                WHERE file_id=? AND status != 'missing' AND article_size=?
+                """,
+                (file_id, int(article_size)),
             ).fetchall()
             return {int(row["chunk_index"]): int(row["size"]) for row in rows}
 
@@ -540,8 +556,8 @@ class Database:
             conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
             conn.executemany(
                 """
-                INSERT INTO chunks(file_id, chunk_index, message_id, size, sha256, subject, status, posted_at)
-                VALUES(?,?,?,?,?,?,?,?)
+                INSERT INTO chunks(file_id, chunk_index, message_id, size, sha256, subject, status, posted_at, article_size)
+                VALUES(?,?,?,?,?,?,?,?,?)
                 """,
                 [
                     (
@@ -553,6 +569,7 @@ class Database:
                         str(chunk["subject"]),
                         "posted",
                         now,
+                        chunk.get("article_size"),
                     )
                     for chunk in chunk_rows
                 ],
@@ -911,6 +928,7 @@ CREATE TABLE IF NOT EXISTS chunks (
   subject TEXT NOT NULL,
   status TEXT NOT NULL,
   posted_at TEXT NOT NULL,
+  article_size INTEGER,
   verified_at TEXT,
   UNIQUE(file_id, chunk_index)
 );
