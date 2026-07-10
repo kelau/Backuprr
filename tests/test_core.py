@@ -98,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.22")
+        self.assertEqual(__version__, "0.2.23")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -699,6 +699,33 @@ class CoreTests(unittest.TestCase):
             },
         )
         self.assertEqual(self.config.usenet_hosts[0].password, "secret")
+
+    def test_update_config_preserves_null_existing_host_password(self):
+        self.config.usenet_hosts = [
+            UsenetHost(name="post", mode="post", host="post.example.test", port=563, tls="implicit", password="secret")
+        ]
+        update_config(
+            self.config,
+            {
+                "usenet_hosts": [
+                    {
+                        "name": "post",
+                        "mode": "post",
+                        "host": "post.example.test",
+                        "port": 563,
+                        "tls": "implicit",
+                        "password": None,
+                    }
+                ]
+            },
+        )
+        self.assertEqual(self.config.usenet_hosts[0].password, "secret")
+
+    def test_public_host_dict_hides_password_but_marks_presence(self):
+        host = UsenetHost(name="post", mode="post", host="post.example.test", port=563, tls="implicit", password="secret")
+        public = host.public_dict()
+        self.assertEqual(public["password"], "")
+        self.assertTrue(public["has_password"])
 
     def test_config_load_accepts_utf8_bom(self):
         config_path = self.root / "bom-config.json"

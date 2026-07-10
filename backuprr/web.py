@@ -1081,7 +1081,7 @@ function hostRow(host, index){
    <label class="field"><span><span class="ui-icon">&#128279;</span>Port</span><input class="hostPort" type="number" min="1" value="${esc(host.port || 563)}"></label>
    <label class="field"><span><span class="ui-icon">&#128274;</span>TLS mode</span><select class="hostTls"><option value="implicit" ${host.tls==="implicit"?"selected":""}>implicit</option><option value="starttls" ${host.tls==="starttls"?"selected":""}>starttls</option><option value="plain" ${host.tls==="plain"?"selected":""}>plain</option></select></label>
    <label class="field"><span><span class="ui-icon">&#128100;</span>Username</span><input class="hostUsername" value="${esc(host.username || "")}" autocomplete="off"></label>
-   <label class="field"><span><span class="ui-icon">&#128273;</span>Password</span><input class="hostPassword" type="password" value="${esc(host.password || "")}" autocomplete="new-password" placeholder="leave blank to keep existing"></label>
+   <label class="field"><span><span class="ui-icon">&#128273;</span>Password</span><input class="hostPassword" type="password" value="${esc(host.password || "")}" autocomplete="new-password" placeholder="${host.has_password ? "stored; leave blank to keep" : "enter password"}"></label>
   </div>
  </div>`;
 }
@@ -1142,7 +1142,7 @@ function collectHosts(){
   port: Number(row.querySelector(".hostPort").value),
   tls: row.querySelector(".hostTls").value,
   username: row.querySelector(".hostUsername").value.trim() || null,
-  password: row.querySelector(".hostPassword").value || null
+  password: row.querySelector(".hostPassword").value
  })).filter(host => host.name || host.host);
 }
 function collectCloudTargets(){

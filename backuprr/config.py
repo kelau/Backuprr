@@ -28,6 +28,7 @@ class UsenetHost:
 
     def public_dict(self) -> Dict[str, Any]:
         data = self.__dict__.copy()
+        data["has_password"] = bool(data.get("password"))
         if data.get("password"):
             data["password"] = ""
         return data
@@ -200,7 +201,7 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         existing_passwords = {host.name: host.password for host in config.usenet_hosts if host.password}
         for item in data["usenet_hosts"]:
             host = UsenetHost.from_dict(item)
-            if host.password == "" and host.name in existing_passwords:
+            if host.password in {"", None} and host.name in existing_passwords:
                 host.password = existing_passwords[host.name]
             if host.mode not in {"read", "post"}:
                 raise ValueError("Usenet host mode must be read or post")
