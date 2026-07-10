@@ -67,6 +67,10 @@ def decode_chunk(chunk: bytes, passphrase: Optional[str]) -> bytes:
     return xor_crypt(chunk[salt_start + 16 :], passphrase, salt)
 
 
+def estimated_body_size(chunk: bytes, config: Config) -> int:
+    return len(chunk) + (len(b"BACKUPRR-ENC1") + 16 if config.encrypt_bodies else 0)
+
+
 def post_next(db: Database, config: Config) -> Optional[int]:
     item = db.next_queue_item()
     if not item:
@@ -77,8 +81,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
     if hourly_limit > 0:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0).isoformat()
         used = db.transfer_bytes_since("upload", cutoff)
-        item_size = int(item["size"] or 0)
-        if used >= hourly_limit or (used > 0 and used + item_size > hourly_limit):
+        if used >= hourly_limit:
             db.log("debug", "post.throttle", f"Hourly post limit reached: {used} of {hourly_limit} bytes used")
             return None
     if not original.exists():
@@ -98,6 +101,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
             "startup-posting-retry",
             "stale-posting-retry",
             "missing-chunks",
+            "hourly-limit",
         }
         reusable_chunks = db.reusable_chunk_indexes(file_id, article_size) if can_reuse_chunks else {}
         reusable_chunks = {index: size for index, size in reusable_chunks.items() if 0 <= index < expected_chunks}
@@ -118,11 +122,32 @@ def post_next(db: Database, config: Config) -> Optional[int]:
 
         max_workers = max(1, int(config.nntp_threads))
         futures = []
+        throttled_by_hourly_limit = False
+        remaining_hourly_budget = 0
+        if hourly_limit > 0:
+            cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0).isoformat()
+            remaining_hourly_budget = max(0, hourly_limit - db.transfer_bytes_since("upload", cutoff))
+        submitted_bytes = 0
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backuprr-post") as executor:
             for chunk_index, chunk in enumerate(iter_chunks(payload, article_size)):
                 if chunk_index in reusable_chunks:
                     continue
+                if hourly_limit > 0:
+                    estimate = estimated_body_size(chunk, config)
+                    if submitted_bytes + estimate > remaining_hourly_budget:
+                        throttled_by_hourly_limit = True
+                        break
+                    submitted_bytes += estimate
                 futures.append(executor.submit(post_chunk, chunk_index, chunk))
+            if not futures and throttled_by_hourly_limit:
+                db.requeue_file(file_id, "hourly-limit")
+                db.log(
+                    "debug",
+                    "post.throttle",
+                    f"Hourly post limit reached before posting next chunk for {original}: {remaining_hourly_budget} bytes remaining",
+                    file_id,
+                )
+                return None
             for future in as_completed(futures):
                 chunk_index, message_id, body_size, digest, subject = future.result()
                 db.add_chunk(file_id, chunk_index, message_id, body_size, digest, subject, article_size=article_size)
@@ -131,6 +156,18 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                 db.set_queue_progress(file_id, posted_count, posted_bytes)
                 db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
         final_chunks = db.chunk_count_for_file(file_id)
+        if throttled_by_hourly_limit and final_chunks < expected_chunks:
+            if payload != original:
+                raise RuntimeError("Hourly post limit interrupted a temporary payload; increase the hourly limit or disable zip/par2 for resumable throttling")
+            db.set_queue_progress(file_id, final_chunks, posted_bytes)
+            db.requeue_file(file_id, "hourly-limit")
+            db.log(
+                "info",
+                "post.throttle",
+                f"Paused posting {original} at {final_chunks}/{expected_chunks} chunks due to hourly post limit",
+                file_id,
+            )
+            return None
         if final_chunks < expected_chunks:
             raise RuntimeError(f"Only {final_chunks} of {expected_chunks} chunks are cataloged")
         trimmed = db.trim_chunks(file_id, expected_chunks)

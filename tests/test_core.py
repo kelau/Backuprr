@@ -106,7 +106,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.33")
+        self.assertEqual(__version__, "0.2.34")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -434,6 +434,41 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             queue_row = conn.execute("SELECT status FROM queue").fetchone()
         self.assertEqual(queue_row["status"], "queued")
+
+    def test_post_next_pauses_large_file_at_hourly_limit_and_resumes(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"0123456789abcdef")
+        self.config.article_size = 8
+        self.config.hourly_post_limit_bytes = 12
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        CountingPostClient.posts = []
+        with patch("backuprr.backup.UsenetClient", CountingPostClient):
+            self.assertIsNone(post_next(self.db, self.config))
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            queue_row = conn.execute("SELECT status, reason, progress_chunks FROM queue WHERE file_id=?", (file_id,)).fetchone()
+            chunks = conn.execute("SELECT chunk_index, article_size FROM chunks WHERE file_id=?", (file_id,)).fetchall()
+            conn.execute("DELETE FROM transfer_samples")
+        self.assertEqual(queue_row["status"], "queued")
+        self.assertEqual(queue_row["reason"], "hourly-limit")
+        self.assertEqual(queue_row["progress_chunks"], 1)
+        self.assertEqual([(row["chunk_index"], row["article_size"]) for row in chunks], [(0, 8)])
+        self.assertEqual(len(CountingPostClient.posts), 1)
+
+        self.config.hourly_post_limit_bytes = 100
+        CountingPostClient.posts = []
+        with patch("backuprr.backup.UsenetClient", CountingPostClient):
+            self.assertIsNotNone(post_next(self.db, self.config))
+        with self.db.connect() as conn:
+            queue_row = conn.execute("SELECT status, progress_chunks FROM queue WHERE file_id=?", (file_id,)).fetchone()
+            file_row = conn.execute("SELECT state FROM files WHERE id=?", (file_id,)).fetchone()
+        self.assertEqual(queue_row["status"], "done")
+        self.assertEqual(queue_row["progress_chunks"], 2)
+        self.assertEqual(file_row["state"], "backed_up")
+        self.assertEqual(len(CountingPostClient.posts), 1)
 
     def test_post_next_replaces_chunks_after_successful_retry(self):
         media = self.root / "media"

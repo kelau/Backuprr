@@ -438,6 +438,15 @@ class Database:
         with self.connect() as conn:
             conn.execute("UPDATE queue SET status=?, updated_at=? WHERE file_id=?", (status, utcnow(), file_id))
 
+    def requeue_file(self, file_id: int, reason: str) -> None:
+        now = utcnow()
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE queue SET status='queued', reason=?, updated_at=? WHERE file_id=?",
+                (reason, now, file_id),
+            )
+            conn.execute("UPDATE files SET state='queued', updated_at=? WHERE id=?", (now, file_id))
+
     def set_queue_progress(self, file_id: int, chunks: int, bytes_posted: int) -> None:
         with self.connect() as conn:
             conn.execute(
