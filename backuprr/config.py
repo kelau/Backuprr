@@ -71,6 +71,10 @@ class Config:
     verbose_log_retention_days: int = 7
     restore_drill_interval_days: int = 30
     restore_drill_sample_bytes: int = 1024 * 1024
+    log_web_access: bool = False
+    log_chunk_events: bool = False
+    compact_chunk_metadata: bool = True
+    transfer_sample_bucket_seconds: int = 60
     auto_queue_exclude_patterns: List[str] = field(default_factory=list)
     usenet_hosts: List[UsenetHost] = field(default_factory=list)
     cloud_backups: List[CloudBackupTarget] = field(default_factory=list)
@@ -132,6 +136,10 @@ class Config:
             "verbose_log_retention_days": self.verbose_log_retention_days,
             "restore_drill_interval_days": self.restore_drill_interval_days,
             "restore_drill_sample_bytes": self.restore_drill_sample_bytes,
+            "log_web_access": self.log_web_access,
+            "log_chunk_events": self.log_chunk_events,
+            "compact_chunk_metadata": self.compact_chunk_metadata,
+            "transfer_sample_bucket_seconds": self.transfer_sample_bucket_seconds,
             "auto_queue_exclude_patterns": self.auto_queue_exclude_patterns,
             "usenet_hosts": [host.__dict__ for host in self.usenet_hosts],
             "cloud_backups": [target.__dict__ for target in self.cloud_backups],
@@ -239,6 +247,17 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if size < 1:
             raise ValueError("restore_drill_sample_bytes must be greater than zero")
         config.restore_drill_sample_bytes = size
+    if "log_web_access" in data:
+        config.log_web_access = bool(data["log_web_access"])
+    if "log_chunk_events" in data:
+        config.log_chunk_events = bool(data["log_chunk_events"])
+    if "compact_chunk_metadata" in data:
+        config.compact_chunk_metadata = bool(data["compact_chunk_metadata"])
+    if "transfer_sample_bucket_seconds" in data:
+        seconds = int(data["transfer_sample_bucket_seconds"])
+        if seconds < 1 or seconds > 3600:
+            raise ValueError("transfer_sample_bucket_seconds must be between 1 and 3600")
+        config.transfer_sample_bucket_seconds = seconds
     if "auto_queue_exclude_patterns" in data:
         config.auto_queue_exclude_patterns = [str(item).strip() for item in data["auto_queue_exclude_patterns"] if str(item).strip()]
     if "zip_subfolders" in data:

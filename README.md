@@ -35,6 +35,9 @@ a CLI and an AJAX-enabled Web UI.
   drill history for production troubleshooting.
 - Chunk-level hourly throttling, resumable posts, and retry/failover across
   configured post hosts.
+- Volume controls for large catalogs: web access logs and successful per-chunk
+  logs are disabled by default, transfer samples are bucketed, and new chunk
+  rows omit debug-only subject/body-hash metadata unless explicitly enabled.
 - CLI commands matching the Web UI operations.
 
 ## Quick start
@@ -119,6 +122,11 @@ Backuprr streams files into article-sized chunks and posts each chunk with an
 obfuscated subject. It stores article message IDs and chunk metadata in SQLite.
 Temporary zip/PAR2 artifacts are created in the OS temp directory only for the
 duration of a run and are deleted afterward.
+
+At multi-terabyte scale, chunk row count is the main durable catalog cost. Use
+larger article sizes, such as 2-5 MiB where your provider accepts them, to
+reduce chunk rows. Keep compact chunk metadata enabled unless you are debugging
+subject/hash generation.
 
 Body encryption uses a passphrase-derived HMAC-SHA256 keystream implemented with
 the Python standard library. For high-assurance environments, integrate a

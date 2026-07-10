@@ -130,7 +130,6 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                     try:
                         with UsenetClient(host) as client:
                             message_id = client.post(config.newsgroup, subject, body)
-                        db.record_host_check(host.name, host.mode, "ok", "posted chunk")
                         if run_id is not None:
                             db.update_backup_run(run_id, posted_count, posted_bytes, host.name)
                         return chunk_index, message_id, len(body), digest, subject
@@ -172,13 +171,16 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                 return None
             for future in as_completed(futures):
                 chunk_index, message_id, body_size, digest, subject = future.result()
-                db.add_chunk(file_id, chunk_index, message_id, body_size, digest, subject, article_size=article_size)
+                stored_digest = "" if getattr(config, "compact_chunk_metadata", True) else digest
+                stored_subject = "" if getattr(config, "compact_chunk_metadata", True) else subject
+                db.add_chunk(file_id, chunk_index, message_id, body_size, stored_digest, stored_subject, article_size=article_size)
                 posted_count += 1
                 posted_bytes += body_size
                 db.set_queue_progress(file_id, posted_count, posted_bytes)
                 if run_id is not None:
                     db.update_backup_run(run_id, posted_count, posted_bytes)
-                db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
+                if getattr(config, "log_chunk_events", False):
+                    db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
         final_chunks = db.chunk_count_for_file(file_id)
         if throttled_by_hourly_limit and final_chunks < expected_chunks:
             if payload != original:
@@ -238,7 +240,8 @@ def verify_chunks(db: Database, config: Config, chunks: Iterable[Any]) -> int:
             db.mark_chunk_verified(chunk_id, exists)
             if exists:
                 db.record_transfer_sample("download", 1)
-            db.log("debug" if exists else "warning", "verify.chunk", f"Chunk {message_id} exists={exists}", file_id)
+            if not exists or getattr(config, "log_chunk_events", False):
+                db.log("debug" if exists else "warning", "verify.chunk", f"Chunk {message_id} exists={exists}", file_id)
             count += 1
     return count
 

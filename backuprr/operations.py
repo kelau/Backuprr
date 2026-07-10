@@ -63,13 +63,14 @@ def check_usenet_hosts(db: Database, config: Config) -> List[Dict[str, Any]]:
 def run_maintenance(db: Database, config: Config, vacuum: bool = False) -> Dict[str, Any]:
     started = utcnow()
     pruned = db.prune_events(config.log_retention_days, config.verbose_log_retention_days)
-    details = f"pruned {pruned} log events"
+    compacted_samples = db.compact_transfer_samples()
+    details = f"pruned {pruned} log events, compacted {compacted_samples} transfer samples"
     if vacuum:
         db.vacuum_analyze()
         details += ", vacuum/analyze completed"
     db.record_maintenance("database", started, "ok", details)
     db.log("info", "maintenance", details)
-    return {"ok": True, "pruned_events": pruned, "vacuum": bool(vacuum), "details": details}
+    return {"ok": True, "pruned_events": pruned, "compacted_transfer_samples": compacted_samples, "vacuum": bool(vacuum), "details": details}
 
 
 def restore_confidence(db: Database, source_path: str) -> Dict[str, Any]:

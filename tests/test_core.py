@@ -107,7 +107,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.36")
+        self.assertEqual(__version__, "0.2.37")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -429,10 +429,29 @@ class CoreTests(unittest.TestCase):
             file_row = conn.execute("SELECT state FROM files LIMIT 1").fetchone()
         self.assertEqual(len(chunks), 2)
         self.assertEqual(file_row["state"], "backed_up")
-        self.assertNotIn("movie.mkv", chunks[0]["subject"])
+        self.assertEqual(chunks[0]["subject"], "")
+        self.assertEqual(chunks[0]["sha256"], "")
         runs = self.db.backup_run_rows()
         self.assertEqual(runs[0]["status"], "done")
         self.assertEqual(runs[0]["chunks_done"], 2)
+        self.assertEqual(self.db.list_events(["debug"], event_types=["post.chunk"]), [])
+
+    def test_chunk_event_logging_can_be_enabled(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"0123456789abcdef")
+        self.config.log_chunk_events = True
+        self.config.compact_chunk_metadata = False
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with patch("backuprr.backup.UsenetClient", FakePostClient):
+            self.assertIsNotNone(post_next(self.db, self.config))
+        self.assertGreater(len(self.db.list_events(["debug"], event_types=["post.chunk"])), 0)
+        with self.db.connect() as conn:
+            chunk = conn.execute("SELECT sha256, subject FROM chunks ORDER BY chunk_index LIMIT 1").fetchone()
+        self.assertTrue(chunk["sha256"])
+        self.assertTrue(chunk["subject"])
 
     def test_post_next_honors_hourly_post_limit(self):
         media = self.root / "media"
@@ -503,11 +522,23 @@ class CoreTests(unittest.TestCase):
                 "INSERT INTO events(ts, level, event_type, message, data) VALUES(?,?,?,?,?)",
                 ("2000-01-01T00:00:00+00:00", "verbose", "old", "old", ""),
             )
+            conn.execute("INSERT INTO transfer_samples(ts, direction, size) VALUES(?,?,?)", ("2026-01-01T00:00:01+00:00", "upload", 1))
+            conn.execute("INSERT INTO transfer_samples(ts, direction, size) VALUES(?,?,?)", ("2026-01-01T00:00:02+00:00", "upload", 2))
         self.config.log_retention_days = 3650
         self.config.verbose_log_retention_days = 1
         result = run_maintenance(self.db, self.config)
         self.assertGreaterEqual(result["pruned_events"], 1)
+        self.assertGreaterEqual(result["compacted_transfer_samples"], 1)
         self.assertEqual(len(self.db.maintenance_rows()), 1)
+
+    def test_transfer_samples_aggregate_by_minute(self):
+        self.db.record_transfer_sample("upload", 4)
+        self.db.record_transfer_sample("upload", 6)
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT direction, size FROM transfer_samples").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["direction"], "upload")
+        self.assertEqual(rows[0]["size"], 10)
 
     def test_post_next_replaces_chunks_after_successful_retry(self):
         media = self.root / "media"
@@ -951,6 +982,10 @@ class CoreTests(unittest.TestCase):
                 "verbose_log_retention_days": 5,
                 "restore_drill_interval_days": 9,
                 "restore_drill_sample_bytes": 2048,
+                "log_web_access": True,
+                "log_chunk_events": True,
+                "compact_chunk_metadata": False,
+                "transfer_sample_bucket_seconds": 60,
                 "auto_queue_exclude_patterns": ["*.sample", ".tmp"],
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
@@ -991,6 +1026,10 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.verbose_log_retention_days, 5)
         self.assertEqual(self.config.restore_drill_interval_days, 9)
         self.assertEqual(self.config.restore_drill_sample_bytes, 2048)
+        self.assertTrue(self.config.log_web_access)
+        self.assertTrue(self.config.log_chunk_events)
+        self.assertFalse(self.config.compact_chunk_metadata)
+        self.assertEqual(self.config.transfer_sample_bucket_seconds, 60)
         self.assertEqual(self.config.auto_queue_exclude_patterns, ["*.sample", ".tmp"])
         self.assertTrue(self.config.zip_subfolders)
         self.assertTrue(self.config.encrypt_bodies)

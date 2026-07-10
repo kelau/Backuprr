@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 STALE_POSTING_SECONDS = 15 * 60
 
 
@@ -529,11 +529,19 @@ class Database:
     def record_transfer_sample(self, direction: str, size: int) -> None:
         if size <= 0:
             return
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0).isoformat()
         with self.connect() as conn:
-            conn.execute(
-                "INSERT INTO transfer_samples(ts, direction, size) VALUES(?,?,?)",
-                (utcnow(), direction, int(size)),
-            )
+            row = conn.execute(
+                "SELECT id FROM transfer_samples WHERE ts=? AND direction=? LIMIT 1",
+                (now, direction),
+            ).fetchone()
+            if row:
+                conn.execute("UPDATE transfer_samples SET size=size+? WHERE id=?", (int(size), row["id"]))
+            else:
+                conn.execute(
+                    "INSERT INTO transfer_samples(ts, direction, size) VALUES(?,?,?)",
+                    (now, direction, int(size)),
+                )
 
     def start_backup_run(self, file_id: int, path: str, chunks_total: int, bytes_total: int, reason: str) -> int:
         with self.connect() as conn:
@@ -600,6 +608,23 @@ class Database:
                 (general_cutoff, verbose_cutoff),
             )
             return int(cur.rowcount)
+
+    def compact_transfer_samples(self) -> int:
+        with self.connect() as conn:
+            before = int(conn.execute("SELECT COUNT(*) FROM transfer_samples").fetchone()[0])
+            rows = conn.execute(
+                """
+                SELECT substr(ts, 1, 16) || ':00+00:00' AS bucket, direction, SUM(size) AS size
+                FROM transfer_samples
+                GROUP BY bucket, direction
+                """
+            ).fetchall()
+            conn.execute("DELETE FROM transfer_samples")
+            conn.executemany(
+                "INSERT INTO transfer_samples(ts, direction, size) VALUES(?,?,?)",
+                [(row["bucket"], row["direction"], int(row["size"] or 0)) for row in rows],
+            )
+            return max(0, before - len(rows))
 
     def vacuum_analyze(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -709,10 +734,17 @@ class Database:
             )
             conn.execute("UPDATE queue SET updated_at=? WHERE file_id=?", (now, file_id))
             conn.execute("UPDATE files SET updated_at=? WHERE id=?", (now, file_id))
-            conn.execute(
-                "INSERT INTO transfer_samples(ts, direction, size) VALUES(?,?,?)",
-                (now, "upload", int(size)),
-            )
+            row = conn.execute(
+                "SELECT id FROM transfer_samples WHERE ts=? AND direction='upload' LIMIT 1",
+                (now[:16] + ":00+00:00",),
+            ).fetchone()
+            if row:
+                conn.execute("UPDATE transfer_samples SET size=size+? WHERE id=?", (int(size), row["id"]))
+            else:
+                conn.execute(
+                    "INSERT INTO transfer_samples(ts, direction, size) VALUES(?,?,?)",
+                    (now[:16] + ":00+00:00", "upload", int(size)),
+                )
 
     def reusable_chunk_indexes(self, file_id: int, article_size: int) -> Dict[int, int]:
         with self.connect() as conn:

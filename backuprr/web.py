@@ -75,7 +75,8 @@ class Handler(BaseHTTPRequestHandler):
     restore_drill_monitor: RestoreDrillMonitor
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        self.db.log("verbose", "web.access", fmt % args)
+        if getattr(self.config, "log_web_access", False):
+            self.db.log("verbose", "web.access", fmt % args)
 
     def send_json(self, data: Any, status: int = 200) -> None:
         payload = json.dumps(data, default=str).encode("utf-8")
@@ -1234,6 +1235,9 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128737;</span>PAR2 redundancy</span><div class="range-field"><input id="setPar2Redundancy" type="range" min="1" max="50" step="1" value="${esc(s.par2?.redundancy_percent ?? 10)}" oninput="setPar2RedundancyLabel.textContent=this.value + '%'"><span id="setPar2RedundancyLabel">${esc(s.par2?.redundancy_percent ?? 10)}%</span></div></label>
   <label class="field"><span><span class="ui-icon">&#128221;</span>Log retention days</span><input id="setLogRetentionDays" type="number" min="1" max="3650" value="${esc(s.log_retention_days || 30)}"></label>
   <label class="field"><span><span class="ui-icon">&#128269;</span>Verbose log retention days</span><input id="setVerboseLogRetentionDays" type="number" min="1" max="3650" value="${esc(s.verbose_log_retention_days || 7)}"></label>
+  <label><input id="setLogWebAccess" type="checkbox" ${s.log_web_access?"checked":""}> <span class="ui-icon">&#128221;</span>Log web access requests</label>
+  <label><input id="setLogChunkEvents" type="checkbox" ${s.log_chunk_events?"checked":""}> <span class="ui-icon">&#129513;</span>Log successful per-chunk events</label>
+  <label><input id="setCompactChunkMetadata" type="checkbox" ${s.compact_chunk_metadata === false ? "" : "checked"}> <span class="ui-icon">&#128451;</span>Compact stored chunk metadata</label>
   <label class="field"><span><span class="ui-icon">&#8635;</span>Restore drill interval days</span><input id="setRestoreDrillDays" type="number" min="1" max="3650" value="${esc(s.restore_drill_interval_days || 30)}"></label>
   <label class="field"><span><span class="ui-icon">&#128207;</span>Restore drill sample bytes</span><input id="setRestoreDrillBytes" type="number" min="1" value="${esc(s.restore_drill_sample_bytes || 1048576)}"></label>
  </div></div>
@@ -1360,6 +1364,9 @@ async function saveSettings(){
   usenet_retry_backoff_seconds: Number(setRetryBackoff.value),
   log_retention_days: Number(setLogRetentionDays.value),
   verbose_log_retention_days: Number(setVerboseLogRetentionDays.value),
+  log_web_access: setLogWebAccess.checked,
+  log_chunk_events: setLogChunkEvents.checked,
+  compact_chunk_metadata: setCompactChunkMetadata.checked,
   restore_drill_interval_days: Number(setRestoreDrillDays.value),
   restore_drill_sample_bytes: Number(setRestoreDrillBytes.value),
   zip_subfolders: setZip.checked,
