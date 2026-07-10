@@ -174,7 +174,7 @@ class CatalogMonitor(ScheduledTask):
 
     def execute(self) -> str:
         count = scan_all(self.db)
-        queued = enqueue_unbacked(self.db)
+        queued = enqueue_unbacked(self.db, self.config)
         result = f"{count} files cataloged, {queued} queued"
         self.db.log("debug", "monitor.scan", f"Automatic catalog scan completed: {result}")
         return result
@@ -200,7 +200,7 @@ class BackupMonitor(ScheduledTask):
     def execute(self) -> str:
         recovered = self.db.recover_stale_posting()
         recovered_mismatches = self.db.recover_queued_failed_mismatches()
-        newly_queued = enqueue_unbacked(self.db)
+        newly_queued = enqueue_unbacked(self.db, self.config)
         file_id = post_next(self.db, self.config)
         stats = self.db.stats()
         queued = int(stats.get("queue_queued", 0))

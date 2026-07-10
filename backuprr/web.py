@@ -84,7 +84,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(INDEX_HTML.encode("utf-8"))
         elif parsed.path == "/api/status":
             self.db.cleanup_completed_queue()
-            speed = self.db.speed_samples(5, 60)
+            speed = self.db.speed_samples(5, 10)
             posting_rows = [dict(row) for row in self.db.list_queue(status="posting")]
             self.send_json(
                 {
@@ -164,7 +164,7 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/scan":
                 self.send_json({"files": self.monitor.scan_once()})
             elif parsed.path == "/api/queue/enqueue-unbacked":
-                self.send_json({"queued": enqueue_unbacked(self.db)})
+                self.send_json({"queued": enqueue_unbacked(self.db, self.config)})
             elif parsed.path == "/api/queue/prioritize":
                 self.send_json({"changed": prioritize(self.db, data.get("filter", "older-first"))})
             elif parsed.path == "/api/queue/move":
@@ -368,7 +368,7 @@ pre { white-space:pre-wrap; background:#fff; border:1px solid var(--line); paddi
 <section id="content"></section>
 </main>
 <script>
-const pages = ["Status","Files","Search","Log","Queue","Tasks","Verification","Statistics","Restore","Settings","About"];
+const pages = ["Status","Files","Search","Log","Queue","Tasks","Verification","Statistics","Settings","About"];
 let page = "Status";
 let settingsCache = null;
 let fileRowsCache = [];
@@ -414,7 +414,7 @@ function iconText(icon, text, cls=""){
  return `<span class="${cls}"><span class="ui-icon">${icon}</span>${esc(text)}</span>`;
 }
 function pageIcon(name){
- return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Restore:"&#8635;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
+ return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
 }
 function stateIcon(value){
  return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;"}[String(value || "")] || "&#8226;");
@@ -509,9 +509,6 @@ async function render(){
   c.innerHTML = `<div id="statisticsPanel"></div>`;
   await updateStatisticsPage();
  }
- if(page==="Restore"){
-  c.innerHTML = `<div class="toolbar"><input id="restorePath" placeholder="File or folder path"><input id="restoreDest" placeholder="Optional destination"><label><input id="restoreFolder" type="checkbox"> <span class="ui-icon">&#128193;</span>Folder</label><button class="primary" onclick="restore()"><span class="ui-icon">&#8635;</span>Restore</button></div><pre id="restoreOut"></pre>`;
- }
  if(page==="Settings"){ settingsCache = await api("/api/settings"); c.innerHTML = settingsForm(settingsCache); }
  if(page==="About"){ c.innerHTML = `<h1><span class="ui-icon">&#128230;</span>Backuprr</h1><p><span class="ui-icon">&#128278;</span>Version <span id="aboutVersion"></span></p><p><span class="ui-icon">&#128274;</span>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
 }
@@ -519,21 +516,22 @@ async function refreshPageForChanges(previous, token){
  const filesChanged = previous.files_updated !== token.files_updated || previous.files_total !== token.files_total;
  const queueChanged = previous.queue_updated !== token.queue_updated || previous.queue_total !== token.queue_total;
  const eventsChanged = previous.event_id !== token.event_id;
+ const transferChanged = previous.transfer_id !== token.transfer_id;
  const chunksChanged = previous.chunks_total !== token.chunks_total;
  const tasksChanged = previous.task_revision !== token.task_revision;
- if(page==="Status" && (filesChanged || queueChanged || chunksChanged || tasksChanged)) await updateStatusPage();
+ if(page==="Status" && (filesChanged || queueChanged || chunksChanged || tasksChanged || transferChanged)) await updateStatusPage();
  if(page==="Files" && filesChanged) await updateFilesPage();
  if(page==="Log" && eventsChanged) await updateLogPage(false);
- if(page==="Queue" && (queueChanged || filesChanged)) await updateQueuePage();
+ if(page==="Queue" && (queueChanged || filesChanged || transferChanged)) await updateQueuePage();
  if(page==="Tasks" && (eventsChanged || tasksChanged)) await updateTasksPage();
  if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged)) await updateVerificationPage();
- if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged)) await updateStatisticsPage();
+ if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged || transferChanged)) await updateStatisticsPage();
  document.querySelectorAll(".push-state").forEach(el => el.textContent = "Updated after change");
 }
 async function updateStatusPage(){
  const s = await api("/api/status");
  const tasks = await api("/api/tasks");
- const speed = await api("/api/speed?minutes=30&bucket=60");
+ const speed = await api("/api/speed?minutes=10&bucket=10");
  document.getElementById("version").textContent = "v"+s.version;
  const panel = document.getElementById("statusPanel");
  if(panel) panel.innerHTML = statusDashboard(s, tasks, speed);
@@ -1008,6 +1006,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128101;</span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
   <label class="field"><span><span class="ui-icon">&#129513;</span>Article size bytes</span><input id="setArticleSize" type="number" min="1" value="${esc(s.article_size)}"></label>
   <label class="field"><span><span class="ui-icon">&#128225;</span>NNTP threads</span><input id="setNntpThreads" type="number" min="1" max="64" value="${esc(s.nntp_threads || 4)}"></label>
+  <label class="field"><span><span class="ui-icon">&#9201;</span>Post limit bytes/hour</span><input id="setHourlyPostLimit" type="number" min="0" value="${esc(s.hourly_post_limit_bytes || 0)}"></label>
  </div></div>
  <div id="tabSchedules" class="tab-panel"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#10003;</span>Verify interval days</span><input id="setVerifyDays" type="number" min="1" value="${esc(s.verification_interval_days)}"></label>
@@ -1025,7 +1024,8 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128737;</span>PAR2 redundancy percent</span><input id="setPar2Redundancy" type="number" min="0" value="${esc(s.par2?.redundancy_percent ?? 10)}"></label>
  </div></div>
  <div id="tabEndpoints" class="tab-panel"><div class="form-grid">
-  <label class="field full"><span><span class="ui-icon">&#128193;</span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
+ <label class="field full"><span><span class="ui-icon">&#128193;</span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
+  <label class="field full"><span><span class="ui-icon">&#128683;</span>Auto-queue exclude patterns, one per line</span><textarea id="setAutoQueueExcludePatterns">${esc((s.auto_queue_exclude_patterns || []).join("\n"))}</textarea></label>
  </div></div>
  <div id="tabUsenet" class="tab-panel"><div class="form-grid">
   <div class="field full"><span><span class="ui-icon">&#128225;</span>Usenet hosts</span><div id="hostList" class="host-list">${hostRows(s.usenet_hosts || [])}</div></div>
@@ -1138,10 +1138,12 @@ async function saveSettings(){
   backup_interval_seconds: Number(setBackupInterval.value),
   cloud_backup_interval_seconds: Number(setCloudBackupInterval.value),
   nntp_threads: Number(setNntpThreads.value),
+  hourly_post_limit_bytes: Number(setHourlyPostLimit.value),
   zip_subfolders: setZip.checked,
   encrypt_bodies: setEncrypt.checked,
   encryption_passphrase_env: setPassEnv.value,
   endpoints: setEndpoints.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
+  auto_queue_exclude_patterns: setAutoQueueExcludePatterns.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   usenet_hosts: collectHosts(),
   cloud_backups: collectCloudTargets(),
   par2: { enabled: setPar2.checked, command: setPar2Command.value, redundancy_percent: Number(setPar2Redundancy.value) }

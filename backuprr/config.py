@@ -60,6 +60,8 @@ class Config:
     backup_interval_seconds: int = 300
     cloud_backup_interval_seconds: int = 3600
     nntp_threads: int = 4
+    hourly_post_limit_bytes: int = 0
+    auto_queue_exclude_patterns: List[str] = field(default_factory=list)
     usenet_hosts: List[UsenetHost] = field(default_factory=list)
     cloud_backups: List[CloudBackupTarget] = field(default_factory=list)
     endpoints: List[str] = field(default_factory=list)
@@ -110,6 +112,8 @@ class Config:
             "backup_interval_seconds": self.backup_interval_seconds,
             "cloud_backup_interval_seconds": self.cloud_backup_interval_seconds,
             "nntp_threads": self.nntp_threads,
+            "hourly_post_limit_bytes": self.hourly_post_limit_bytes,
+            "auto_queue_exclude_patterns": self.auto_queue_exclude_patterns,
             "usenet_hosts": [host.__dict__ for host in self.usenet_hosts],
             "cloud_backups": [target.__dict__ for target in self.cloud_backups],
             "endpoints": self.endpoints,
@@ -166,6 +170,13 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if threads <= 0:
             raise ValueError("nntp_threads must be greater than zero")
         config.nntp_threads = min(64, threads)
+    if "hourly_post_limit_bytes" in data:
+        limit = int(data["hourly_post_limit_bytes"] or 0)
+        if limit < 0:
+            raise ValueError("hourly_post_limit_bytes cannot be negative")
+        config.hourly_post_limit_bytes = limit
+    if "auto_queue_exclude_patterns" in data:
+        config.auto_queue_exclude_patterns = [str(item).strip() for item in data["auto_queue_exclude_patterns"] if str(item).strip()]
     if "zip_subfolders" in data:
         config.zip_subfolders = bool(data["zip_subfolders"])
     if "encrypt_bodies" in data:

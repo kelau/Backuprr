@@ -74,7 +74,7 @@ def main(argv=None) -> int:
             rows = db.list_rows("queue")
             print(json.dumps([dict(row) for row in rows], indent=2))
         elif args.queue_command == "enqueue-unbacked":
-            print(f"Queued {enqueue_unbacked(db)} files")
+            print(f"Queued {enqueue_unbacked(db, config)} files")
         elif args.queue_command == "prioritize":
             print(f"Reordered {prioritize(db, args.filter)} queued files")
         elif args.queue_command == "move":

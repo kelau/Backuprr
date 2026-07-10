@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 STALE_POSTING_SECONDS = 15 * 60
 
 
@@ -44,6 +44,16 @@ class Database:
             conn.execute("ALTER TABLE queue ADD COLUMN progress_chunks INTEGER NOT NULL DEFAULT 0")
         if "progress_bytes" not in queue_columns:
             conn.execute("ALTER TABLE queue ADD COLUMN progress_bytes INTEGER NOT NULL DEFAULT 0")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS transfer_samples (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              ts TEXT NOT NULL,
+              direction TEXT NOT NULL,
+              size INTEGER NOT NULL
+            )
+            """
+        )
 
     def get_meta(self, key: str) -> Optional[str]:
         with self.connect() as conn:
@@ -403,6 +413,24 @@ class Database:
                 (max(0, int(chunks)), max(0, int(bytes_posted)), utcnow(), file_id),
             )
 
+    def record_transfer_sample(self, direction: str, size: int) -> None:
+        if size <= 0:
+            return
+        with self.connect() as conn:
+            conn.execute(
+                "INSERT INTO transfer_samples(ts, direction, size) VALUES(?,?,?)",
+                (utcnow(), direction, int(size)),
+            )
+
+    def transfer_bytes_since(self, direction: str, since: str) -> int:
+        with self.connect() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COALESCE(SUM(size), 0) FROM transfer_samples WHERE direction=? AND ts >= ?",
+                    (direction, since),
+                ).fetchone()[0]
+            )
+
     def boost_queue_priority(self, file_id: int, amount: int = 10, reason: str = "manual-priority") -> None:
         should_queue = False
         with self.connect() as conn:
@@ -455,6 +483,10 @@ class Database:
             )
             conn.execute("UPDATE queue SET updated_at=? WHERE file_id=?", (now, file_id))
             conn.execute("UPDATE files SET updated_at=? WHERE id=?", (now, file_id))
+            conn.execute(
+                "INSERT INTO transfer_samples(ts, direction, size) VALUES(?,?,?)",
+                (now, "upload", int(size)),
+            )
 
     def replace_chunks(self, file_id: int, chunks: Iterable[Dict[str, Any]]) -> int:
         now = utcnow()
@@ -678,6 +710,7 @@ class Database:
                   (SELECT COALESCE(MAX(updated_at), '') FROM files) AS files_updated,
                   (SELECT COALESCE(MAX(updated_at), '') FROM queue) AS queue_updated,
                   (SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type != 'web.access') AS event_id,
+                  (SELECT COALESCE(MAX(id), 0) FROM transfer_samples) AS transfer_id,
                   (SELECT COUNT(*) FROM chunks) AS chunks_total,
                   (SELECT COUNT(*) FROM files WHERE state != 'deleted') AS files_total,
                   (SELECT COUNT(*) FROM queue) AS queue_total
@@ -703,18 +736,19 @@ class Database:
             buckets[key] = {"ts": key, "upload_bps": 0.0, "download_bps": 0.0}
             cursor += timedelta(seconds=bucket_seconds)
         with self.connect() as conn:
-            posted = conn.execute(
-                "SELECT posted_at, size FROM chunks WHERE posted_at >= ?",
+            transfers = conn.execute(
+                "SELECT ts, direction, size FROM transfer_samples WHERE ts >= ?",
                 (start.isoformat(),),
             ).fetchall()
             verified = conn.execute(
                 "SELECT verified_at, size FROM chunks WHERE verified_at IS NOT NULL AND verified_at >= ?",
                 (start.isoformat(),),
             ).fetchall()
-        for row in posted:
-            key = self._bucket_key(row["posted_at"], bucket_seconds)
+        for row in transfers:
+            key = self._bucket_key(row["ts"], bucket_seconds)
             buckets.setdefault(key, {"ts": key, "upload_bps": 0.0, "download_bps": 0.0})
-            buckets[key]["upload_bps"] += row["size"] / bucket_seconds
+            metric = "download_bps" if row["direction"] == "download" else "upload_bps"
+            buckets[key][metric] += row["size"] / bucket_seconds
         for row in verified:
             key = self._bucket_key(row["verified_at"], bucket_seconds)
             buckets.setdefault(key, {"ts": key, "upload_bps": 0.0, "download_bps": 0.0})
@@ -808,5 +842,12 @@ CREATE TABLE IF NOT EXISTS events (
   message TEXT NOT NULL,
   file_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
   data TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS transfer_samples (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TEXT NOT NULL,
+  direction TEXT NOT NULL,
+  size INTEGER NOT NULL
 );
 """

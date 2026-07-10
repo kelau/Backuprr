@@ -1,21 +1,44 @@
+from fnmatch import fnmatch
+from pathlib import Path
+from typing import Optional
+
+from .config import Config
 from .db import Database
 
 
-def enqueue_unbacked(db: Database) -> int:
+def excluded_by_auto_queue_filter(path: str, relative_path: str, patterns: list[str]) -> bool:
+    names = {Path(path).name.lower(), str(relative_path or "").lower(), str(path or "").lower()}
+    for raw_pattern in patterns:
+        pattern = raw_pattern.strip().lower()
+        if not pattern:
+            continue
+        extension_pattern = f"*{pattern}" if pattern.startswith(".") else pattern
+        if any(fnmatch(name, extension_pattern) for name in names):
+            return True
+    return False
+
+
+def enqueue_unbacked(db: Database, config: Optional[Config] = None) -> int:
     count = 0
+    skipped = 0
+    patterns = list(getattr(config, "auto_queue_exclude_patterns", []) or [])
     with db.connect() as conn:
         rows = conn.execute(
             """
-            SELECT id FROM files
+            SELECT id, path, relative_path FROM files
             WHERE state IN ('discovered', 'changed', 'missing_chunks')
               AND id NOT IN (SELECT file_id FROM queue WHERE status IN ('queued', 'posting'))
             ORDER BY created_at ASC
             """
         ).fetchall()
     for row in rows:
+        if patterns and excluded_by_auto_queue_filter(str(row["path"]), str(row["relative_path"]), patterns):
+            skipped += 1
+            continue
         db.queue_file(int(row["id"]), priority=100, reason="unbacked")
         count += 1
-    db.log("info" if count else "debug", "queue", f"Queued {count} unbacked files")
+    suffix = f", skipped {skipped} by auto-queue filter" if skipped else ""
+    db.log("info" if count else "debug", "queue", f"Queued {count} unbacked files{suffix}")
     return count
 
 

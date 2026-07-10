@@ -98,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.18")
+        self.assertEqual(__version__, "0.2.19")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -116,6 +116,25 @@ class CoreTests(unittest.TestCase):
         stats = self.db.stats()
         self.assertEqual(stats["files_total"], 1)
         self.assertEqual(stats["queue_queued"], 1)
+
+    def test_auto_queue_exclude_patterns_skip_matching_files(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"abc")
+        (media / "sample.tmp").write_bytes(b"tmp")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        self.config.auto_queue_exclude_patterns = ["*.tmp"]
+        self.assertEqual(enqueue_unbacked(self.db, self.config), 1)
+        with self.db.connect() as conn:
+            queued = conn.execute(
+                """
+                SELECT f.relative_path FROM queue q
+                JOIN files f ON f.id=q.file_id
+                ORDER BY f.relative_path
+                """
+            ).fetchall()
+        self.assertEqual([row["relative_path"] for row in queued], ["movie.mkv"])
 
     def test_stats_exclude_deleted_from_active_total(self):
         media = self.root / "media"
@@ -230,6 +249,21 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(chunks), 2)
         self.assertEqual(file_row["state"], "backed_up")
         self.assertNotIn("movie.mkv", chunks[0]["subject"])
+
+    def test_post_next_honors_hourly_post_limit(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        self.config.hourly_post_limit_bytes = 4
+        self.db.record_transfer_sample("upload", 4)
+        with patch("backuprr.backup.UsenetClient", FakePostClient):
+            self.assertIsNone(post_next(self.db, self.config))
+        with self.db.connect() as conn:
+            queue_row = conn.execute("SELECT status FROM queue").fetchone()
+        self.assertEqual(queue_row["status"], "queued")
 
     def test_post_next_replaces_chunks_after_successful_retry(self):
         media = self.root / "media"
@@ -557,6 +591,8 @@ class CoreTests(unittest.TestCase):
                 "backup_interval_seconds": 20,
                 "cloud_backup_interval_seconds": 55,
                 "nntp_threads": 6,
+                "hourly_post_limit_bytes": 123456,
+                "auto_queue_exclude_patterns": ["*.sample", ".tmp"],
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
                 "encryption_passphrase_env": "BACKUPRR_SECRET",
@@ -586,6 +622,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.backup_interval_seconds, 20)
         self.assertEqual(self.config.cloud_backup_interval_seconds, 55)
         self.assertEqual(self.config.nntp_threads, 6)
+        self.assertEqual(self.config.hourly_post_limit_bytes, 123456)
+        self.assertEqual(self.config.auto_queue_exclude_patterns, ["*.sample", ".tmp"])
         self.assertTrue(self.config.zip_subfolders)
         self.assertTrue(self.config.encrypt_bodies)
         self.assertEqual(self.config.endpoints, [str(self.root / "media")])

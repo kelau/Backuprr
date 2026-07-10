@@ -72,6 +72,14 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         return None
     file_id = int(item["file_id"])
     original = Path(item["path"])
+    hourly_limit = int(getattr(config, "hourly_post_limit_bytes", 0) or 0)
+    if hourly_limit > 0:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0).isoformat()
+        used = db.transfer_bytes_since("upload", cutoff)
+        item_size = int(item["size"] or 0)
+        if used >= hourly_limit or (used > 0 and used + item_size > hourly_limit):
+            db.log("debug", "post.throttle", f"Hourly post limit reached: {used} of {hourly_limit} bytes used")
+            return None
     if not original.exists():
         db.update_file_state(file_id, "failed")
         db.set_queue_status(file_id, "failed")
@@ -116,6 +124,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                 posted_count += 1
                 posted_bytes += body_size
                 db.set_queue_progress(file_id, posted_count, posted_bytes)
+                db.record_transfer_sample("upload", body_size)
                 db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
         replaced = db.replace_chunks(file_id, posted_chunks)
         db.set_queue_progress(file_id, replaced, sum(int(chunk["size"]) for chunk in posted_chunks))
@@ -152,6 +161,8 @@ def verify_chunks(db: Database, config: Config, chunks: Iterable[Any]) -> int:
         for future in as_completed(futures):
             chunk_id, file_id, message_id, exists = future.result()
             db.mark_chunk_verified(chunk_id, exists)
+            if exists:
+                db.record_transfer_sample("download", 1)
             db.log("debug" if exists else "warning", "verify.chunk", f"Chunk {message_id} exists={exists}", file_id)
             count += 1
     return count

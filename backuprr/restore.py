@@ -48,6 +48,7 @@ def restore_file(db: Database, config: Config, source_path: str, dest: Optional[
             raw = b"\n".join(article_lines(client.conn.article(chunk["message_id"])))
             msg = email.message_from_bytes(raw)
             payload = msg.get_payload(decode=True) or b""
+            db.record_transfer_sample("download", len(payload))
             output.write(decode_chunk(payload, passphrase))
     if target.resolve() == Path(file_row["path"]).resolve():
         stat = target.stat()
