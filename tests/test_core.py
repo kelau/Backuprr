@@ -67,7 +67,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.12")
+        self.assertEqual(__version__, "0.2.13")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -545,6 +545,12 @@ class CoreTests(unittest.TestCase):
             },
         )
         self.assertEqual(self.config.usenet_hosts[0].password, "secret")
+
+    def test_config_load_accepts_utf8_bom(self):
+        config_path = self.root / "bom-config.json"
+        config_path.write_text('{"database":"test.sqlite3"}', encoding="utf-8-sig")
+        loaded = Config.load(str(config_path))
+        self.assertEqual(loaded.database, "test.sqlite3")
 
     def test_old_env_host_keys_are_ignored_when_loading_hosts(self):
         host = UsenetHost.from_dict(

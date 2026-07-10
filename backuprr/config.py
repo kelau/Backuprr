@@ -75,7 +75,7 @@ class Config:
         config_path = Path(path)
         data: Dict[str, Any] = {}
         if config_path.exists():
-            data = json.loads(config_path.read_text(encoding="utf-8"))
+            data = json.loads(config_path.read_text(encoding="utf-8-sig"))
         hosts = [UsenetHost.from_dict(item) for item in data.pop("usenet_hosts", [])]
         cloud_backups = [CloudBackupTarget.from_dict(item) for item in data.pop("cloud_backups", [])]
         config = cls(**data)
