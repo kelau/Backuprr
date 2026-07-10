@@ -355,6 +355,9 @@ th { color:var(--muted); font-weight:600; background:#fafbfb; }
 .form-grid { display:grid; grid-template-columns:minmax(0,720px); gap:12px; margin-bottom:12px; align-items:start; }
 .field { display:grid; gap:5px; }
 .field span { color:var(--muted); font-size:12px; font-weight:600; }
+.range-field { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; }
+.range-field span { min-width:74px; text-align:right; color:var(--muted); font-size:12px; font-weight:700; }
+.range-field input { padding:0; }
 .full { grid-column:1 / -1; }
 .host-list { display:grid; gap:12px; }
 .host-row, .cloud-row { border:1px solid var(--line); background:#fff; border-radius:8px; padding:12px; }
@@ -843,6 +846,16 @@ function formatBytes(value){
  while(size >= 1024 && index < units.length - 1){ size /= 1024; index++; }
  return `${size.toFixed(index ? 1 : 0)} ${units[index]}`;
 }
+function bytesToGb(value){
+ return Math.round(Number(value || 0) / 1073741824);
+}
+function gbToBytes(value){
+ return Math.round(Number(value || 0) * 1073741824);
+}
+function postLimitLabel(gb){
+ const value = Number(gb || 0);
+ return value <= 0 ? "No limit" : `${value} GB/hour`;
+}
 function formatDateTime(value){
  if(!value) return "";
  const date = new Date(value);
@@ -1067,7 +1080,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128101;</span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
   <label class="field"><span><span class="ui-icon">&#129513;</span>Article size bytes</span><input id="setArticleSize" type="number" min="1" value="${esc(s.article_size)}"></label>
   <label class="field"><span><span class="ui-icon">&#128225;</span>NNTP threads</span><input id="setNntpThreads" type="number" min="1" max="64" value="${esc(s.nntp_threads || 4)}"></label>
-  <label class="field"><span><span class="ui-icon">&#9201;</span>Post limit bytes/hour</span><input id="setHourlyPostLimit" type="number" min="0" value="${esc(s.hourly_post_limit_bytes || 0)}"></label>
+  <label class="field"><span><span class="ui-icon">&#9201;</span>Post limit per hour</span><div class="range-field"><input id="setHourlyPostLimitGb" type="range" min="0" max="1000" step="10" value="${esc(bytesToGb(s.hourly_post_limit_bytes || 0))}" oninput="setHourlyPostLimitLabel.textContent=postLimitLabel(this.value)"><span id="setHourlyPostLimitLabel">${esc(postLimitLabel(bytesToGb(s.hourly_post_limit_bytes || 0)))}</span></div></label>
  </div></div>
  <div id="tabSchedules" class="tab-panel"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#10003;</span>Verify interval days</span><input id="setVerifyDays" type="number" min="1" value="${esc(s.verification_interval_days)}"></label>
@@ -1201,7 +1214,7 @@ async function saveSettings(){
   backup_interval_seconds: Number(setBackupInterval.value),
   cloud_backup_interval_seconds: Number(setCloudBackupInterval.value),
   nntp_threads: Number(setNntpThreads.value),
-  hourly_post_limit_bytes: Number(setHourlyPostLimit.value),
+  hourly_post_limit_bytes: gbToBytes(setHourlyPostLimitGb.value),
   zip_subfolders: setZip.checked,
   encrypt_bodies: setEncrypt.checked,
   encryption_passphrase_env: setPassEnv.value,

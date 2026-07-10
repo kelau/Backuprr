@@ -82,6 +82,14 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM endpoints ORDER BY path").fetchall()
 
+    def endpoint_file_snapshot(self, endpoint_id: int) -> Dict[str, Dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id, path, relative_path, size, mtime_ns, sha256, state FROM files WHERE endpoint_id=?",
+                (endpoint_id,),
+            ).fetchall()
+            return {str(row["path"]): dict(row) for row in rows}
+
     def upsert_file(self, record: Dict[str, Any]) -> int:
         now = utcnow()
         with self.connect() as conn:

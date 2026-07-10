@@ -98,7 +98,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.24")
+        self.assertEqual(__version__, "0.2.25")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -170,6 +170,34 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["path"], str(moved.resolve()))
         self.assertEqual(rows[0]["relative_path"], str(Path("subfolder") / "movie.mkv"))
         self.assertNotEqual(rows[0]["state"], "deleted")
+
+    def test_scan_skips_hashing_unchanged_files(self):
+        media = self.root / "media"
+        media.mkdir()
+        movie = media / "movie.mkv"
+        movie.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        self.assertEqual(scan_all(self.db), 1)
+        with patch("backuprr.scanner.sha256_file", side_effect=AssertionError("unchanged file should not be rehashed")):
+            self.assertEqual(scan_all(self.db), 1)
+
+    def test_scan_updates_moved_file_without_rehash_when_metadata_matches(self):
+        media = self.root / "media"
+        media.mkdir()
+        original = media / "movie.mkv"
+        original.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        self.assertEqual(scan_all(self.db), 1)
+        subfolder = media / "season"
+        subfolder.mkdir()
+        moved = subfolder / "movie.mkv"
+        original.rename(moved)
+        with patch("backuprr.scanner.sha256_file", side_effect=AssertionError("metadata-matched move should not be rehashed")):
+            self.assertEqual(scan_all(self.db), 1)
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT path, relative_path FROM files").fetchone()
+        self.assertEqual(row["path"], str(moved.resolve()))
+        self.assertEqual(row["relative_path"], str(Path("season") / "movie.mkv"))
 
     def test_scan_reconciles_existing_deleted_and_discovered_move_split(self):
         media = self.root / "media"
