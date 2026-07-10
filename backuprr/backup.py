@@ -1,5 +1,6 @@
 import hashlib
 import os
+import shutil
 import subprocess
 import tempfile
 import zipfile
@@ -30,6 +31,8 @@ def prepare_payload(path: Path, config: Config) -> Path:
     if config.par2.get("enabled"):
         command = config.par2.get("command", "par2")
         redundancy = str(config.par2.get("redundancy_percent", 10))
+        if shutil.which(command) is None:
+            raise RuntimeError(f"PAR2 command not found: {command}. Install PAR2 or disable PAR2 recovery files in Settings.")
         subprocess.run([command, "create", f"-r{redundancy}", str(zip_path)], check=True, cwd=str(tempdir))
     return zip_path
 
@@ -80,8 +83,10 @@ def post_next(db: Database, config: Config) -> Optional[int]:
     cleared = db.clear_chunks(file_id)
     if cleared:
         db.log("debug", "post.retry", f"Cleared {cleared} partial chunk records before retrying {original}", file_id)
-    payload = prepare_payload(original, config)
+    payload = original
     try:
+        payload = prepare_payload(original, config)
+
         def post_chunk(chunk_index: int, chunk: bytes) -> tuple[int, str, int, str, str]:
             salt = os.urandom(16)
             body = encode_chunk(chunk, config, salt)

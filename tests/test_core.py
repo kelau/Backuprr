@@ -67,7 +67,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.10")
+        self.assertEqual(__version__, "0.2.11")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -210,6 +210,25 @@ class CoreTests(unittest.TestCase):
             chunks = conn.execute("SELECT message_id FROM chunks WHERE file_id=? ORDER BY chunk_index", (file_id,)).fetchall()
         self.assertTrue(chunks)
         self.assertNotEqual(chunks[0]["message_id"], "<old@example.test>")
+
+    def test_missing_par2_command_fails_queue_item_cleanly(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        self.config.par2 = {"enabled": True, "command": "definitely-missing-par2", "redundancy_percent": 10}
+        with self.assertRaisesRegex(RuntimeError, "PAR2 command not found"):
+            post_next(self.db, self.config)
+        with self.db.connect() as conn:
+            file_row = conn.execute("SELECT state FROM files").fetchone()
+            queue_row = conn.execute("SELECT status FROM queue").fetchone()
+            event = conn.execute("SELECT message FROM events WHERE event_type='post' ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(file_row["state"], "failed")
+        self.assertEqual(queue_row["status"], "failed")
+        self.assertIn("PAR2 command not found", event["message"])
 
     def test_encryption_round_trip(self):
         salt = b"1234567890abcdef"
