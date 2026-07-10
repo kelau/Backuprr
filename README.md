@@ -4,6 +4,8 @@ Backuprr catalogs movie and series folders and backs them up to Usenet without
 keeping permanent local backup archives. It provides the same operations through
 a CLI and an AJAX-enabled Web UI.
 
+![Backuprr Status dashboard](docs/screenshots/status-dashboard.png)
+
 ## Features
 
 - SQLite catalog of watched endpoints and all files below them.

@@ -106,7 +106,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.34")
+        self.assertEqual(__version__, "0.2.35")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
