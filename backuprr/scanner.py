@@ -13,6 +13,11 @@ def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def ensure_readable(path: Path) -> None:
+    with path.open("rb") as handle:
+        handle.read(1)
+
+
 def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
     root = Path(endpoint_path).resolve()
     seen: List[str] = []
@@ -40,7 +45,18 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
         return candidates[0] if len(candidates) == 1 else None
 
     for path in root.rglob("*"):
-        if not path.is_file():
+        try:
+            is_file = path.is_file()
+        except OSError as exc:
+            try:
+                resolved = str(path.resolve())
+            except OSError:
+                resolved = str(path)
+            db.log("warning", "scan.file_error", f"Skipped unreadable file metadata {resolved}: {exc}")
+            db.mark_file_unreadable(resolved, str(exc))
+            seen.append(resolved)
+            continue
+        if not is_file:
             continue
         resolved = str(path.resolve())
         try:
@@ -51,6 +67,13 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
         seen.append(resolved)
         existing = snapshot.get(resolved)
         if existing and existing["state"] != "deleted" and existing["size"] == stat.st_size and existing["mtime_ns"] == stat.st_mtime_ns:
+            if existing["state"] == "queued":
+                try:
+                    ensure_readable(path)
+                except OSError as exc:
+                    db.log("warning", "scan.file_error", f"Skipped unreadable queued file {resolved}: {exc}")
+                    db.mark_file_unreadable(resolved, str(exc))
+                    continue
             unchanged += 1
             count += 1
             continue
@@ -62,6 +85,7 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
                 digest = sha256_file(path)
             except OSError as exc:
                 db.log("warning", "scan.file_error", f"Skipped unreadable file content {resolved}: {exc}")
+                db.mark_file_unreadable(resolved, str(exc))
                 continue
         hashed += 0 if candidate else 1
         file_id = db.upsert_file(

@@ -106,7 +106,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.32")
+        self.assertEqual(__version__, "0.2.33")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -221,6 +221,106 @@ class CoreTests(unittest.TestCase):
         rows = self.db.list_events(["warning"], event_types=["scan.file_error"])
         self.assertEqual(len(rows), 1)
         self.assertIn("Skipped unreadable file content", rows[0]["message"])
+
+    def test_scan_holds_queued_file_when_content_becomes_unreadable(self):
+        media = self.root / "media"
+        media.mkdir()
+        movie = media / "locked.iso"
+        movie.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        self.assertEqual(scan_all(self.db), 1)
+        self.assertEqual(enqueue_unbacked(self.db), 1)
+        movie.write_bytes(b"abcd")
+        with patch("backuprr.scanner.sha256_file", side_effect=PermissionError("locked")):
+            self.assertEqual(scan_all(self.db), 0)
+        with self.db.connect() as conn:
+            file_row = conn.execute("SELECT id, state FROM files WHERE path=?", (str(movie.resolve()),)).fetchone()
+            queue_row = conn.execute("SELECT status, reason FROM queue WHERE file_id=?", (file_row["id"],)).fetchone()
+        self.assertEqual(file_row["state"], "unreadable")
+        self.assertEqual(queue_row["status"], "failed")
+        self.assertEqual(queue_row["reason"], "file-unreadable")
+        self.assertEqual(self.db.next_queue_item(), None)
+
+    def test_scan_holds_unchanged_queued_file_when_read_probe_fails(self):
+        media = self.root / "media"
+        media.mkdir()
+        movie = media / "locked.iso"
+        movie.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with patch("backuprr.scanner.ensure_readable", side_effect=PermissionError("locked")):
+            self.assertEqual(scan_all(self.db), 0)
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT f.state, q.status, q.reason
+                FROM files f
+                JOIN queue q ON q.file_id = f.id
+                WHERE f.path=?
+                """,
+                (str(movie.resolve()),),
+            ).fetchone()
+        self.assertEqual(row["state"], "unreadable")
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["reason"], "file-unreadable")
+
+    def test_scan_holds_queued_file_when_is_file_check_fails(self):
+        media = self.root / "media"
+        media.mkdir()
+        movie = media / "locked.iso"
+        movie.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        original_is_file = Path.is_file
+
+        def fail_locked(path):
+            if path.name == "locked.iso":
+                raise PermissionError("locked")
+            return original_is_file(path)
+
+        with patch.object(Path, "is_file", autospec=True, side_effect=fail_locked):
+            self.assertEqual(scan_all(self.db), 0)
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT f.state, q.status, q.reason
+                FROM files f
+                JOIN queue q ON q.file_id = f.id
+                WHERE f.path=?
+                """,
+                (str(movie.resolve()),),
+            ).fetchone()
+        self.assertEqual(row["state"], "unreadable")
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["reason"], "file-unreadable")
+
+    def test_scan_revives_unreadable_file_after_successful_read(self):
+        media = self.root / "media"
+        media.mkdir()
+        movie = media / "locked.iso"
+        movie.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        movie.write_bytes(b"abcd")
+        with patch("backuprr.scanner.sha256_file", side_effect=PermissionError("locked")):
+            scan_all(self.db)
+        self.assertEqual(scan_all(self.db), 1)
+        self.assertEqual(enqueue_unbacked(self.db), 1)
+        with self.db.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT f.state, q.status, q.reason
+                FROM files f
+                JOIN queue q ON q.file_id = f.id
+                WHERE f.path=?
+                """,
+                (str(movie.resolve()),),
+            ).fetchone()
+        self.assertEqual(row["state"], "queued")
+        self.assertEqual(row["status"], "queued")
+        self.assertEqual(row["reason"], "unbacked")
 
     def test_scan_updates_moved_file_without_rehash_when_metadata_matches(self):
         media = self.root / "media"

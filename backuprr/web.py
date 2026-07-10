@@ -446,10 +446,10 @@ function pageIcon(name){
  return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
 }
 function stateIcon(value){
- return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;"}[String(value || "")] || "&#8226;");
+ return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",unreadable:"&#128274;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;"}[String(value || "")] || "&#8226;");
 }
 function stateTone(value){
- return ({backed_up:"ok",done:"ok",restored:"ok",queued:"warn",posting:"warn",running:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad"}[String(value || "")] || "");
+ return ({backed_up:"ok",done:"ok",restored:"ok",queued:"warn",posting:"warn",running:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad",unreadable:"bad"}[String(value || "")] || "");
 }
 function statePill(value){
  const tone = stateTone(value);

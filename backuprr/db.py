@@ -99,7 +99,7 @@ class Database:
             row = conn.execute("SELECT id, size, mtime_ns, sha256, state FROM files WHERE path = ?", (record["path"],)).fetchone()
             if row:
                 changed = row["size"] != record["size"] or row["mtime_ns"] != record["mtime_ns"] or row["sha256"] != record["sha256"]
-                revived = row["state"] == "deleted"
+                revived = row["state"] in {"deleted", "unreadable"}
                 state = "changed" if changed else record.get("state", "discovered")
                 conn.execute(
                     """
@@ -273,7 +273,7 @@ class Database:
         now = utcnow()
         with self.connect() as conn:
             file_row = conn.execute("SELECT state FROM files WHERE id=?", (file_id,)).fetchone()
-            if not file_row or file_row["state"] in {"backed_up", "deleted", "posting"}:
+            if not file_row or file_row["state"] in {"backed_up", "deleted", "posting", "unreadable"}:
                 return
             row = conn.execute("SELECT COALESCE(MAX(position), 0) + 1 AS next_pos FROM queue").fetchone()
             conn.execute(
@@ -295,7 +295,7 @@ class Database:
                 SELECT q.*, f.path, f.size, f.sha256, f.state FROM queue q
                 JOIN files f ON f.id = q.file_id
                 WHERE q.status='queued'
-                  AND f.state NOT IN ('backed_up', 'deleted', 'posting')
+                  AND f.state NOT IN ('backed_up', 'deleted', 'posting', 'unreadable')
                 ORDER BY q.priority ASC, q.position ASC
                 LIMIT 1
                 """
@@ -309,7 +309,7 @@ class Database:
             params.append(status)
         elif not include_done:
             where_parts.append("q.status NOT IN ('done', 'failed')")
-            where_parts.append("f.state NOT IN ('backed_up', 'failed')")
+            where_parts.append("f.state NOT IN ('backed_up', 'failed', 'unreadable')")
         where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         with self.connect() as conn:
             return conn.execute(
@@ -337,7 +337,7 @@ class Database:
             params.append(status)
         elif not include_done:
             where_parts.append("q.status NOT IN ('done', 'failed')")
-            where_parts.append("f.state NOT IN ('backed_up', 'failed')")
+            where_parts.append("f.state NOT IN ('backed_up', 'failed', 'unreadable')")
         where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
         with self.connect() as conn:
             return int(
@@ -467,7 +467,7 @@ class Database:
         should_queue = False
         with self.connect() as conn:
             file_row = conn.execute("SELECT state FROM files WHERE id=?", (file_id,)).fetchone()
-            if not file_row or file_row["state"] in {"backed_up", "deleted"}:
+            if not file_row or file_row["state"] in {"backed_up", "deleted", "unreadable"}:
                 return
             queue_row = conn.execute("SELECT priority FROM queue WHERE file_id=?", (file_id,)).fetchone()
             if not queue_row:
@@ -491,7 +491,7 @@ class Database:
             rows = conn.execute(
                 """
                 SELECT id FROM files
-                WHERE state NOT IN ('backed_up', 'deleted')
+                WHERE state NOT IN ('backed_up', 'deleted', 'unreadable')
                   AND (path LIKE ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?)
                 ORDER BY relative_path
                 """,
@@ -594,6 +594,30 @@ class Database:
     def update_file_state(self, file_id: int, state: str) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE files SET state=?, updated_at=? WHERE id=?", (state, utcnow(), file_id))
+
+    def mark_file_unreadable(self, path: str, reason: str) -> Optional[int]:
+        now = utcnow()
+        with self.connect() as conn:
+            row = conn.execute("SELECT id, state FROM files WHERE path=?", (path,)).fetchone()
+            if not row:
+                return None
+            file_id = int(row["id"])
+            if row["state"] != "backed_up":
+                conn.execute("UPDATE files SET state='unreadable', updated_at=? WHERE id=?", (now, file_id))
+                conn.execute(
+                    """
+                    UPDATE queue
+                    SET status='failed', reason='file-unreadable',
+                        progress_chunks=0, progress_bytes=0, updated_at=?
+                    WHERE file_id=? AND status IN ('queued', 'posting')
+                    """,
+                    (now, file_id),
+                )
+            conn.execute(
+                "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
+                (now, "warning", "scan.file_error", f"Marked unreadable file on hold: {path}: {reason}", file_id, ""),
+            )
+            return file_id
 
     def mark_restored_backed_up(self, file_id: int, size: int, mtime_ns: int, sha256: str) -> None:
         now = utcnow()
