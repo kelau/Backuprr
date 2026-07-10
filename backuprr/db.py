@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STALE_POSTING_SECONDS = 15 * 60
 
 
@@ -32,10 +32,18 @@ class Database:
     def init(self) -> None:
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO app_meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+
+    def _migrate(self, conn: sqlite3.Connection) -> None:
+        queue_columns = {row["name"] for row in conn.execute("PRAGMA table_info(queue)").fetchall()}
+        if "progress_chunks" not in queue_columns:
+            conn.execute("ALTER TABLE queue ADD COLUMN progress_chunks INTEGER NOT NULL DEFAULT 0")
+        if "progress_bytes" not in queue_columns:
+            conn.execute("ALTER TABLE queue ADD COLUMN progress_bytes INTEGER NOT NULL DEFAULT 0")
 
     def get_meta(self, key: str) -> Optional[str]:
         with self.connect() as conn:
@@ -251,7 +259,8 @@ class Database:
                 INSERT INTO queue(file_id, priority, position, status, reason, created_at, updated_at)
                 VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(file_id) DO UPDATE SET
-                  priority=excluded.priority, status='queued', reason=excluded.reason, updated_at=excluded.updated_at
+                  priority=excluded.priority, status='queued', reason=excluded.reason,
+                  progress_chunks=0, progress_bytes=0, updated_at=excluded.updated_at
                 """,
                 (file_id, priority, row["next_pos"], "queued", reason, now, now),
             )
@@ -284,8 +293,8 @@ class Database:
             return conn.execute(
                 f"""
                 SELECT q.*, f.path, f.size, f.state,
-                       COUNT(c.id) AS posted_chunks,
-                       COALESCE(SUM(c.size), 0) AS posted_bytes
+                       CASE WHEN q.status='posting' THEN q.progress_chunks ELSE COUNT(c.id) END AS posted_chunks,
+                       CASE WHEN q.status='posting' THEN q.progress_bytes ELSE COALESCE(SUM(c.size), 0) END AS posted_bytes
                 FROM queue q
                 JOIN files f ON f.id = q.file_id
                 LEFT JOIN chunks c ON c.file_id = f.id
@@ -360,6 +369,13 @@ class Database:
     def set_queue_status(self, file_id: int, status: str) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE queue SET status=?, updated_at=? WHERE file_id=?", (status, utcnow(), file_id))
+
+    def set_queue_progress(self, file_id: int, chunks: int, bytes_posted: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE queue SET progress_chunks=?, progress_bytes=?, updated_at=? WHERE file_id=?",
+                (max(0, int(chunks)), max(0, int(bytes_posted)), utcnow(), file_id),
+            )
 
     def boost_queue_priority(self, file_id: int, amount: int = 10, reason: str = "manual-priority") -> None:
         should_queue = False
@@ -722,6 +738,8 @@ CREATE TABLE IF NOT EXISTS queue (
   position INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
   reason TEXT NOT NULL,
+  progress_chunks INTEGER NOT NULL DEFAULT 0,
+  progress_bytes INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

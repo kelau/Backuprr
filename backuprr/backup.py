@@ -79,6 +79,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         return file_id
     host = select_host(config, "post")
     db.set_queue_status(file_id, "posting")
+    db.set_queue_progress(file_id, 0, 0)
     db.update_file_state(file_id, "posting")
     payload = original
     try:
@@ -96,6 +97,8 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         max_workers = max(1, int(config.nntp_threads))
         futures = []
         posted_chunks = []
+        posted_count = 0
+        posted_bytes = 0
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backuprr-post") as executor:
             for chunk_index, chunk in enumerate(iter_chunks(payload, config.article_size)):
                 futures.append(executor.submit(post_chunk, chunk_index, chunk))
@@ -110,9 +113,12 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                         "subject": subject,
                     }
                 )
-                db.set_queue_status(file_id, "posting")
+                posted_count += 1
+                posted_bytes += body_size
+                db.set_queue_progress(file_id, posted_count, posted_bytes)
                 db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
         replaced = db.replace_chunks(file_id, posted_chunks)
+        db.set_queue_progress(file_id, replaced, sum(int(chunk["size"]) for chunk in posted_chunks))
         db.log("debug", "post.retry", f"Replaced chunk catalog with {replaced} newly posted chunks for {original}", file_id)
         with db.connect() as conn:
             conn.execute("UPDATE files SET state='backed_up', last_backup_at=?, updated_at=? WHERE id=?", (utcnow(), utcnow(), file_id))
