@@ -775,8 +775,9 @@ tr:hover td { background:var(--row-hover); }
 .tree-row:hover { background:var(--row-hover); }
 .tree-name { flex:1; overflow-wrap:anywhere; }
 .tree-meta { color:var(--muted); font-size:12px; text-align:right; justify-self:end; }
-.tree-actions { display:flex; gap:4px; justify-content:flex-end; white-space:nowrap; }
-.icon-btn { width:30px; height:30px; display:inline-grid; place-items:center; padding:0; }
+.tree-actions { display:flex; gap:2px; justify-content:flex-end; white-space:nowrap; }
+.tree-actions button, .tree-actions summary { min-width:0; }
+.icon-btn { width:28px; height:28px; display:inline-grid; place-items:center; padding:0; }
 .folder > .tree-row { font-weight:600; }
 .hidden { display:none; }
 .muted { color:var(--muted); }
@@ -808,6 +809,7 @@ let page = "Status";
 let settingsCache = null;
 let fileRowsCache = [];
 let operationRowsCache = [];
+let verificationRowsCache = new Map();
 let logLevelSelection = ["error","warning","info"];
 let logEventTypeSelection = [];
 let logPage = 1;
@@ -892,7 +894,7 @@ function stateIcon(value){
  return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",unreadable:"&#128274;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;",unverified:"&#128269;",no_chunks:"&#128230;"}[String(value || "")] || "&#8226;");
 }
 function stateTone(value){
- return ({backed_up:"ok",done:"ok",restored:"ok",verified:"ok",queued:"warn",posting:"warn",running:"warn",unverified:"warn",no_chunks:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad",missing:"bad",unreadable:"bad"}[String(value || "")] || "");
+ return ({backed_up:"ok",done:"ok",restored:"ok",verified:"ok",queued:"warn",posting:"warn",running:"warn",verifying:"warn",restoring:"warn",unverified:"warn",no_chunks:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad",missing:"bad",unreadable:"bad"}[String(value || "")] || "");
 }
 function statePill(value){
  const tone = stateTone(value);
@@ -1143,26 +1145,63 @@ function updateVerificationSelectionState(rows=[]){
   box.indeterminate = tableSelected > 0 && tableSelected < tableIds.length;
  });
 }
+function normalizeVerificationResults(missing, unverified, verified, noChunks){
+ for(const bucket of [missing, unverified, verified, noChunks]){
+  for(const row of (bucket.rows || [])){
+   verificationRowsCache.set(Number(row.id), row);
+  }
+ }
+ const activeIds = new Set(operationRowsCache.filter(op => op.kind === "verify" && op.status === "running" && op.file_id).map(op => Number(op.file_id)));
+ if(!activeIds.size) return {missing, unverified, verified, noChunks};
+ const buckets = [missing, unverified, verified, noChunks];
+ const activeRows = [];
+ for(const bucket of buckets){
+  bucket.rows = (bucket.rows || []).filter(row => {
+   if(activeIds.has(Number(row.id))){
+    activeRows.push({...row, state:"verifying", verification_state:"verifying"});
+    return false;
+   }
+   return true;
+  });
+ }
+ const existing = new Set((unverified.rows || []).map(row => Number(row.id)));
+ for(const activeId of activeIds){
+  if(!activeRows.some(row => Number(row.id) === activeId) && verificationRowsCache.has(activeId)){
+   activeRows.push({...verificationRowsCache.get(activeId), state:"verifying", verification_state:"verifying"});
+  }
+ }
+ for(const row of activeRows){
+  if(!existing.has(Number(row.id))){
+   unverified.rows = [row, ...(unverified.rows || [])];
+   existing.add(Number(row.id));
+  }
+ }
+ return {missing, unverified, verified, noChunks};
+}
 async function verifySelectedFiles(){
  const ids = Array.from(selectedVerificationFiles);
- if(!ids.length) return setVerificationStatus("Select files to verify first.", 0, "bad");
- setVerificationStatus(`Started verification for ${ids.length} selected files.`, 5, "warn");
+ if(!ids.length) return setVerificationStatus("Select files to verify first.", "bad");
+ setVerificationStatus(`Starting verification for ${ids.length} selected file${ids.length === 1 ? "" : "s"}...`, "warn");
  const out = await post("/api/verify/start", { file_ids:ids });
- if(out.error) setVerificationStatus(out.error, 0, "bad");
- else setVerificationStatus(`Verification is running for ${ids.length} selected files.`, 5, "warn");
+ if(out.error) setVerificationStatus(out.error, "bad");
+ else setVerificationStatus(`Verification started for ${ids.length} selected file${ids.length === 1 ? "" : "s"}.`, "warn", true);
  await updateVerificationPage();
 }
 async function verifyAllFiles(){
- setVerificationStatus("Started verification for all due chunks.", 5, "warn");
+ setVerificationStatus("Starting verification for due chunks...", "warn");
  const out = await post("/api/verify/start", { force:true });
- if(out.error) setVerificationStatus(out.error, 0, "bad");
- else setVerificationStatus("Verification is running.", 5, "warn");
+ if(out.error) setVerificationStatus(out.error, "bad");
+ else setVerificationStatus("Verification started.", "warn", true);
  await updateVerificationPage();
 }
-function setVerificationStatus(message, pct=0, tone="warn", indeterminate=false){
+function setVerificationStatus(message, tone="warn", transient=false){
  const target = document.getElementById("verificationStatus");
  if(!target) return;
- target.innerHTML = statusProgressHtml(message, pct, tone, indeterminate);
+ target.className = "async-status";
+ target.innerHTML = statusMessageHtml(message, tone);
+ if(transient) setTimeout(() => {
+  if(target.innerHTML === statusMessageHtml(message, tone)) target.innerHTML = "";
+ }, 3500);
 }
 async function updateTasksPage(){
  const rows = await api("/api/tasks");
@@ -1190,12 +1229,13 @@ async function updateVerificationPage(){
  await refreshOperationProgress();
  verificationTextFilter = document.getElementById("verificationSearch")?.value || verificationTextFilter;
  const q = encodeURIComponent(verificationTextFilter);
- const [missing, unverified, verified, noChunks] = await Promise.all([
+ let [missing, unverified, verified, noChunks] = await Promise.all([
   api(`/api/verification?state=missing&page=${verificationMissingPage}&page_size=${verificationPageSize}&q=${q}`),
   api(`/api/verification?state=unverified&page=${verificationUnverifiedPage}&page_size=${verificationPageSize}&q=${q}`),
   api(`/api/verification?state=verified&page=${verificationVerifiedPage}&page_size=${verificationPageSize}&q=${q}`),
   api(`/api/verification?state=no_chunks&page=${verificationNoChunksPage}&page_size=${verificationPageSize}&q=${q}`)
  ]);
+ ({missing, unverified, verified, noChunks} = normalizeVerificationResults(missing, unverified, verified, noChunks));
  const missingTarget = document.getElementById("verificationMissingRows");
  const unverifiedTarget = document.getElementById("verificationUnverifiedRows");
  const verifiedTarget = document.getElementById("verificationVerifiedRows");
@@ -1580,13 +1620,14 @@ function fileRow(file){
  const hasChunks = Number(file.chunk_count || 0) > 0;
  const checked = selectedFiles.has(Number(file.id)) ? "checked" : "";
  const progress = fileProgress(file);
+ const displayState = activeOperationFor("restore", Number(file.id)) ? "restoring" : file.state;
  return `<li><div class="tree-row file-row">
   <input type="checkbox" class="fileSelect" value="${Number(file.id)}" ${checked} onchange="setFileSelected(${Number(file.id)}, this.checked)">
   <span>&#128196;</span>
   <span class="tree-name">${esc(file.display_name)}</span>
   ${progress}
   <span class="tree-meta">${formatBytes(file.size)}</span>
-  ${statePill(file.state)}
+  ${statePill(displayState)}
   ${verifiedPill(file.last_verify_at)}
   <span class="tree-actions">
   ${canQueue ? `<button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>` : ""}
@@ -1624,18 +1665,19 @@ function operationFor(kind, fileId){
  const matching = operationRowsCache.filter(op => op.kind === kind && Number(op.file_id || 0) === Number(fileId));
  return matching.sort((a,b)=>String(b.updated_at || "").localeCompare(String(a.updated_at || "")))[0] || null;
 }
+function activeOperationFor(kind, fileId){
+ const op = operationFor(kind, fileId);
+ return op && op.status === "running" ? op : null;
+}
 function operationProgressHtml(kind, fileId){
  const op = operationFor(kind, fileId);
- if(!op) return "";
+ if(!op || op.status !== "running") return "";
  const total = Number(op.total || 0);
  const done = Number(op.done || 0);
  const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
- const tone = op.status === "failed" ? "bad" : op.status === "done" ? "ok" : "warn";
  const detail = Number(op.bytes_done || 0) ? ` - ${formatBytes(op.bytes_done)}` : "";
- const label = op.status === "running"
-  ? `${labelize(kind)} ${total ? `${done}/${total}` : "starting"}${detail}`
-  : `${labelize(op.status)}: ${op.message || labelize(kind)}`;
- return `<div class="file-progress"><div class="progress-track"><div class="progress-fill ${tone === "bad" ? "bad" : ""}" style="width:${Math.max(3,pct)}%"></div></div><span>${esc(label)}</span></div>`;
+ const label = `${labelize(kind)} ${total ? `${done}/${total}` : "starting"}${detail}`;
+ return `<div class="file-progress"><div class="progress-track"><div class="progress-fill" style="width:${Math.max(3,pct)}%"></div></div><span>${esc(label)}</span></div>`;
 }
 function fileProgress(file){
  const restoreProgress = operationProgressHtml("restore", Number(file.id));
@@ -1746,49 +1788,54 @@ function statusProgressHtml(message, pct=0, tone="warn", indeterminate=false){
  const width = Math.max(0, Math.min(100, Number(pct || 0)));
  return `<span class="pill ${tone}"><span class="ui-icon">${tone === "ok" ? "&#10003;" : tone === "bad" ? "&#9888;" : "&#9658;"}</span>${esc(message)}</span><div class="progress-track"><div class="progress-fill ${indeterminate ? "indeterminate" : ""}" style="width:${indeterminate ? 42 : width}%"></div></div>`;
 }
-function setRestoreStatus(message, pct=0, tone="warn", indeterminate=false){
+function statusMessageHtml(message, tone="warn"){
+ return `<span class="pill ${tone}"><span class="ui-icon">${tone === "ok" ? "&#10003;" : tone === "bad" ? "&#9888;" : "&#9658;"}</span>${esc(message)}</span>`;
+}
+function setRestoreStatus(message, tone="warn", transient=false){
  const target = document.getElementById("restoreStatus");
  if(target){
   target.className = "async-status";
-  target.innerHTML = statusProgressHtml(message, pct, tone, indeterminate);
+  target.innerHTML = statusMessageHtml(message, tone);
+  if(transient) setTimeout(() => {
+   if(target.innerHTML === statusMessageHtml(message, tone)) target.innerHTML = "";
+  }, 3500);
  }
 }
 async function restoreSelectedFilesMode(mode, destValue=""){
  const selectedRows = Array.from(selectedFileData.values()).filter(row => Number(row.chunk_count || 0) > 0);
  if(!selectedRows.length){
-  setRestoreStatus("Select files with recorded chunks first.", 0, "bad");
+  setRestoreStatus("Select files with recorded chunks first.", "bad");
   return;
  }
  if(mode === "destination" && !destValue){
-  setRestoreStatus("Choose a destination folder first.", 0, "bad");
+  setRestoreStatus("Choose a destination folder first.", "bad");
   return;
  }
  closeDropdowns();
  if(mode === "download"){
   const ids = selectedRows.map(row => `file_id=${encodeURIComponent(row.id)}`).join("&");
-  setRestoreStatus(`Preparing restore zip for ${selectedRows.length} files...`, 35, "warn", true);
+  setRestoreStatus(`Preparing restore zip for ${selectedRows.length} files...`, "warn", true);
   window.open(`/api/restore/download-zip?${ids}`, "_blank");
   return;
  }
  const dest = mode === "destination" ? destValue : "";
  let restored = 0;
- setRestoreStatus(`Starting restore for ${selectedRows.length} files...`, 5, "warn");
+ setRestoreStatus(`Starting restore for ${selectedRows.length} files...`, "warn");
  for(const file of selectedRows){
-  const startPct = Math.round((restored / selectedRows.length) * 100);
   const confidence = await post("/api/restore/confidence", { path:file.path });
   if(confidence.warning && !confirm(`${file.relative_path || file.path}\n${confidence.warning}\nContinue restore?`)){
-   setRestoreStatus(`Skipped ${file.relative_path || file.path}`, startPct, "warn");
+   setRestoreStatus(`Skipped ${file.relative_path || file.path}`, "warn", true);
    continue;
   }
   const out = await post("/api/restore/start", { path:file.path, dest:dest || null });
   if(out.error){
-   setRestoreStatus(out.error, Math.max(startPct, 5), "bad");
+   setRestoreStatus(out.error, "bad");
    return;
   }
   restored++;
-  setRestoreStatus(`Started ${restored} of ${selectedRows.length} restore jobs.`, Math.round((restored / selectedRows.length) * 100), "warn");
+  setRestoreStatus(`Started ${restored} of ${selectedRows.length} restore jobs.`, "warn");
  }
- setRestoreStatus(`Restore jobs started for ${restored} files.`, 100, "ok");
+ setRestoreStatus(`Restore jobs started for ${restored} files.`, "ok", true);
  await updateFilesPage();
 }
 async function restoreCatalogFile(fileId){
@@ -1798,23 +1845,23 @@ async function restoreCatalogFileMode(fileId, mode, destValue=""){
  const file = fileRowsCache.find(row => Number(row.id) === Number(fileId));
  if(!file) return;
  if(mode === "download"){
-  setRestoreStatus(`Preparing browser download for ${file.relative_path || file.path}...`, 35, "warn", true);
+  setRestoreStatus(`Preparing browser download for ${file.relative_path || file.path}...`, "warn", true);
   closeDropdowns();
   window.open(`/api/restore/download?path=${encodeURIComponent(file.path)}`, "_blank");
   return;
  }
  if(mode === "destination" && !destValue){
-  setRestoreStatus("Choose a destination path first.", 0, "bad");
+  setRestoreStatus("Choose a destination path first.", "bad");
   return;
  }
  closeDropdowns();
- setRestoreStatus(`Checking restore confidence for ${file.relative_path || file.path}...`, 15, "warn");
+ setRestoreStatus(`Checking restore confidence for ${file.relative_path || file.path}...`, "warn");
  const confidence = await post("/api/restore/confidence", { path:file.path });
  if(confidence.warning && !confirm(`${confidence.warning}\nContinue restore?`)) return;
  const dest = mode === "destination" ? destValue : "";
- setRestoreStatus(`Starting restore for ${file.relative_path || file.path}...`, 10, "warn");
+ setRestoreStatus(`Starting restore for ${file.relative_path || file.path}...`, "warn");
  const out = await post("/api/restore/start", { path:file.path, dest:dest || null });
- setRestoreStatus(out.error || `Restore started for ${file.relative_path || file.path}.`, out.error ? 10 : 20, out.error ? "bad" : "warn");
+ setRestoreStatus(out.error || `Restore started for ${file.relative_path || file.path}.`, out.error ? "bad" : "warn", !out.error);
  await updateFilesPage();
 }
 async function restoreCatalogFolder(path){
@@ -1823,14 +1870,14 @@ async function restoreCatalogFolder(path){
 async function restoreCatalogFolderMode(path, mode, destValue=""){
  const dest = mode === "destination" ? destValue : "";
  if(mode === "destination" && !dest){
-  setRestoreStatus("Choose a destination folder first.", 0, "bad");
+  setRestoreStatus("Choose a destination folder first.", "bad");
   return;
  }
  closeDropdowns();
- setRestoreStatus(`Starting folder restore for ${path}...`, 10, "warn");
+ setRestoreStatus(`Starting folder restore for ${path}...`, "warn");
  const out = await post("/api/restore/start", { path:path, dest:dest || null, folder:true });
  const count = (out.operation_ids || []).length;
- setRestoreStatus(out.error || `Restore started for ${count} files from ${path}.`, out.error ? 10 : 20, out.error ? "bad" : "warn");
+ setRestoreStatus(out.error || `Restore started for ${count} files from ${path}.`, out.error ? "bad" : "warn", !out.error);
  await updateFilesPage();
 }
 function restoreModePrompt(multiple=false){
