@@ -1516,7 +1516,7 @@ function settingsForm(s){
  </div></div>
  <div id="tabEndpoints" class="tab-panel"><div class="form-grid">
  <label class="field full"><span><span class="ui-icon">&#128193;</span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
-  <label class="field full"><span><span class="ui-icon">&#128683;</span>Auto-queue exclude patterns, one per line</span><textarea id="setAutoQueueExcludePatterns">${esc((s.auto_queue_exclude_patterns || []).join("\n"))}</textarea></label>
+  <label class="field full"><span><span class="ui-icon">&#128683;</span>Auto-queue exclude patterns, one per line. Examples: MP4, .mp4, *.sample, regex:\\.partial$, /Season \\d+/</span><textarea id="setAutoQueueExcludePatterns">${esc((s.auto_queue_exclude_patterns || []).join("\n"))}</textarea></label>
  </div></div>
  <div id="tabUsenet" class="tab-panel"><div class="form-grid">
   <div class="toolbar"><button onclick="addHost()"><span class="ui-icon">&#10133;</span>Add Host</button></div>

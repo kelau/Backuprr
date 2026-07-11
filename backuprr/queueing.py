@@ -1,4 +1,5 @@
 from fnmatch import fnmatch
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -8,15 +9,45 @@ from .db import Database
 
 
 def excluded_by_auto_queue_filter(path: str, relative_path: str, patterns: list[str]) -> bool:
-    names = {Path(path).name.lower(), str(relative_path or "").lower(), str(path or "").lower()}
+    names = {Path(path).name, str(relative_path or ""), str(path or "")}
+    lowered_names = {name.lower() for name in names}
     for raw_pattern in patterns:
-        pattern = raw_pattern.strip().lower()
+        pattern = raw_pattern.strip()
         if not pattern:
             continue
-        extension_pattern = f"*{pattern}" if pattern.startswith(".") else pattern
-        if any(fnmatch(name, extension_pattern) for name in names):
+        regex = regex_from_filter(pattern)
+        if regex and any(regex.search(name) for name in names):
+            return True
+        glob_patterns = glob_patterns_from_filter(pattern)
+        if any(fnmatch(name, glob_pattern) for name in lowered_names for glob_pattern in glob_patterns):
             return True
     return False
+
+
+def regex_from_filter(pattern: str) -> Optional[re.Pattern[str]]:
+    if pattern.lower().startswith(("regex:", "re:")):
+        expression = pattern.split(":", 1)[1].strip()
+    elif len(pattern) >= 2 and pattern.startswith("/") and pattern.endswith("/"):
+        expression = pattern[1:-1]
+    else:
+        return None
+    if not expression:
+        return None
+    try:
+        return re.compile(expression, re.IGNORECASE)
+    except re.error:
+        return None
+
+
+def glob_patterns_from_filter(pattern: str) -> list[str]:
+    lowered = pattern.lower()
+    if any(char in lowered for char in "*?[]"):
+        return [lowered]
+    if lowered.startswith("."):
+        return [f"*{lowered}"]
+    if re.fullmatch(r"[a-z0-9]+", lowered):
+        return [f"*.{lowered}", lowered]
+    return [lowered]
 
 
 def file_is_stable(path: str, size: int, mtime_ns: int, stability_seconds: int) -> bool:

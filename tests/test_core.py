@@ -14,7 +14,7 @@ from backuprr.db import Database
 from backuprr.log_forwarding import build_payload
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
 from backuprr.operations import check_usenet_hosts, dry_run_plan, restore_confidence, restore_plan, run_maintenance, run_restore_drill, test_post_host_article_size
-from backuprr.queueing import enqueue_unbacked, prioritize
+from backuprr.queueing import enqueue_unbacked, excluded_by_auto_queue_filter, prioritize
 from backuprr.restore import restore_file, restore_sample
 from backuprr.scanner import scan_all
 from backuprr.web import hourly_post_budget, thread_usage_summary, throughput_summary
@@ -120,7 +120,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.44")
+        self.assertEqual(__version__, "0.2.45")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -268,6 +268,15 @@ class CoreTests(unittest.TestCase):
                 """
             ).fetchall()
         self.assertEqual([row["relative_path"] for row in queued], ["movie.mkv"])
+
+    def test_auto_queue_exclude_patterns_accept_extension_shorthand_and_regex(self):
+        self.assertTrue(excluded_by_auto_queue_filter("C:/media/trailer.mp4", "trailer.mp4", ["MP4"]))
+        self.assertTrue(excluded_by_auto_queue_filter("C:/media/trailer.MP4", "trailer.MP4", [".mp4"]))
+        self.assertTrue(excluded_by_auto_queue_filter("C:/media/trailer.mp4", "trailer.mp4", ["*.mp4"]))
+        self.assertTrue(excluded_by_auto_queue_filter("C:/media/Season 01/trailer.mkv", "Season 01/trailer.mkv", [r"regex:Season \d+"]))
+        self.assertTrue(excluded_by_auto_queue_filter("C:/media/sample-trailer.mkv", "sample-trailer.mkv", [r"/sample-.+\.mkv$/"]))
+        self.assertFalse(excluded_by_auto_queue_filter("C:/media/movie.mkv", "movie.mkv", ["MP4", r"regex:sample"]))
+        self.assertFalse(excluded_by_auto_queue_filter("C:/media/movie.mkv", "movie.mkv", ["regex:["]))
 
     def test_stats_exclude_deleted_from_active_total(self):
         media = self.root / "media"
