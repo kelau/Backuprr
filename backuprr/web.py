@@ -3,8 +3,10 @@ import math
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from . import __version__
 from .cloud_backup import backup_config_and_database
@@ -178,6 +180,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(rowdicts(self.db.restore_drill_rows(int(query.get("limit", ["50"])[0]))))
         elif parsed.path == "/api/restore/download":
             self.stream_restore_download(query.get("path", [""])[0])
+        elif parsed.path == "/api/restore/download-zip":
+            self.stream_restore_zip([int(item) for item in query.get("file_id", [])])
         elif parsed.path == "/api/verification":
             page = max(1, int(query.get("page", ["1"])[0]))
             page_size = max(1, min(200, int(query.get("page_size", ["25"])[0])))
@@ -338,6 +342,28 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.flush()
         self.db.log("info", "restore.download", f"Downloaded restored copy of {source_path}", int(file_row["id"]))
 
+    def stream_restore_zip(self, file_ids: list[int]) -> None:
+        if not file_ids:
+            self.send_json({"error": "file_id is required"}, 400)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", "attachment; filename*=UTF-8''backuprr-restore.zip")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        writer = ResponseZipWriter(self.wfile)
+        restored = 0
+        with ZipFile(writer, "w", compression=ZIP_DEFLATED) as archive:
+            for file_id in file_ids:
+                file_row = self.db.file_by_id(int(file_id))
+                _, payloads = restored_payloads(self.db, self.config, str(file_row["path"]))
+                name = str(file_row["relative_path"] or Path(file_row["path"]).name).replace("\\", "/")
+                with archive.open(name, "w") as entry:
+                    for payload in payloads:
+                        entry.write(payload)
+                restored += 1
+        self.db.log("info", "restore.download", f"Downloaded restore zip with {restored} files")
+
     def all_tasks(self) -> list[dict]:
         return (
             self.monitor.tasks()
@@ -370,6 +396,27 @@ class Handler(BaseHTTPRequestHandler):
                 time.sleep(1)
         except (BrokenPipeError, ConnectionError):
             return
+
+
+class ResponseZipWriter:
+    def __init__(self, handle: Any):
+        self.handle = handle
+        self.offset = 0
+
+    def write(self, data: bytes) -> int:
+        self.handle.write(data)
+        self.handle.flush()
+        self.offset += len(data)
+        return len(data)
+
+    def tell(self) -> int:
+        return self.offset
+
+    def flush(self) -> None:
+        self.handle.flush()
+
+    def seekable(self) -> bool:
+        return False
 
 
 def run_web(config: Config, db: Database, host: str, port: int) -> None:
@@ -525,7 +572,7 @@ tr:hover td { background:var(--row-hover); }
 .tree ul { list-style:none; margin:0; padding-left:20px; }
 .tree li { margin:2px 0; }
 .tree-row { display:flex; align-items:center; gap:8px; min-height:32px; padding:4px 6px; border-radius:6px; }
-.tree-row.file-row, .tree-row.folder-row, .tree-header { display:grid; grid-template-columns:24px 24px minmax(260px,1fr) minmax(92px,120px) minmax(120px,140px) minmax(118px,140px) minmax(180px,230px) minmax(132px,max-content); gap:8px; align-items:center; min-width:1000px; }
+.tree-row.file-row, .tree-row.folder-row, .tree-header { display:grid; grid-template-columns:24px 24px minmax(260px,1fr) minmax(180px,230px) minmax(92px,120px) minmax(120px,140px) minmax(118px,140px) minmax(132px,max-content); gap:8px; align-items:center; min-width:1000px; }
 .tree-header { color:var(--muted); font-size:12px; font-weight:800; text-transform:uppercase; background:var(--table-head-bg); border:1px solid var(--line); border-radius:6px; padding:7px 6px; margin-bottom:6px; }
 .tree-row:hover { background:var(--row-hover); }
 .tree-name { flex:1; overflow-wrap:anywhere; }
@@ -537,7 +584,7 @@ tr:hover td { background:var(--row-hover); }
 .muted { color:var(--muted); }
 .error { color:var(--bad); }
 pre { white-space:pre-wrap; background:var(--panel); border:1px solid var(--line); padding:12px; border-radius:6px; }
-@media (max-width:1100px) { .tree-row.file-row, .tree-row.folder-row, .tree-header { grid-template-columns:24px 24px minmax(180px,1fr) minmax(92px,auto) minmax(110px,auto) minmax(120px,max-content); min-width:760px; } .tree-row.file-row > :nth-child(7), .tree-row.folder-row > :nth-child(7), .tree-header > :nth-child(7) { display:none; } .tree-actions { grid-column:auto; } }
+@media (max-width:1100px) { .tree-row.file-row, .tree-row.folder-row, .tree-header { grid-template-columns:24px 24px minmax(180px,1fr) minmax(140px,auto) minmax(92px,auto) minmax(120px,max-content); min-width:760px; } .tree-row.file-row > :nth-child(7), .tree-row.folder-row > :nth-child(7), .tree-header > :nth-child(7) { display:none; } .tree-actions { grid-column:auto; } }
 @media (max-width:860px) { header { position:relative; } .app-shell { display:block; } .sidebar { border-right:0; border-bottom:1px solid var(--line); } nav { display:grid; grid-template-columns:repeat(2,1fr); } .side-footer { display:none; } .toolbar-grid { grid-template-columns:1fr; } }
 </style>
 </head>
@@ -581,6 +628,7 @@ let verificationTextFilter = "";
 let selectedFiles = new Set();
 let selectedFileData = new Map();
 let selectedVerificationFiles = new Set();
+let settingsDirty = false;
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
@@ -678,11 +726,22 @@ function connectChanges(){
   if(previous) refreshPageForChanges(previous, token);
   else refreshCurrentLivePage();
  });
- eventSource.onerror = () => { document.querySelectorAll(".push-state").forEach(el => el.textContent = "Waiting for change stream"); };
+ eventSource.onerror = () => {};
 }
 function pushLabel(){
- return `<span class="muted push-note push-state"><span class="ui-icon">&#128225;</span>Live updates on change</span>`;
+ return "";
 }
+function closeDropdowns(){
+ document.querySelectorAll("details.dropdown[open]").forEach(dropdown => dropdown.removeAttribute("open"));
+}
+document.addEventListener("click", event => {
+ document.querySelectorAll("details.dropdown[open]").forEach(dropdown => {
+  if(!dropdown.contains(event.target)) dropdown.removeAttribute("open");
+ });
+});
+document.addEventListener("keydown", event => {
+ if(event.key === "Escape") closeDropdowns();
+});
 function multiSelectDropdown(label, cls, options, selected, renderer=""){
  const summary = selected.length === options.length ? `All ${label}` : `${label}: ${selected.length}`;
  return `<details class="dropdown"><summary>${esc(summary)}</summary><div class="dropdown-menu">${options.map(option => {
@@ -707,9 +766,9 @@ async function render(){
    <label><input id="showDeletedFiles" type="checkbox" onchange="filesPage=1;updateFilesPage()"> <span class="ui-icon">&#128465;</span>Show deleted</label>
    <label><input id="selectAllFiles" type="checkbox" onchange="toggleSelectAllFiles(this.checked)"> Select page</label>
    <button onclick="boostSelectedFiles()"><span class="ui-icon">&#8593;</span>Bump selected</button>
-   <button onclick="restoreSelectedFiles()"><span class="ui-icon">&#8635;</span>Restore selected</button>
+   ${selectedRestoreDropdown()}
    ${pushLabel()}
-  </div><div id="filesTree"></div><div id="filesSelectionSummary" class="selection-summary"></div>`;
+  </div><div id="restoreStatus" class="muted"></div><div id="filesTree"></div><div id="filesSelectionSummary" class="selection-summary"></div>`;
   await updateFilesPage();
  }
  if(page==="Search"){
@@ -749,7 +808,7 @@ async function render(){
   c.innerHTML = `<div id="operationsPanel"></div>`;
   await updateOperationsPage();
  }
- if(page==="Settings"){ settingsCache = await loadSettings(); c.innerHTML = settingsForm(settingsCache); }
+ if(page==="Settings"){ settingsCache = await loadSettings(); c.innerHTML = settingsForm(settingsCache); initSettingsDirtyTracking(); }
  if(page==="About"){ c.innerHTML = `<h1><span class="ui-icon">&#128230;</span>Backuprr</h1><p><span class="ui-icon">&#128278;</span>Version <span id="aboutVersion"></span></p><p><span class="ui-icon">&#128274;</span>Catalog media folders, post obfuscated Usenet backups, verify article availability, and restore files when needed.</p>`; const s=await api("/api/status"); document.getElementById("aboutVersion").textContent=s.version; }
 }
 async function refreshCurrentLivePage(){
@@ -776,7 +835,6 @@ async function refreshPageForChanges(previous, token){
  if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged)) await updateVerificationPage();
  if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged || transferChanged)) await updateStatisticsPage();
  if(page==="Operations" && (eventsChanged || tasksChanged || transferChanged)) await updateOperationsPage();
- document.querySelectorAll(".push-state").forEach(el => el.textContent = "Updated after change");
 }
 async function updateStatusPage(){
  const s = await api("/api/status");
@@ -1240,7 +1298,7 @@ function fileTree(rows, showDeleted=false){
   }
   node.files.push({...row, display_name: parts[parts.length - 1] || row.path});
  }
- return `<div class="tree"><div class="tree-header"><span></span><span></span><span>Name</span><span>Size</span><span>State</span><span>Verification</span><span>Progress</span><span>Actions</span></div><ul>${treeNode(root, "", showDeleted)}</ul></div>`;
+ return `<div class="tree"><div class="tree-header"><span></span><span></span><span>Name</span><span>Progress</span><span>Size</span><span>State</span><span>Verification</span><span>Actions</span></div><ul>${treeNode(root, "", showDeleted)}</ul></div>`;
 }
 function treeNode(node, prefix, showDeleted){
  const dirs = Object.keys(node.dirs).sort((a,b)=>a.localeCompare(b));
@@ -1248,8 +1306,9 @@ function treeNode(node, prefix, showDeleted){
   const path = prefix ? prefix+"/"+name : name;
   const state = folderState(node.dirs[name]);
   const canRestore = folderChunkCount(node.dirs[name]) > 0;
+  const canPrioritize = folderCanPrioritize(node.dirs[name]);
   const ids = collectNodeFiles(node.dirs[name]).map(file => Number(file.id));
-  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row folder-row"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span class="tree-meta">${countFiles(node.dirs[name])} files / ${formatBytes(node.dirs[name].total_size || 0)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span></span><span class="tree-actions"><button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button>${canRestore ? folderRestoreDropdown(path) : ""}</span></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
+  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row folder-row"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span></span><span class="tree-meta">${countFiles(node.dirs[name])} files / ${formatBytes(node.dirs[name].total_size || 0)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span class="tree-actions">${canPrioritize ? `<button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
  }).join("");
  const fileHtml = node.files.sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name))).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
@@ -1267,6 +1326,9 @@ function folderState(node){
  if(files.some(file => ["failed","missing_chunks"].includes(file.state))) return "missing_chunks";
  if(files.some(file => ["queued","posting"].includes(file.state))) return "queued";
  return "discovered";
+}
+function folderCanPrioritize(node){
+ return collectNodeFiles(node).filter(file => file.state !== "deleted").some(file => file.state !== "backed_up");
 }
 function folderVerifiedPill(node){
  const files = collectNodeFiles(node).filter(file => file.state !== "deleted" && Number(file.chunk_count || 0) > 0);
@@ -1290,10 +1352,10 @@ function fileRow(file){
   <input type="checkbox" class="fileSelect" value="${Number(file.id)}" ${checked} onchange="setFileSelected(${Number(file.id)}, this.checked)">
   <span>&#128196;</span>
   <span class="tree-name">${esc(file.display_name)}</span>
+  ${progress}
   <span class="tree-meta">${formatBytes(file.size)}</span>
   ${statePill(file.state)}
   ${verifiedPill(file.last_verify_at)}
-  ${progress}
   <span class="tree-actions">
   ${canQueue ? `<button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>` : ""}
   ${file.state !== "backed_up" && file.state !== "deleted" ? `<button class="icon-btn" title="Increase queue priority" onclick="boostFile(${Number(file.id)})">&#8593;</button>` : ""}
@@ -1307,11 +1369,18 @@ function restoreDropdown(fileId){
 function folderRestoreDropdown(path){
  return `<details class="dropdown" onclick="event.stopPropagation()"><summary class="icon-btn" title="Restore folder">&#8635;</summary><div class="dropdown-menu restore-destination"><button onclick="restoreCatalogFolderMode(${jsString(path)}, 'origin')">Restore To Origin</button><button onclick="showFolderRestoreDestination(this)">Restore To New Destination</button><div class="hidden"><input placeholder="Destination folder"><button onclick="restoreCatalogFolderMode(${jsString(path)}, 'destination', this.previousElementSibling.value)">Restore</button></div></div></details>`;
 }
+function selectedRestoreDropdown(){
+ return `<details class="dropdown" onclick="event.stopPropagation()"><summary><span class="ui-icon">&#8635;</span>Restore selected</summary><div class="dropdown-menu restore-destination"><button onclick="restoreSelectedFilesMode('origin')">Restore To Origin</button><button onclick="showSelectedRestoreDestination(this)">Restore To New Destination</button><button onclick="restoreSelectedFilesMode('download')">Download Zip</button><div class="hidden"><input placeholder="Destination folder"><button onclick="restoreSelectedFilesMode('destination', this.previousElementSibling.value)">Restore</button></div></div></details>`;
+}
 function showRestoreDestination(fileId){
  const target = document.getElementById(`restoreDest${Number(fileId)}`);
  if(target) target.classList.toggle("hidden");
 }
 function showFolderRestoreDestination(button){
+ const target = button.nextElementSibling;
+ if(target) target.classList.toggle("hidden");
+}
+function showSelectedRestoreDestination(button){
  const target = button.nextElementSibling;
  if(target) target.classList.toggle("hidden");
 }
@@ -1420,26 +1489,50 @@ async function boostSelectedFiles(){
  await updateFilesPage();
 }
 async function restoreSelectedFiles(){
+ return restoreSelectedFilesMode("origin");
+}
+function setRestoreStatus(message, tone="muted"){
+ const target = document.getElementById("restoreStatus");
+ if(target){
+  target.className = tone;
+  target.textContent = message;
+ }
+}
+async function restoreSelectedFilesMode(mode, destValue=""){
  const selectedRows = Array.from(selectedFileData.values()).filter(row => Number(row.chunk_count || 0) > 0);
- if(!selectedRows.length) return alert("Select files with recorded chunks first");
- const mode = restoreModePrompt(selectedRows.length > 1);
- if(!mode) return;
- if(mode === "download" && selectedRows.length > 1 && !confirm(`Open ${selectedRows.length} browser downloads?`)) return;
- const dest = mode === "destination" ? prompt("Restore destination folder", "") : "";
+ if(!selectedRows.length){
+  setRestoreStatus("Select files with recorded chunks first.", "error");
+  return alert("Select files with recorded chunks first");
+ }
+ if(mode === "destination" && !destValue){
+  setRestoreStatus("Choose a destination folder first.", "error");
+  return alert("Choose a destination folder first");
+ }
+ closeDropdowns();
+ if(mode === "download"){
+  const ids = selectedRows.map(row => `file_id=${encodeURIComponent(row.id)}`).join("&");
+  setRestoreStatus(`Preparing restore zip for ${selectedRows.length} files...`);
+  window.open(`/api/restore/download-zip?${ids}`, "_blank");
+  return;
+ }
+ const dest = mode === "destination" ? destValue : "";
  let restored = 0;
+ setRestoreStatus(`Restoring ${selectedRows.length} files...`);
  for(const file of selectedRows){
-  if(mode === "download"){
-   window.open(`/api/restore/download?path=${encodeURIComponent(file.path)}`, "_blank");
-   restored++;
+  setRestoreStatus(`Restoring ${restored + 1} of ${selectedRows.length}: ${file.relative_path || file.path}`);
+  const confidence = await post("/api/restore/confidence", { path:file.path });
+  if(confidence.warning && !confirm(`${file.relative_path || file.path}\n${confidence.warning}\nContinue restore?`)){
+   setRestoreStatus(`Skipped ${file.relative_path || file.path}`);
    continue;
   }
-  const confidence = await post("/api/restore/confidence", { path:file.path });
-  if(confidence.warning && !confirm(`${file.relative_path || file.path}\n${confidence.warning}\nContinue restore?`)) continue;
   const out = await post("/api/restore", { path:file.path, dest:dest || null });
-  if(out.error) return alert(out.error);
+  if(out.error){
+   setRestoreStatus(out.error, "error");
+   return alert(out.error);
+  }
   restored++;
  }
- alert(`Restored ${restored} files`);
+ setRestoreStatus(`Restored ${restored} files.`, "muted");
 }
 async function restoreCatalogFile(fileId){
  return restoreCatalogFileMode(fileId, "origin");
@@ -1448,14 +1541,23 @@ async function restoreCatalogFileMode(fileId, mode, destValue=""){
  const file = fileRowsCache.find(row => Number(row.id) === Number(fileId));
  if(!file) return;
  if(mode === "download"){
+  setRestoreStatus(`Preparing browser download for ${file.relative_path || file.path}...`);
+  closeDropdowns();
   window.open(`/api/restore/download?path=${encodeURIComponent(file.path)}`, "_blank");
   return;
  }
+ if(mode === "destination" && !destValue){
+  setRestoreStatus("Choose a destination path first.", "error");
+  return alert("Choose a destination path first");
+ }
+ closeDropdowns();
+ setRestoreStatus(`Checking restore confidence for ${file.relative_path || file.path}...`);
  const confidence = await post("/api/restore/confidence", { path:file.path });
  if(confidence.warning && !confirm(`${confidence.warning}\nContinue restore?`)) return;
  const dest = mode === "destination" ? destValue : "";
- if(mode === "destination" && !dest) return alert("Choose a destination path first");
+ setRestoreStatus(`Restoring ${file.relative_path || file.path}...`);
  const out = await post("/api/restore", { path:file.path, dest:dest || null });
+ setRestoreStatus(out.error || `Restored to ${out.target}`, out.error ? "error" : "muted");
  alert(out.error || `Restored to ${out.target}`);
 }
 async function restoreCatalogFolder(path){
@@ -1463,8 +1565,14 @@ async function restoreCatalogFolder(path){
 }
 async function restoreCatalogFolderMode(path, mode, destValue=""){
  const dest = mode === "destination" ? destValue : "";
- if(mode === "destination" && !dest) return alert("Choose a destination folder first");
+ if(mode === "destination" && !dest){
+  setRestoreStatus("Choose a destination folder first.", "error");
+  return alert("Choose a destination folder first");
+ }
+ closeDropdowns();
+ setRestoreStatus(`Restoring folder ${path}...`);
  const out = await post("/api/restore", { path:path, dest:dest || null, folder:true });
+ setRestoreStatus(out.error || `Restored ${out.restored} files from ${path}.`, out.error ? "error" : "muted");
  alert(out.error || `Restored ${out.restored} files`);
 }
 function restoreModePrompt(multiple=false){
@@ -1482,7 +1590,7 @@ async function restore(){ const out = await post("/api/restore",{path:restorePat
 function settingsForm(s){
  return `<div class="settings-header"><div class="tabs">
   ${["General","Usenet","Protection","Schedules","Endpoints","Logging","Cloud"].map((name,index)=>`<button class="${index===0?"primary":""}" onclick="showSettingsTab('${name}', this)">${name}</button>`).join("")}
- </div><div class="toolbar-right"><button class="primary" onclick="saveSettings()"><span class="ui-icon">&#128190;</span>Save Settings</button><button onclick="render()"><span class="ui-icon">&#8635;</span>Reset</button></div></div>
+ </div><div class="toolbar-right"><button id="saveSettingsButton" class="primary" onclick="saveSettings()" disabled><span class="ui-icon">&#128190;</span>Save Settings</button><button id="resetSettingsButton" onclick="render()" disabled><span class="ui-icon">&#8635;</span>Reset</button></div></div>
  <div id="tabGeneral" class="tab-panel active"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#127912;</span>UI template</span><select id="setUiTheme" onchange="applyTheme(this.value)">${themeOptions(s.ui_theme || "harbor_light")}</select></label>
   <label class="field"><span><span class="ui-icon">&#128101;</span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
@@ -1542,6 +1650,22 @@ function showSettingsTab(name, button){
  document.querySelectorAll(".tabs button").forEach(tab => tab.classList.remove("primary"));
  button.classList.add("primary");
 }
+function setSettingsDirty(value){
+ settingsDirty = Boolean(value);
+ const save = document.getElementById("saveSettingsButton");
+ const reset = document.getElementById("resetSettingsButton");
+ if(save) save.disabled = !settingsDirty;
+ if(reset) reset.disabled = !settingsDirty;
+}
+function initSettingsDirtyTracking(){
+ setSettingsDirty(false);
+ const content = document.getElementById("content");
+ if(!content) return;
+ content.querySelectorAll("input, textarea, select").forEach(input => {
+  input.addEventListener("input", () => setSettingsDirty(true));
+  input.addEventListener("change", () => setSettingsDirty(true));
+ });
+}
 function hostRows(hosts){
  return hosts.map((host, index) => hostRow(host, index)).join("") || hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"" }, 0);
 }
@@ -1598,23 +1722,30 @@ function addHost(){
  const index = list.querySelectorAll(".host-row").length;
  list.insertAdjacentHTML("beforeend", hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"" }, index));
  renumberHosts();
+ initSettingsDirtyTracking();
+ setSettingsDirty(true);
 }
 function addCloudTarget(){
  const list = document.getElementById("cloudList");
  const index = list.querySelectorAll(".cloud-row").length;
  list.insertAdjacentHTML("beforeend", cloudRow({ name:"", provider:"local", target:"", command:"", enabled:true }, index));
  renumberCloudTargets();
+ initSettingsDirtyTracking();
+ setSettingsDirty(true);
 }
 function addLogDestination(){
  const list = document.getElementById("logDestinationList");
  const index = list.querySelectorAll(".log-destination-row").length;
  list.insertAdjacentHTML("beforeend", logDestinationRow({ name:"", platform:"loki", url:"", api_key:"", username:"", password:"", min_level:"info", timeout_seconds:5, enabled:false }, index));
  renumberLogDestinations();
+ initSettingsDirtyTracking();
+ setSettingsDirty(true);
 }
 function removeLogDestination(button){
  button.closest(".log-destination-row").remove();
  if(!document.querySelector(".log-destination-row")) addLogDestination();
  renumberLogDestinations();
+ setSettingsDirty(true);
 }
 function renumberLogDestinations(){
  document.querySelectorAll(".log-destination-row").forEach((row, index) => {
@@ -1626,6 +1757,7 @@ function removeCloudTarget(button){
  button.closest(".cloud-row").remove();
  if(!document.querySelector(".cloud-row")) addCloudTarget();
  renumberCloudTargets();
+ setSettingsDirty(true);
 }
 function renumberCloudTargets(){
  document.querySelectorAll(".cloud-row").forEach((row, index) => {
@@ -1637,6 +1769,7 @@ function removeHost(button){
  button.closest(".host-row").remove();
  if(!document.querySelector("#hostList > .host-row")) addHost();
  renumberHosts();
+ setSettingsDirty(true);
 }
 function renumberHosts(){
  document.querySelectorAll("#hostList > .host-row").forEach((row, index) => {
@@ -1715,7 +1848,10 @@ async function saveSettings(){
  const out = await post("/api/settings", payload);
  settingsOut.textContent = JSON.stringify(out, null, 2);
  if(out.ok) settingsCache = out.settings;
- if(out.ok) applyTheme(settingsCache.ui_theme);
+ if(out.ok){
+  applyTheme(settingsCache.ui_theme);
+  setSettingsDirty(false);
+ }
 }
 render();
 </script>

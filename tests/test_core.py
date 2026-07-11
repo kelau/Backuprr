@@ -1,7 +1,9 @@
+import io
 import os
 import email.message
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,7 +19,7 @@ from backuprr.operations import check_usenet_hosts, dry_run_plan, restore_confid
 from backuprr.queueing import enqueue_unbacked, excluded_by_auto_queue_filter, prioritize
 from backuprr.restore import restore_file, restore_sample
 from backuprr.scanner import scan_all
-from backuprr.web import hourly_post_budget, thread_usage_summary, throughput_summary
+from backuprr.web import ResponseZipWriter, hourly_post_budget, thread_usage_summary, throughput_summary
 
 
 class FakePostClient:
@@ -120,7 +122,16 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.45")
+        self.assertEqual(__version__, "0.2.46")
+
+    def test_response_zip_writer_supports_streamed_zip_downloads(self):
+        buffer = io.BytesIO()
+        writer = ResponseZipWriter(buffer)
+        with zipfile.ZipFile(writer, "w") as archive:
+            archive.writestr("sample.txt", b"payload")
+
+        with zipfile.ZipFile(io.BytesIO(buffer.getvalue()), "r") as archive:
+            self.assertEqual(archive.read("sample.txt"), b"payload")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
