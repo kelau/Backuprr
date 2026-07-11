@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 STALE_POSTING_SECONDS = 15 * 60
 
 
@@ -47,6 +47,9 @@ class Database:
         chunk_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
         if "article_size" not in chunk_columns:
             conn.execute("ALTER TABLE chunks ADD COLUMN article_size INTEGER")
+        host_stats_columns = {row["name"] for row in conn.execute("PRAGMA table_info(host_stats)").fetchall()}
+        if host_stats_columns and "article_size_bytes" not in host_stats_columns:
+            conn.execute("ALTER TABLE host_stats ADD COLUMN article_size_bytes INTEGER")
         self._create_operational_tables(conn)
 
     def _create_operational_tables(self, conn: sqlite3.Connection) -> None:
@@ -88,6 +91,7 @@ class Database:
               status TEXT NOT NULL,
               message TEXT NOT NULL DEFAULT '',
               latency_ms INTEGER,
+              article_size_bytes INTEGER,
               checked_at TEXT NOT NULL
             )
             """
@@ -572,11 +576,19 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM backup_runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
-    def record_host_check(self, host_name: str, mode: str, status: str, message: str = "", latency_ms: Optional[int] = None) -> None:
+    def record_host_check(
+        self,
+        host_name: str,
+        mode: str,
+        status: str,
+        message: str = "",
+        latency_ms: Optional[int] = None,
+        article_size_bytes: Optional[int] = None,
+    ) -> None:
         with self.connect() as conn:
             conn.execute(
-                "INSERT INTO host_stats(host_name, mode, status, message, latency_ms, checked_at) VALUES(?,?,?,?,?,?)",
-                (host_name, mode, status, message, latency_ms, utcnow()),
+                "INSERT INTO host_stats(host_name, mode, status, message, latency_ms, article_size_bytes, checked_at) VALUES(?,?,?,?,?,?,?)",
+                (host_name, mode, status, message, latency_ms, article_size_bytes, utcnow()),
             )
 
     def host_health_rows(self, limit: int = 50) -> List[sqlite3.Row]:
@@ -1214,6 +1226,7 @@ CREATE TABLE IF NOT EXISTS host_stats (
   status TEXT NOT NULL,
   message TEXT NOT NULL DEFAULT '',
   latency_ms INTEGER,
+  article_size_bytes INTEGER,
   checked_at TEXT NOT NULL
 );
 

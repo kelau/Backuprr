@@ -7,7 +7,7 @@ from .backup import post_next, verify_due_chunks
 from .cloud_backup import backup_config_and_database
 from .config import Config
 from .db import Database
-from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill
+from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill, test_post_host_article_size
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
 from .scanner import scan_all
@@ -45,6 +45,8 @@ def main(argv=None) -> int:
     sub.add_parser("cloud-backup")
     sub.add_parser("dry-run")
     sub.add_parser("health-check")
+    article_size = sub.add_parser("article-size-test")
+    article_size.add_argument("--host")
     maintenance = sub.add_parser("maintenance")
     maintenance.add_argument("--vacuum", action="store_true")
     sub.add_parser("restore-drill")
@@ -101,6 +103,20 @@ def main(argv=None) -> int:
         print(json.dumps(dry_run_plan(db, config), indent=2))
     elif args.command == "health-check":
         print(json.dumps(check_usenet_hosts(db, config), indent=2))
+    elif args.command == "article-size-test":
+        host_names = [args.host] if args.host else [host.name for host in config.hosts_for_mode("post")]
+        print(
+            json.dumps(
+                [
+                    {
+                        "host_name": host_name,
+                        "article_size_bytes": test_post_host_article_size(db, config, host_name),
+                    }
+                    for host_name in host_names
+                ],
+                indent=2,
+            )
+        )
     elif args.command == "maintenance":
         print(json.dumps(run_maintenance(db, config, vacuum=args.vacuum), indent=2))
     elif args.command == "restore-drill":

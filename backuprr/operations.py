@@ -1,4 +1,6 @@
+import hashlib
 import math
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,6 +10,11 @@ from .config import Config
 from .db import Database, utcnow
 from .restore import restore_sample
 from .usenet import UsenetClient
+
+
+ARTICLE_TEST_MIN_BYTES = 100 * 1024
+ARTICLE_TEST_MAX_BYTES = 5 * 1024 * 1024
+ARTICLE_TEST_STEP_BYTES = 100 * 1024
 
 
 def dry_run_plan(db: Database, config: Config) -> Dict[str, Any]:
@@ -39,15 +46,19 @@ def check_usenet_hosts(db: Database, config: Config) -> List[Dict[str, Any]]:
         started = time.perf_counter()
         status = "ok"
         message = "connection/auth ok"
+        article_size_bytes = None
         try:
             with UsenetClient(host) as client:
                 if host.mode == "read" and client.conn:
                     client.conn.group(config.newsgroup)
+            if host.mode == "post":
+                article_size_bytes = test_post_host_article_size(db, config, host.name)
+                message = f"connection/auth ok; max article size {article_size_bytes} bytes"
         except Exception as exc:
             status = "failed"
             message = str(exc)
         latency_ms = max(1, int((time.perf_counter() - started) * 1000))
-        db.record_host_check(host.name, host.mode, status, message, latency_ms)
+        db.record_host_check(host.name, host.mode, status, message, latency_ms, article_size_bytes)
         results.append(
             {
                 "host_name": host.name,
@@ -55,9 +66,51 @@ def check_usenet_hosts(db: Database, config: Config) -> List[Dict[str, Any]]:
                 "status": status,
                 "message": message,
                 "latency_ms": latency_ms,
+                "article_size_bytes": article_size_bytes,
             }
         )
     return results
+
+
+def test_post_host_article_size(
+    db: Database,
+    config: Config,
+    host_name: str,
+    min_bytes: int = ARTICLE_TEST_MIN_BYTES,
+    max_bytes: int = ARTICLE_TEST_MAX_BYTES,
+    step_bytes: int = ARTICLE_TEST_STEP_BYTES,
+) -> int:
+    hosts = [host for host in config.hosts_for_mode("post") if host.name == host_name]
+    if not hosts:
+        raise RuntimeError(f"No post host named {host_name}")
+    host = hosts[0]
+    low_units = max(1, math.ceil(min_bytes / step_bytes))
+    high_units = max(low_units, max_bytes // step_bytes)
+    best = 0
+    last_error = ""
+    while low_units <= high_units:
+        mid = (low_units + high_units) // 2
+        size = mid * step_bytes
+        try:
+            post_article_size_probe(host, config.newsgroup, size)
+            best = size
+            low_units = mid + 1
+        except Exception as exc:
+            last_error = str(exc)
+            high_units = mid - 1
+    if best <= 0:
+        raise RuntimeError(f"Article size probe failed at minimum {min_bytes} bytes: {last_error}")
+    db.record_host_check(host.name, host.mode, "article_size", f"max article size {best} bytes", article_size_bytes=best)
+    db.log("info", "host.article_size", f"{host.name} supports article bodies up to {best} bytes")
+    return best
+
+
+def post_article_size_probe(host, newsgroup: str, size: int) -> None:
+    token = hashlib.sha256(f"{host.name}:{size}:{time.time()}:{os.urandom(8).hex()}".encode()).hexdigest()[:32]
+    subject = f"[backuprr-size-probe-{token}] ({size})"
+    body = bytes((index % 251 for index in range(size)))
+    with UsenetClient(host) as client:
+        client.post(newsgroup, subject, body)
 
 
 def run_maintenance(db: Database, config: Config, vacuum: bool = False) -> Dict[str, Any]:

@@ -31,6 +31,8 @@ a CLI and an AJAX-enabled Web UI.
   queue/file summaries, and simple charts.
 - Operations page and CLI commands for worker pause/resume, provider health
   checks, dry-run planning, database maintenance, and restore drills.
+- Automatic post-host article-size probes to learn the largest body size the
+  provider accepts before tuning large-scale backup chunking.
 - Backup run history, host health history, maintenance history, and restore
   drill history for production troubleshooting.
 - Chunk-level hourly throttling, resumable posts, and retry/failover across
@@ -108,6 +110,7 @@ backuprr post-next --config config.json
 backuprr verify --config config.json
 backuprr dry-run --config config.json
 backuprr health-check --config config.json
+backuprr article-size-test --config config.json
 backuprr maintenance --vacuum --config config.json
 backuprr restore-drill --config config.json
 backuprr pause backup --config config.json
@@ -127,6 +130,10 @@ At multi-terabyte scale, chunk row count is the main durable catalog cost. Use
 larger article sizes, such as 2-5 MiB where your provider accepts them, to
 reduce chunk rows. Keep compact chunk metadata enabled unless you are debugging
 subject/hash generation.
+
+The provider health check automatically posts disposable obfuscated probe
+articles to each configured post host and records the largest accepted article
+body size. You can run only that probe with `backuprr article-size-test`.
 
 Body encryption uses a passphrase-derived HMAC-SHA256 keystream implemented with
 the Python standard library. For high-assurance environments, integrate a

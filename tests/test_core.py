@@ -12,7 +12,7 @@ from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
-from backuprr.operations import dry_run_plan, restore_confidence, run_maintenance, run_restore_drill
+from backuprr.operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill, test_post_host_article_size
 from backuprr.queueing import enqueue_unbacked, prioritize
 from backuprr.restore import restore_file, restore_sample
 from backuprr.scanner import scan_all
@@ -38,6 +38,17 @@ class CountingPostClient(FakePostClient):
 
     def post(self, newsgroup, subject, body):
         self.__class__.posts.append((subject, body))
+        return super().post(newsgroup, subject, body)
+
+
+class LimitedPostClient(FakePostClient):
+    max_size = 300 * 1024
+    attempts = []
+
+    def post(self, newsgroup, subject, body):
+        self.__class__.attempts.append(len(body))
+        if len(body) > self.__class__.max_size:
+            raise RuntimeError("article too large")
         return super().post(newsgroup, subject, body)
 
 
@@ -107,7 +118,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.37")
+        self.assertEqual(__version__, "0.2.38")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -130,6 +141,33 @@ class CoreTests(unittest.TestCase):
         self.assertIn("host_stats", tables)
         self.assertIn("maintenance_runs", tables)
         self.assertIn("restore_drills", tables)
+
+    def test_article_size_probe_records_largest_supported_size(self):
+        LimitedPostClient.max_size = 300 * 1024
+        LimitedPostClient.attempts = []
+        with patch("backuprr.operations.UsenetClient", LimitedPostClient):
+            size = test_post_host_article_size(
+                self.db,
+                self.config,
+                "post",
+                min_bytes=100 * 1024,
+                max_bytes=500 * 1024,
+                step_bytes=100 * 1024,
+            )
+        self.assertEqual(size, 300 * 1024)
+        self.assertIn(300 * 1024, LimitedPostClient.attempts)
+        health = self.db.host_health_rows()
+        self.assertEqual(health[0]["status"], "article_size")
+        self.assertEqual(health[0]["article_size_bytes"], 300 * 1024)
+
+    def test_health_check_runs_article_size_probe_for_post_hosts(self):
+        LimitedPostClient.max_size = 200 * 1024
+        LimitedPostClient.attempts = []
+        with patch("backuprr.operations.UsenetClient", LimitedPostClient):
+            results = check_usenet_hosts(self.db, self.config)
+        self.assertEqual(results[0]["status"], "ok")
+        self.assertEqual(results[0]["article_size_bytes"], 200 * 1024)
+        self.assertIn("max article size", results[0]["message"])
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"

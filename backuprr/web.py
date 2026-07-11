@@ -11,7 +11,7 @@ from .cloud_backup import backup_config_and_database
 from .config import Config, update_config
 from .db import Database
 from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, MaintenanceMonitor, RestoreDrillMonitor
-from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill
+from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill, test_post_host_article_size
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
 
@@ -240,6 +240,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "paused": self.db.paused_kinds()})
             elif parsed.path == "/api/health/check":
                 self.send_json({"hosts": check_usenet_hosts(self.db, self.config)})
+            elif parsed.path == "/api/health/article-size":
+                host_names = data.get("hosts") or [host.name for host in self.config.hosts_for_mode("post")]
+                results = []
+                for host_name in host_names:
+                    results.append(
+                        {
+                            "host_name": str(host_name),
+                            "article_size_bytes": test_post_host_article_size(self.db, self.config, str(host_name)),
+                        }
+                    )
+                self.send_json({"hosts": results})
             elif parsed.path == "/api/maintenance/run":
                 self.send_json(run_maintenance(self.db, self.config, vacuum=bool(data.get("vacuum"))))
             elif parsed.path == "/api/restore-drill/run":
@@ -477,10 +488,10 @@ function table(rows, cols){
  rows.map(r=>`<tr>${cols.map(c=>`<td>${formatCellHtml(c, r[c], r)}</td>`).join("")}</tr>`).join("")+"</tbody></table>";
 }
 function formatCell(col, value){
- return ["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked"].includes(col) ? formatBytes(value) : value;
+ return ["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked","article_size_bytes"].includes(col) ? formatBytes(value) : value;
 }
 function formatCellHtml(col, value, row={}){
- if(["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked"].includes(col)) return esc(formatBytes(value));
+ if(["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked","article_size_bytes"].includes(col)) return esc(formatBytes(value));
  if(["ts","created_at","updated_at","last_backup_at","last_verify_at","last_chunk_verify_at","posted_at","verified_at","last_run","started_at","finished_at","checked_at"].includes(col)) return esc(formatDateTime(value));
  if(["state","status"].includes(col)) return statePill(value);
  if(col === "level") return levelPill(value);
@@ -893,7 +904,7 @@ function statisticsDashboard(data){
   <h2 class="section-title"><span class="ui-icon">&#128230;</span>Backup runs</h2>
   ${table(backupRuns, ["id","file_id","status","reason","host","started_at","finished_at","chunks_done","chunks_total","bytes_done","bytes_total","error"])}
   <h2 class="section-title"><span class="ui-icon">&#128225;</span>Host health</h2>
-  ${table(hostHealth, ["host_name","mode","status","latency_ms","checked_at","message"])}
+  ${table(hostHealth, ["host_name","mode","status","article_size_bytes","latency_ms","checked_at","message"])}
   <h2 class="section-title"><span class="ui-icon">&#128736;</span>Maintenance</h2>
   ${table(maintenance, ["kind","started_at","finished_at","result","details"])}
   <h2 class="section-title"><span class="ui-icon">&#8635;</span>Restore drills</h2>
@@ -903,7 +914,7 @@ function statisticsDashboard(data){
 function operationsDashboard(tasks, plan, health, maintenance, drills, runs){
  return `<div class="dashboard">
   <div class="toolbar">
-   <button class="primary" onclick="post('/api/health/check').then(updateOperationsPage)"><span class="ui-icon">&#128225;</span>Check Usenet hosts</button>
+   <button class="primary" onclick="post('/api/health/check').then(updateOperationsPage)"><span class="ui-icon">&#128225;</span>Check hosts + article size</button>
    <button onclick="post('/api/maintenance/run', { vacuum:false }).then(updateOperationsPage)"><span class="ui-icon">&#128736;</span>Prune logs</button>
    <button onclick="post('/api/maintenance/run', { vacuum:true }).then(updateOperationsPage)"><span class="ui-icon">&#128190;</span>Vacuum database</button>
    <button onclick="post('/api/restore-drill/run').then(updateOperationsPage)"><span class="ui-icon">&#8635;</span>Run restore drill</button>
@@ -920,7 +931,7 @@ function operationsDashboard(tasks, plan, health, maintenance, drills, runs){
    ${statCard("Estimated time", plan.estimated_days_at_limit == null ? "No limit" : `${plan.estimated_days_at_limit} days`, "&#9201;")}
   </div>
   <h2 class="section-title"><span class="ui-icon">&#128225;</span>Provider health</h2>
-  ${table(health, ["host_name","mode","status","latency_ms","checked_at","message"])}
+  ${table(health, ["host_name","mode","status","article_size_bytes","latency_ms","checked_at","message"])}
   <h2 class="section-title"><span class="ui-icon">&#128230;</span>Recent backup sessions</h2>
   ${table(runs, ["id","file_id","status","reason","host","chunks_done","chunks_total","bytes_done","bytes_total","error"])}
   <h2 class="section-title"><span class="ui-icon">&#128736;</span>Maintenance history</h2>
