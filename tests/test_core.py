@@ -55,6 +55,14 @@ class LimitedPostClient(FakePostClient):
         return super().post(newsgroup, subject, body)
 
 
+class SocketBlockedPostClient(FakePostClient):
+    attempts = 0
+
+    def post(self, newsgroup, subject, body):
+        self.__class__.attempts += 1
+        raise FakeSocketPermissionError("An attempt was made to access a socket in a way forbidden by its access permissions")
+
+
 class FakeReadClient:
     def __init__(self, host):
         self.host = host
@@ -122,7 +130,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.46")
+        self.assertEqual(__version__, "0.2.48")
 
     def test_response_zip_writer_supports_streamed_zip_downloads(self):
         buffer = io.BytesIO()
@@ -804,6 +812,36 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(file_row["state"], "failed")
         self.assertEqual(queue_row["status"], "failed")
         self.assertIn("PAR2 command not found", event["message"])
+
+    def test_post_next_requeues_when_socket_access_is_blocked(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+
+        SocketBlockedPostClient.attempts = 0
+        with patch("backuprr.backup.UsenetClient", SocketBlockedPostClient):
+            self.assertIsNone(post_next(self.db, self.config))
+
+        with self.db.connect() as conn:
+            file_row = conn.execute("SELECT state FROM files").fetchone()
+            queue_row = conn.execute("SELECT status, reason FROM queue").fetchone()
+            event = conn.execute("SELECT level, message FROM events WHERE event_type='post.network' ORDER BY id DESC LIMIT 1").fetchone()
+            run = conn.execute("SELECT status, error FROM backup_runs ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(file_row["state"], "queued")
+        self.assertEqual(queue_row["status"], "queued")
+        self.assertEqual(queue_row["reason"], "network-blocked")
+        self.assertEqual(event["level"], "warning")
+        self.assertIn("socket access is blocked", event["message"])
+        self.assertEqual(run["status"], "paused")
+        first_attempts = SocketBlockedPostClient.attempts
+
+        with patch("backuprr.backup.UsenetClient", SocketBlockedPostClient):
+            self.assertIsNone(post_next(self.db, self.config))
+        self.assertEqual(SocketBlockedPostClient.attempts, first_attempts)
 
     def test_failed_rebackup_preserves_existing_chunks(self):
         media = self.root / "media"

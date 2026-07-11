@@ -18,6 +18,23 @@ from .db import Database, utcnow
 from .usenet import UsenetClient, obfuscated_subject, select_host
 
 
+NETWORK_BLOCKED_RETRY_SECONDS = 300
+
+
+class PostNetworkBlockedError(RuntimeError):
+    pass
+
+
+def is_socket_permission_error(exc: Exception) -> bool:
+    text = str(exc)
+    return isinstance(exc, OSError) and (
+        getattr(exc, "winerror", None) == 10013
+        or getattr(exc, "errno", None) == 10013
+        or "WinError 10013" in text
+        or "forbidden by its access permissions" in text
+    )
+
+
 def iter_chunks(path: Path, size: int) -> Iterator[bytes]:
     with path.open("rb") as handle:
         for block in iter(lambda: handle.read(size), b""):
@@ -86,6 +103,18 @@ def queued_file_is_stable(item: Any, path: Path, stability_seconds: int) -> bool
     return age_seconds >= stability_seconds
 
 
+def network_blocked_retry_due(item: Any, retry_seconds: int = NETWORK_BLOCKED_RETRY_SECONDS) -> bool:
+    if str(item["reason"] or "") != "network-blocked":
+        return True
+    try:
+        updated_at = datetime.fromisoformat(str(item["updated_at"]))
+    except (TypeError, ValueError):
+        return True
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - updated_at >= timedelta(seconds=retry_seconds)
+
+
 def post_next(db: Database, config: Config) -> Optional[int]:
     item = db.next_queue_item()
     if not item:
@@ -104,6 +133,9 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         db.set_queue_status(file_id, "failed")
         db.log("error", "post", f"Queued file no longer exists: {original}", file_id)
         return file_id
+    if not network_blocked_retry_due(item):
+        db.log("debug", "post.network", f"Waiting before retrying network-blocked post for {original}", file_id)
+        return None
     stability_seconds = int(getattr(config, "file_stability_seconds", 0) or 0)
     if stability_seconds and not queued_file_is_stable(item, original, stability_seconds):
         db.requeue_file(file_id, "file-changing")
@@ -155,6 +187,8 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                     except Exception as exc:
                         last_error = exc
                         db.record_host_check(host.name, host.mode, "failed", str(exc))
+                        if is_socket_permission_error(exc):
+                            raise PostNetworkBlockedError(f"NNTP socket access is blocked by the OS or sandbox ({exc})") from exc
                         db.log("warning", "post.retry", f"Post attempt {attempt + 1}/{attempts} failed on {host.name}: {exc}", file_id)
                 if attempt + 1 < attempts and backoff:
                     time.sleep(backoff)
@@ -257,6 +291,14 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         )
         db.log("info", "post", f"Posted backup for {original}", file_id)
         return file_id
+    except PostNetworkBlockedError as exc:
+        final_chunks = db.chunk_count_for_file(file_id)
+        db.set_queue_progress(file_id, final_chunks, int(locals().get("posted_bytes", 0)))
+        db.requeue_file(file_id, "network-blocked")
+        if run_id is not None:
+            db.finish_backup_run(run_id, "paused", str(exc))
+        db.log("warning", "post.network", f"Posting skipped for {original}: {exc}", file_id)
+        return None
     except Exception as exc:
         db.update_file_state(file_id, "failed")
         db.set_queue_status(file_id, "failed")
