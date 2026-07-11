@@ -489,12 +489,20 @@ tr:hover td { background:var(--row-hover); }
 .mini-progress .progress-track { height:8px; }
 .toolbar-grid { display:grid; grid-template-columns:minmax(220px,1fr) auto auto; gap:8px; align-items:center; margin-bottom:12px; padding:10px; background:var(--toolbar-bg); border:1px solid var(--line); border-radius:6px; box-shadow:var(--shadow); }
 .toolbar-options { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+.toolbar-right { margin-left:auto; display:flex; gap:8px; align-items:center; }
+.dropdown { position:relative; display:inline-block; }
+.dropdown > summary { list-style:none; cursor:pointer; border:1px solid var(--line); background:var(--input-bg); border-radius:4px; padding:8px 10px; font-weight:700; }
+.dropdown > summary::-webkit-details-marker { display:none; }
+.dropdown-menu { position:absolute; right:0; top:calc(100% + 4px); z-index:10; min-width:220px; display:grid; gap:6px; padding:10px; background:var(--panel); border:1px solid var(--line); border-radius:6px; box-shadow:var(--shadow); }
+.dropdown-menu label { justify-content:flex-start; }
+.dropdown-menu button { text-align:left; }
+.restore-destination { display:grid; gap:6px; min-width:260px; }
 .thread-meter { display:flex; align-items:baseline; gap:8px; margin-bottom:10px; }
 .thread-meter b { font-size:32px; }
 .refresh-note { margin-left:auto; }
 .push-note { margin-left:auto; }
 .section-title { margin:16px 0 8px; font-size:16px; }
-.pagination { display:flex; gap:8px; align-items:center; margin:8px 0 14px; }
+.pagination { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0 14px; }
 .form-grid { display:grid; grid-template-columns:minmax(0,720px); gap:12px; margin-bottom:12px; align-items:start; }
 .field { display:grid; gap:5px; }
 .field span { color:var(--muted); font-size:12px; font-weight:700; }
@@ -507,19 +515,21 @@ tr:hover td { background:var(--row-hover); }
 .host-row h3, .cloud-row h3 { margin:0 0 10px; font-size:14px; }
 .host-grid { display:grid; grid-template-columns:minmax(0,1fr); gap:10px; }
 .tabs { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:12px; padding:8px; background:var(--toolbar-bg); border:1px solid var(--line); border-radius:6px; }
+.settings-header { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:12px; }
+.settings-header .tabs { margin-bottom:0; flex:1; }
 .tab-panel { display:none; }
 .tab-panel.active { display:block; }
 .selection-summary { position:sticky; bottom:0; margin-top:12px; background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:10px 12px; box-shadow:0 -10px 24px rgba(0,0,0,.18); }
 .danger { color:var(--bad); }
-.tree { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px; box-shadow:var(--shadow); }
+.tree { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:8px; box-shadow:var(--shadow); overflow:auto; }
 .tree ul { list-style:none; margin:0; padding-left:20px; }
 .tree li { margin:2px 0; }
 .tree-row { display:flex; align-items:center; gap:8px; min-height:32px; padding:4px 6px; border-radius:6px; }
-.tree-row.file-row { display:grid; grid-template-columns:24px 24px minmax(220px,1fr) minmax(86px,110px) minmax(112px,130px) minmax(90px,100px) minmax(104px,130px) minmax(170px,220px) minmax(112px,max-content); gap:8px; align-items:center; }
-.tree-row.folder-row { display:grid; grid-template-columns:24px 24px minmax(220px,1fr) minmax(112px,130px) minmax(104px,130px) minmax(120px,150px) minmax(104px,130px); gap:8px; align-items:center; }
+.tree-row.file-row, .tree-row.folder-row, .tree-header { display:grid; grid-template-columns:24px 24px minmax(260px,1fr) minmax(92px,120px) minmax(120px,140px) minmax(118px,140px) minmax(180px,230px) minmax(132px,max-content); gap:8px; align-items:center; min-width:1000px; }
+.tree-header { color:var(--muted); font-size:12px; font-weight:800; text-transform:uppercase; background:var(--table-head-bg); border:1px solid var(--line); border-radius:6px; padding:7px 6px; margin-bottom:6px; }
 .tree-row:hover { background:var(--row-hover); }
 .tree-name { flex:1; overflow-wrap:anywhere; }
-.tree-meta { color:var(--muted); font-size:12px; }
+.tree-meta { color:var(--muted); font-size:12px; text-align:right; justify-self:end; }
 .tree-actions { display:flex; gap:6px; justify-content:flex-end; }
 .icon-btn { width:32px; height:32px; display:inline-grid; place-items:center; padding:0; }
 .folder > .tree-row { font-weight:600; }
@@ -527,7 +537,7 @@ tr:hover td { background:var(--row-hover); }
 .muted { color:var(--muted); }
 .error { color:var(--bad); }
 pre { white-space:pre-wrap; background:var(--panel); border:1px solid var(--line); padding:12px; border-radius:6px; }
-@media (max-width:1100px) { .tree-row.file-row, .tree-row.folder-row { grid-template-columns:24px 24px minmax(180px,1fr) minmax(92px,auto) minmax(100px,auto); } .tree-row.file-row > :nth-child(n+6):not(.tree-actions), .tree-row.folder-row > :nth-child(n+6):not(.tree-actions) { display:none; } .tree-actions { grid-column:auto; } }
+@media (max-width:1100px) { .tree-row.file-row, .tree-row.folder-row, .tree-header { grid-template-columns:24px 24px minmax(180px,1fr) minmax(92px,auto) minmax(110px,auto) minmax(120px,max-content); min-width:760px; } .tree-row.file-row > :nth-child(7), .tree-row.folder-row > :nth-child(7), .tree-header > :nth-child(7) { display:none; } .tree-actions { grid-column:auto; } }
 @media (max-width:860px) { header { position:relative; } .app-shell { display:block; } .sidebar { border-right:0; border-bottom:1px solid var(--line); } nav { display:grid; grid-template-columns:repeat(2,1fr); } .side-footer { display:none; } .toolbar-grid { grid-template-columns:1fr; } }
 </style>
 </head>
@@ -551,7 +561,6 @@ let settingsCache = null;
 let fileRowsCache = [];
 let logLevelSelection = ["error","warning","info"];
 let logEventTypeSelection = [];
-let logExcludeWebAccess = true;
 let logPage = 1;
 let logPageSize = 100;
 let logTextFilter = "";
@@ -561,20 +570,36 @@ let activeQueuePage = 1;
 let completedQueuePage = 1;
 let failedQueuePage = 1;
 let filesPage = 1;
+let filesPageSize = 100;
+let queuePageSize = 10;
 let verificationMissingPage = 1;
 let verificationUnverifiedPage = 1;
 let verificationVerifiedPage = 1;
 let verificationNoChunksPage = 1;
+let verificationPageSize = 10;
 let verificationTextFilter = "";
 let selectedFiles = new Set();
 let selectedFileData = new Map();
 let selectedVerificationFiles = new Set();
-const queuePageSize = 10;
-const filesPageSize = 100;
 const api = (url, opts={}) => fetch(url, {headers:{"Content-Type":"application/json"}, ...opts}).then(r => r.json());
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
 function jsString(v){ return JSON.stringify(String(v ?? "")).replace(/</g, "\\u003c"); }
+function labelize(value){
+ const text = String(value ?? "").trim();
+ if(!text) return "-";
+ const known = {
+  id:"ID", ts:"Time", file_id:"File ID", relative_path:"Path", event_type:"Event Type", last_verify_at:"Last Verified",
+  last_chunk_verify_at:"Last Chunk Check", no_chunks:"No Chunks", missing_chunks:"Missing Chunks", backed_up:"Backed Up",
+  cloud_backup:"Cloud Backup", restore_drill:"Restore Drill", backup_run_id:"Backup Run ID", app_version:"App Version",
+  article_size:"Article Size", chunk_count:"Chunks", verified_chunks:"Verified", missing_chunks:"Missing",
+  verification_state:"Verification", queue_status:"Queue Status", progress_chunks:"Progress Chunks", progress_bytes:"Progress Bytes",
+  started_at:"Started", finished_at:"Finished", checked_at:"Checked", last_run:"Last Run", last_error:"Last Error",
+  interval_seconds:"Interval", time_until_next_run:"Next Run", last_run_duration:"Duration", bytes_total:"Total", bytes_done:"Done"
+ };
+ if(known[text]) return known[text];
+ return text.replace(/[_-]+/g, " ").replace(/\b\w/g, char => char.toUpperCase());
+}
 function themeOptions(selected){
  return themeTemplates.map(theme => `<option value="${theme.id}" ${theme.id===selected ? "selected" : ""}>${esc(theme.name)}</option>`).join("");
 }
@@ -590,7 +615,7 @@ async function loadSettings(){
 }
 function table(rows, cols){
  if(!rows.length) return "<p class='muted'>No rows.</p>";
- return `<table><thead><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>`+
+ return `<table><thead><tr>${cols.map(c=>`<th>${esc(labelize(c))}</th>`).join("")}</tr></thead><tbody>`+
  rows.map(r=>`<tr>${cols.map(c=>`<td>${formatCellHtml(c, r[c], r)}</td>`).join("")}</tr>`).join("")+"</tbody></table>";
 }
 function formatCell(col, value){
@@ -601,9 +626,10 @@ function formatCellHtml(col, value, row={}){
  if(["ts","created_at","updated_at","last_backup_at","last_verify_at","last_chunk_verify_at","posted_at","verified_at","last_run","started_at","finished_at","checked_at"].includes(col)) return esc(formatDateTime(value));
  if(["state","status","verification_state"].includes(col)) return statePill(value);
  if(col === "level") return levelPill(value);
- if(col === "kind") return iconText(kindIcon(value), value);
+ if(col === "kind") return iconText(kindIcon(value), labelize(value));
  if(col === "progress") return iconText(iconForProgress(row.progress_percent), value);
  if(col === "last_error" && value) return iconText("&#9888;", value, "error");
+ if(["event_type","reason","mode"].includes(col)) return esc(labelize(value));
  return esc(value);
 }
 function iconText(icon, text, cls=""){
@@ -620,13 +646,13 @@ function stateTone(value){
 }
 function statePill(value){
  const tone = stateTone(value);
- return `<span class="pill ${tone}"><span class="ui-icon">${stateIcon(value)}</span>${esc(value || "-")}</span>`;
+ return `<span class="pill ${tone}"><span class="ui-icon">${stateIcon(value)}</span>${esc(labelize(value))}</span>`;
 }
 function levelPill(value){
  const key = String(value || "");
  const tone = ({error:"bad",warning:"warn",info:"info",debug:"debug",verbose:"verbose"}[key] || "");
  const icon = ({error:"&#10060;",warning:"&#9888;",info:"&#8505;",debug:"&#128027;",verbose:"&#128269;"}[key] || "&#8226;");
- return `<span class="pill ${tone}"><span class="ui-icon">${icon}</span>${esc(value || "-")}</span>`;
+ return `<span class="pill ${tone}"><span class="ui-icon">${icon}</span>${esc(labelize(value))}</span>`;
 }
 function kindIcon(value){
  return ({catalog:"&#128193;",backup:"&#128230;",verification:"&#10003;",cloud_backup:"&#9729;",maintenance:"&#128736;",restore_drill:"&#8635;"}[String(value || "")] || "&#9881;");
@@ -657,6 +683,13 @@ function connectChanges(){
 function pushLabel(){
  return `<span class="muted push-note push-state"><span class="ui-icon">&#128225;</span>Live updates on change</span>`;
 }
+function multiSelectDropdown(label, cls, options, selected, renderer=""){
+ const summary = selected.length === options.length ? `All ${label}` : `${label}: ${selected.length}`;
+ return `<details class="dropdown"><summary>${esc(summary)}</summary><div class="dropdown-menu">${options.map(option => {
+  const content = renderer === "levelPill" ? levelPill(option) : esc(labelize(option));
+  return `<label><input class="${cls}" type="checkbox" value="${esc(option)}" ${selected.includes(option) ? "checked" : ""} onchange="logPage=1;updateLogPage()"> ${content}</label>`;
+ }).join("")}</div></details>`;
+}
 async function render(){
  nav();
  connectChanges();
@@ -684,14 +717,13 @@ async function render(){
  }
  if(page==="Log"){
   const eventTypes = await api("/api/log/event-types");
+  if(!logEventTypeSelection.length) logEventTypeSelection = eventTypes.filter(type => type !== "web.access");
   const levels = ["error","warning","info","debug","verbose"];
   c.innerHTML = `<div class="toolbar-grid">
    <input id="logSearch" placeholder="Filter log text" value="${esc(logTextFilter)}" oninput="logTextFilter=this.value;logPage=1;updateLogPage(false)">
-   <div class="toolbar-options">${levels.map(level=>`<label><input class="logLevel" type="checkbox" value="${level}" ${logLevelSelection.includes(level) ? "checked" : ""} onchange="logPage=1;updateLogPage()"> ${levelPill(level)}</label>`).join("")}</div>
-   <div class="toolbar-options">
-    <select id="logEventType" onchange="logPage=1;updateLogPage()"><option value="">All event types</option>${eventTypes.map(type=>`<option value="${esc(type)}" ${logEventTypeSelection.includes(type) ? "selected" : ""}>${esc(type)}</option>`).join("")}</select>
-    <label><input id="hideWebAccess" type="checkbox" ${logExcludeWebAccess ? "checked" : ""} onchange="logPage=1;updateLogPage()"> Hide web.access</label>
-    <select id="logPageSize" onchange="logPageSize=Number(this.value);logPage=1;updateLogPage()"><option value="50" ${logPageSize===50?"selected":""}>50</option><option value="100" ${logPageSize===100?"selected":""}>100</option><option value="250" ${logPageSize===250?"selected":""}>250</option></select>
+    <div class="toolbar-options">
+    ${multiSelectDropdown("Levels", "logLevel", levels, logLevelSelection, "levelPill")}
+    ${multiSelectDropdown("Event Types", "logEventType", eventTypes, logEventTypeSelection)}
     ${pushLabel()}
    </div>
   </div><div id="logRows"></div>`;
@@ -766,7 +798,7 @@ async function updateFilesPage(){
  }
  const target = document.getElementById("filesTree");
  if(target){
-  target.innerHTML = fileTree(fileRowsCache, showDeleted) + paginationControls(result, "filesPage", "updateFilesPage");
+  target.innerHTML = fileTree(fileRowsCache, showDeleted) + paginationControls(result, "filesPage", "updateFilesPage", "filesPageSize");
   target.querySelectorAll("details[data-path]").forEach(details => {
    if(openFolders.has(details.dataset.path)) details.open = true;
   });
@@ -788,19 +820,25 @@ async function updateQueuePage(){
 function pagedTable(result, pageVar, cols){
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || queuePageSize)));
  const pageNo = Number(result.page || 1);
- return table(result.rows || [], cols) + `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);updateQueuePage()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${Number(result.total || 0)} rows</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;updateQueuePage()">Next</button></div>`;
+ return table(result.rows || [], cols) + paginationControls(result, pageVar, "updateQueuePage", "queuePageSize");
 }
 function verificationTable(rows, tableKey){
  if(!rows.length) return "<p class='muted'>No rows.</p>";
- const cols = ["relative_path","state","verification_state","chunk_count","verified_chunks","missing_chunks","last_verify_at","last_chunk_verify_at"];
- return `<table><thead><tr><th><input class="verificationTableSelect" data-table-key="${esc(tableKey)}" type="checkbox" onchange="toggleVerificationTable('${esc(tableKey)}', this.checked)"></th>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>`+
+ const colsByTable = {
+  missing:["relative_path","state","chunk_count","missing_chunks","last_chunk_verify_at"],
+  unverified:["relative_path","state","chunk_count"],
+  verified:["relative_path","state","chunk_count","last_verify_at","last_chunk_verify_at"],
+  no_chunks:["relative_path","state"]
+ };
+ const cols = colsByTable[tableKey] || ["relative_path","state"];
+ return `<table><thead><tr><th><input class="verificationTableSelect" data-table-key="${esc(tableKey)}" type="checkbox" onchange="toggleVerificationTable('${esc(tableKey)}', this.checked)"></th>${cols.map(c=>`<th>${esc(labelize(c))}</th>`).join("")}</tr></thead><tbody>`+
  rows.map(row => `<tr><td><input class="verificationSelect" type="checkbox" value="${Number(row.id)}" ${selectedVerificationFiles.has(Number(row.id)) ? "checked" : ""} onchange="setVerificationSelected(${Number(row.id)}, this.checked)"></td>${cols.map(c=>`<td>${formatCellHtml(c, row[c], row)}</td>`).join("")}</tr>`).join("")+
  "</tbody></table>";
 }
 function verificationPagedTable(result, pageVar, state){
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || 25)));
  const pageNo = Number(result.page || 1);
- return verificationTable(result.rows || [], state) + `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);updateVerificationPage()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${Number(result.total || 0)} ${esc(state.replace("_", " "))}</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;updateVerificationPage()">Next</button></div>`;
+ return verificationTable(result.rows || [], state) + paginationControls(result, pageVar, "updateVerificationPage", "verificationPageSize", `${Number(result.total || 0)} ${labelize(state)}`);
 }
 function setVerificationSelected(fileId, checked){
  if(checked) selectedVerificationFiles.add(Number(fileId));
@@ -856,10 +894,10 @@ async function updateVerificationPage(){
  verificationTextFilter = document.getElementById("verificationSearch")?.value || verificationTextFilter;
  const q = encodeURIComponent(verificationTextFilter);
  const [missing, unverified, verified, noChunks] = await Promise.all([
-  api(`/api/verification?state=missing&page=${verificationMissingPage}&page_size=10&q=${q}`),
-  api(`/api/verification?state=unverified&page=${verificationUnverifiedPage}&page_size=10&q=${q}`),
-  api(`/api/verification?state=verified&page=${verificationVerifiedPage}&page_size=10&q=${q}`),
-  api(`/api/verification?state=no_chunks&page=${verificationNoChunksPage}&page_size=10&q=${q}`)
+  api(`/api/verification?state=missing&page=${verificationMissingPage}&page_size=${verificationPageSize}&q=${q}`),
+  api(`/api/verification?state=unverified&page=${verificationUnverifiedPage}&page_size=${verificationPageSize}&q=${q}`),
+  api(`/api/verification?state=verified&page=${verificationVerifiedPage}&page_size=${verificationPageSize}&q=${q}`),
+  api(`/api/verification?state=no_chunks&page=${verificationNoChunksPage}&page_size=${verificationPageSize}&q=${q}`)
  ]);
  const missingTarget = document.getElementById("verificationMissingRows");
  const unverifiedTarget = document.getElementById("verificationUnverifiedRows");
@@ -889,10 +927,11 @@ async function updateOperationsPage(){
  const target = document.getElementById("operationsPanel");
  if(target) target.innerHTML = operationsDashboard(tasks, plan, health.hosts || [], maintenance || [], drills || [], runs || []);
 }
-function paginationControls(result, pageVar, updateFn){
+function paginationControls(result, pageVar, updateFn, pageSizeVar="", label=""){
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || 1)));
  const pageNo = Number(result.page || 1);
- return `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);${updateFn}()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${Number(result.total || 0)} rows</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;${updateFn}()">Next</button></div>`;
+ const pageSize = pageSizeVar ? `<label class="muted">Rows <select onchange="${pageSizeVar}=Number(this.value);${pageVar}=1;${updateFn}()">${[10,25,50,100,250].map(size=>`<option value="${size}" ${Number(result.page_size || 0)===size ? "selected" : ""}>${size}</option>`).join("")}</select></label>` : "";
+ return `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);${updateFn}()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${esc(label || `${Number(result.total || 0)} rows`)}</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;${updateFn}()">Next</button>${pageSize}</div>`;
 }
 function statusDashboard(status, tasks, speed){
  const stats = status.stats || {};
@@ -1180,14 +1219,12 @@ function secondsFromLabel(label){
 }
 async function updateLogPage(saveSelection=true){
  logLevelSelection = Array.from(document.querySelectorAll(".logLevel:checked")).map(input => input.value);
- logEventTypeSelection = Array.from(document.querySelectorAll("#logEventType")).map(input => input.value).filter(Boolean);
- logExcludeWebAccess = !!document.getElementById("hideWebAccess")?.checked;
+ logEventTypeSelection = Array.from(document.querySelectorAll(".logEventType:checked")).map(input => input.value);
  logTextFilter = document.getElementById("logSearch")?.value || logTextFilter;
  const levels = logLevelSelection.map(level => "level="+encodeURIComponent(level)).join("&");
  const eventTypes = logEventTypeSelection.map(type => "event_type="+encodeURIComponent(type)).join("&");
- const exclude = logExcludeWebAccess ? "exclude_event_type=web.access" : "";
- const result = await api(`/api/log?page=${logPage}&page_size=${logPageSize}&q=${encodeURIComponent(logTextFilter)}&${levels}&${eventTypes}&${exclude}`);
- document.getElementById("logRows").innerHTML = table(result.rows || [], ["id","ts","level","event_type","message","file_id"]) + paginationControls(result, "logPage", "updateLogPage");
+ const result = await api(`/api/log?page=${logPage}&page_size=${logPageSize}&q=${encodeURIComponent(logTextFilter)}&${levels}&${eventTypes}`);
+ document.getElementById("logRows").innerHTML = table(result.rows || [], ["id","ts","level","event_type","message","file_id"]) + paginationControls(result, "logPage", "updateLogPage", "logPageSize");
 }
 async function loadLog(){ await updateLogPage(); }
 function fileTree(rows, showDeleted=false){
@@ -1203,7 +1240,7 @@ function fileTree(rows, showDeleted=false){
   }
   node.files.push({...row, display_name: parts[parts.length - 1] || row.path});
  }
- return `<div class="tree"><ul>${treeNode(root, "", showDeleted)}</ul></div>`;
+ return `<div class="tree"><div class="tree-header"><span></span><span></span><span>Name</span><span>Size</span><span>State</span><span>Verification</span><span>Progress</span><span>Actions</span></div><ul>${treeNode(root, "", showDeleted)}</ul></div>`;
 }
 function treeNode(node, prefix, showDeleted){
  const dirs = Object.keys(node.dirs).sort((a,b)=>a.localeCompare(b));
@@ -1212,7 +1249,7 @@ function treeNode(node, prefix, showDeleted){
   const state = folderState(node.dirs[name]);
   const canRestore = folderChunkCount(node.dirs[name]) > 0;
   const ids = collectNodeFiles(node.dirs[name]).map(file => Number(file.id));
-  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row folder-row"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span class="tree-meta">${countFiles(node.dirs[name])} files &middot; ${formatBytes(node.dirs[name].total_size || 0)}</span><span class="tree-actions"><button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button>${canRestore ? `<button class="icon-btn" title="Restore or download folder" onclick="event.preventDefault();restoreCatalogFolder(${jsString(path)})">&#8635;</button>` : ""}</span></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
+  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row folder-row"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span class="tree-meta">${countFiles(node.dirs[name])} files / ${formatBytes(node.dirs[name].total_size || 0)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span></span><span class="tree-actions"><button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button>${canRestore ? folderRestoreDropdown(path) : ""}</span></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
  }).join("");
  const fileHtml = node.files.sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name))).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
@@ -1255,15 +1292,28 @@ function fileRow(file){
   <span class="tree-name">${esc(file.display_name)}</span>
   <span class="tree-meta">${formatBytes(file.size)}</span>
   ${statePill(file.state)}
-  <span class="tree-meta">${Number(file.chunk_count || 0)} chunks</span>
   ${verifiedPill(file.last_verify_at)}
   ${progress}
   <span class="tree-actions">
   ${canQueue ? `<button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>` : ""}
   ${file.state !== "backed_up" && file.state !== "deleted" ? `<button class="icon-btn" title="Increase queue priority" onclick="boostFile(${Number(file.id)})">&#8593;</button>` : ""}
-  ${hasChunks ? `<button class="icon-btn" title="Restore or download file" onclick="restoreCatalogFile(${Number(file.id)})">&#8635;</button>` : ""}
+  ${hasChunks ? restoreDropdown(Number(file.id)) : ""}
   </span>
  </div></li>`;
+}
+function restoreDropdown(fileId){
+ return `<details class="dropdown" onclick="event.stopPropagation()"><summary class="icon-btn" title="Restore or download">&#8635;</summary><div class="dropdown-menu restore-destination"><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'origin')">Restore To Origin</button><button onclick="showRestoreDestination(${Number(fileId)})">Restore To New Destination</button><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'download')">Download In Browser</button><div id="restoreDest${Number(fileId)}" class="hidden"><input placeholder="Destination path"><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'destination', this.previousElementSibling.value)">Restore</button></div></div></details>`;
+}
+function folderRestoreDropdown(path){
+ return `<details class="dropdown" onclick="event.stopPropagation()"><summary class="icon-btn" title="Restore folder">&#8635;</summary><div class="dropdown-menu restore-destination"><button onclick="restoreCatalogFolderMode(${jsString(path)}, 'origin')">Restore To Origin</button><button onclick="showFolderRestoreDestination(this)">Restore To New Destination</button><div class="hidden"><input placeholder="Destination folder"><button onclick="restoreCatalogFolderMode(${jsString(path)}, 'destination', this.previousElementSibling.value)">Restore</button></div></div></details>`;
+}
+function showRestoreDestination(fileId){
+ const target = document.getElementById(`restoreDest${Number(fileId)}`);
+ if(target) target.classList.toggle("hidden");
+}
+function showFolderRestoreDestination(button){
+ const target = button.nextElementSibling;
+ if(target) target.classList.toggle("hidden");
 }
 function verifiedPill(timestamp){
  if(!timestamp) return `<span></span>`;
@@ -1392,25 +1442,28 @@ async function restoreSelectedFiles(){
  alert(`Restored ${restored} files`);
 }
 async function restoreCatalogFile(fileId){
+ return restoreCatalogFileMode(fileId, "origin");
+}
+async function restoreCatalogFileMode(fileId, mode, destValue=""){
  const file = fileRowsCache.find(row => Number(row.id) === Number(fileId));
  if(!file) return;
- const mode = restoreModePrompt(false);
- if(!mode) return;
  if(mode === "download"){
   window.open(`/api/restore/download?path=${encodeURIComponent(file.path)}`, "_blank");
   return;
  }
  const confidence = await post("/api/restore/confidence", { path:file.path });
  if(confidence.warning && !confirm(`${confidence.warning}\nContinue restore?`)) return;
- const dest = mode === "destination" ? prompt("Restore destination", "") : "";
+ const dest = mode === "destination" ? destValue : "";
+ if(mode === "destination" && !dest) return alert("Choose a destination path first");
  const out = await post("/api/restore", { path:file.path, dest:dest || null });
  alert(out.error || `Restored to ${out.target}`);
 }
 async function restoreCatalogFolder(path){
- const mode = prompt("Folder restore mode: origin or destination", "origin");
- if(!mode) return;
- if(mode.toLowerCase().startsWith("download")) return alert("Browser download is available for individual files. Use destination restore for folders.");
- const dest = mode.toLowerCase().startsWith("dest") ? prompt("Restore destination for this folder", "") : "";
+ return restoreCatalogFolderMode(path, "origin");
+}
+async function restoreCatalogFolderMode(path, mode, destValue=""){
+ const dest = mode === "destination" ? destValue : "";
+ if(mode === "destination" && !dest) return alert("Choose a destination folder first");
  const out = await post("/api/restore", { path:path, dest:dest || null, folder:true });
  alert(out.error || `Restored ${out.restored} files`);
 }
@@ -1427,9 +1480,9 @@ function restoreModePrompt(multiple=false){
 async function search(){ document.getElementById("results").innerHTML = table(await api("/api/search?q="+encodeURIComponent(document.getElementById("q").value)), ["id","relative_path","size","state","updated_at"]); }
 async function restore(){ const out = await post("/api/restore",{path:restorePath.value,dest:restoreDest.value,folder:restoreFolder.checked}); restoreOut.textContent = JSON.stringify(out,null,2); }
 function settingsForm(s){
- return `<div class="tabs">
+ return `<div class="settings-header"><div class="tabs">
   ${["General","Usenet","Protection","Schedules","Endpoints","Logging","Cloud"].map((name,index)=>`<button class="${index===0?"primary":""}" onclick="showSettingsTab('${name}', this)">${name}</button>`).join("")}
- </div>
+ </div><div class="toolbar-right"><button class="primary" onclick="saveSettings()"><span class="ui-icon">&#128190;</span>Save Settings</button><button onclick="render()"><span class="ui-icon">&#8635;</span>Reset</button></div></div>
  <div id="tabGeneral" class="tab-panel active"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#127912;</span>UI template</span><select id="setUiTheme" onchange="applyTheme(this.value)">${themeOptions(s.ui_theme || "harbor_light")}</select></label>
   <label class="field"><span><span class="ui-icon">&#128101;</span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
@@ -1466,6 +1519,7 @@ function settingsForm(s){
   <label class="field full"><span><span class="ui-icon">&#128683;</span>Auto-queue exclude patterns, one per line</span><textarea id="setAutoQueueExcludePatterns">${esc((s.auto_queue_exclude_patterns || []).join("\n"))}</textarea></label>
  </div></div>
  <div id="tabUsenet" class="tab-panel"><div class="form-grid">
+  <div class="toolbar"><button onclick="addHost()"><span class="ui-icon">&#10133;</span>Add Host</button></div>
   <div class="field full"><span><span class="ui-icon">&#128225;</span>Usenet hosts</span><div id="hostList" class="host-list">${hostRows(s.usenet_hosts || [])}</div></div>
  </div></div>
  <div id="tabLogging" class="tab-panel"><div class="form-grid">
@@ -1473,12 +1527,13 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128269;</span>Verbose log retention days</span><input id="setVerboseLogRetentionDays" type="number" min="1" max="3650" value="${esc(s.verbose_log_retention_days || 7)}"></label>
   <label><input id="setLogWebAccess" type="checkbox" ${s.log_web_access?"checked":""}> <span class="ui-icon">&#128221;</span>Log web access requests</label>
   <label><input id="setLogChunkEvents" type="checkbox" ${s.log_chunk_events?"checked":""}> <span class="ui-icon">&#129513;</span>Log successful per-chunk events</label>
+  <div class="toolbar"><button onclick="addLogDestination()"><span class="ui-icon">&#10133;</span>Add Log Destination</button></div>
   <div class="field full"><span><span class="ui-icon">&#128225;</span>Log aggregation destinations</span><div id="logDestinationList" class="host-list">${logDestinationRows(s.log_destinations || [])}</div></div>
  </div></div>
  <div id="tabCloud" class="tab-panel"><div class="form-grid">
+  <div class="toolbar"><button onclick="addCloudTarget()"><span class="ui-icon">&#10133;</span>Add Cloud Target</button><button onclick="post('/api/cloud-backup').then(out=>settingsOut.textContent=JSON.stringify(out,null,2))"><span class="ui-icon">&#9729;</span>Backup Config/DB Now</button></div>
   <div class="field full"><span><span class="ui-icon">&#9729;</span>Cloud backup targets</span><div id="cloudList" class="host-list">${cloudRows(s.cloud_backups || [])}</div></div>
  </div></div>
- <div class="toolbar"><button onclick="addHost()"><span class="ui-icon">&#10133;</span>Add host</button><button onclick="addLogDestination()"><span class="ui-icon">&#10133;</span>Add log destination</button><button onclick="addCloudTarget()"><span class="ui-icon">&#10133;</span>Add cloud target</button><button onclick="post('/api/cloud-backup').then(out=>settingsOut.textContent=JSON.stringify(out,null,2))"><span class="ui-icon">&#9729;</span>Backup config/db now</button><button class="primary" onclick="saveSettings()"><span class="ui-icon">&#128190;</span>Save settings</button><button onclick="render()"><span class="ui-icon">&#8635;</span>Reset</button></div>
  <pre id="settingsOut"></pre>`;
 }
 function showSettingsTab(name, button){
