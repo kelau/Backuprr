@@ -1,5 +1,6 @@
 import email
 import hashlib
+import os
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -45,6 +46,8 @@ def restore_file(db: Database, config: Config, source_path: str, dest: Optional[
             db.record_transfer_sample("download", len(payload))
             output.write(decode_chunk(payload, passphrase))
     if target.resolve() == Path(file_row["path"]).resolve():
+        original_mtime_ns = int(file_row["mtime_ns"] or target.stat().st_mtime_ns)
+        os.utime(target, ns=(original_mtime_ns, original_mtime_ns))
         stat = target.stat()
         db.mark_restored_backed_up(int(file_row["id"]), stat.st_size, stat.st_mtime_ns, sha256_file(target))
     db.log("info", "restore", f"Restored {source_path} to {target}", int(file_row["id"]))

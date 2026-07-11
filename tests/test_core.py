@@ -130,7 +130,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.48")
+        self.assertEqual(__version__, "0.2.50")
 
     def test_response_zip_writer_supports_streamed_zip_downloads(self):
         buffer = io.BytesIO()
@@ -1218,6 +1218,7 @@ class CoreTests(unittest.TestCase):
                         "tls": "implicit",
                         "username": "provider-user",
                         "password": "provider-password",
+                        "priority": 250,
                     }
                 ],
                 "par2": {"enabled": True, "command": "par2", "redundancy_percent": 12},
@@ -1266,6 +1267,7 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(self.config.encrypt_bodies)
         self.assertEqual(self.config.endpoints, [str(self.root / "media")])
         self.assertEqual(self.config.usenet_hosts[0].tls, "implicit")
+        self.assertEqual(self.config.usenet_hosts[0].priority, 250)
         self.assertEqual(self.config.usenet_hosts[0].resolved_username(), "provider-user")
         self.assertEqual(self.config.usenet_hosts[0].resolved_password(), "provider-password")
         self.assertEqual(self.config.par2["redundancy_percent"], 12)
@@ -1368,6 +1370,14 @@ class CoreTests(unittest.TestCase):
             },
         )
         self.assertEqual(self.config.usenet_hosts[0].password, "secret")
+
+    def test_usenet_hosts_for_mode_are_priority_sorted(self):
+        self.config.usenet_hosts = [
+            UsenetHost(name="low", mode="post", host="low.example.test", port=563, tls="implicit", priority=10),
+            UsenetHost(name="high", mode="post", host="high.example.test", port=563, tls="implicit", priority=500),
+            UsenetHost(name="read", mode="read", host="read.example.test", port=563, tls="implicit", priority=999),
+        ]
+        self.assertEqual([host.name for host in self.config.hosts_for_mode("post")], ["high", "low"])
 
     def test_update_config_preserves_null_existing_host_password(self):
         self.config.usenet_hosts = [
@@ -1630,9 +1640,11 @@ class CoreTests(unittest.TestCase):
             file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
         self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
         self.db.update_file_state(file_id, "backed_up")
+        original_mtime_ns = path.stat().st_mtime_ns
         self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
         with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
             self.assertEqual(restore_file(self.db, self.config, str(path)), path)
+        self.assertEqual(path.stat().st_mtime_ns, original_mtime_ns)
         scan_all(self.db)
         self.assertEqual(enqueue_unbacked(self.db), 0)
         with self.db.connect() as conn:

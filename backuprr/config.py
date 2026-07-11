@@ -14,10 +14,13 @@ class UsenetHost:
     tls: str = "plain"
     username: Optional[str] = None
     password: Optional[str] = None
+    priority: int = 100
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "UsenetHost":
-        supported = {key: data.get(key) for key in ("name", "mode", "host", "port", "tls", "username", "password")}
+        supported = {key: data.get(key) for key in ("name", "mode", "host", "port", "tls", "username", "password", "priority")}
+        if supported["priority"] is None:
+            supported["priority"] = 100
         return cls(**supported)
 
     def resolved_username(self) -> Optional[str]:
@@ -153,7 +156,7 @@ class Config:
         return os.getenv(self.encryption_passphrase_env)
 
     def hosts_for_mode(self, mode: str) -> List[UsenetHost]:
-        return [host for host in self.usenet_hosts if host.mode == mode]
+        return sorted((host for host in self.usenet_hosts if host.mode == mode), key=lambda host: (-int(host.priority), host.name))
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -340,6 +343,7 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
                 raise ValueError("Usenet host name and host are required")
             if host.port <= 0:
                 raise ValueError("Usenet host port must be greater than zero")
+            host.priority = max(0, int(host.priority))
             hosts.append(host)
         config.usenet_hosts = hosts
     if "cloud_backups" in data:

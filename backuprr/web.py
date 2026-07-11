@@ -529,6 +529,11 @@ tr:hover td { background:var(--row-hover); }
 .bar-fill.bad { background:var(--bad); }
 .progress-track { height:16px; background:var(--track-bg); border-radius:999px; overflow:hidden; border:1px solid rgba(125,211,199,.10); }
 .progress-fill { height:100%; background:linear-gradient(90deg,#0f867a,#4adecf); border-radius:999px; transition:width .2s ease; }
+.progress-fill.indeterminate { width:42%; min-width:32px; animation:progress-slide 1.1s ease-in-out infinite; }
+@keyframes progress-slide { 0% { transform:translateX(-120%); } 100% { transform:translateX(260%); } }
+.async-status { display:grid; gap:6px; max-width:560px; margin:8px 0 12px; }
+.async-status .pill { width:max-content; }
+.async-status .progress-track { height:10px; }
 .file-progress { min-width:160px; max-width:220px; display:grid; gap:3px; }
 .file-progress .progress-track { height:8px; }
 .file-progress span { font-size:12px; color:var(--muted); }
@@ -572,7 +577,7 @@ tr:hover td { background:var(--row-hover); }
 .tree ul { list-style:none; margin:0; padding-left:20px; }
 .tree li { margin:2px 0; }
 .tree-row { display:flex; align-items:center; gap:8px; min-height:32px; padding:4px 6px; border-radius:6px; }
-.tree-row.file-row, .tree-row.folder-row, .tree-header { display:grid; grid-template-columns:24px 24px minmax(260px,1fr) minmax(180px,230px) minmax(92px,120px) minmax(120px,140px) minmax(118px,140px) minmax(132px,max-content); gap:8px; align-items:center; min-width:1000px; }
+.tree-row.file-row, .tree-row.folder-row, .tree-header { display:grid; grid-template-columns:24px 24px minmax(280px,1fr) minmax(178px,200px) minmax(88px,96px) minmax(112px,124px) minmax(112px,132px) minmax(96px,max-content); gap:8px; align-items:center; min-width:940px; }
 .tree-header { color:var(--muted); font-size:12px; font-weight:800; text-transform:uppercase; background:var(--table-head-bg); border:1px solid var(--line); border-radius:6px; padding:7px 6px; margin-bottom:6px; }
 .tree-row:hover { background:var(--row-hover); }
 .tree-name { flex:1; overflow-wrap:anywhere; }
@@ -584,7 +589,10 @@ tr:hover td { background:var(--row-hover); }
 .muted { color:var(--muted); }
 .error { color:var(--bad); }
 pre { white-space:pre-wrap; background:var(--panel); border:1px solid var(--line); padding:12px; border-radius:6px; }
-@media (max-width:1100px) { .tree-row.file-row, .tree-row.folder-row, .tree-header { grid-template-columns:24px 24px minmax(180px,1fr) minmax(140px,auto) minmax(92px,auto) minmax(120px,max-content); min-width:760px; } .tree-row.file-row > :nth-child(7), .tree-row.folder-row > :nth-child(7), .tree-header > :nth-child(7) { display:none; } .tree-actions { grid-column:auto; } }
+.task-detail { color:var(--muted); background:var(--panel-2); }
+.task-detail td { padding-top:6px; padding-bottom:10px; }
+.task-row-actions { display:flex; flex-wrap:wrap; gap:6px; justify-content:flex-end; }
+@media (max-width:1100px) { .tree-row.file-row, .tree-row.folder-row, .tree-header { grid-template-columns:24px 24px minmax(180px,1fr) minmax(150px,170px) minmax(78px,90px) minmax(96px,max-content); min-width:720px; } .tree-row.file-row > :nth-child(7), .tree-row.folder-row > :nth-child(7), .tree-header > :nth-child(7) { display:none; } .tree-actions { grid-column:auto; } }
 @media (max-width:860px) { header { position:relative; } .app-shell { display:block; } .sidebar { border-right:0; border-bottom:1px solid var(--line); } nav { display:grid; grid-template-columns:repeat(2,1fr); } .side-footer { display:none; } .toolbar-grid { grid-template-columns:1fr; } }
 </style>
 </head>
@@ -764,7 +772,6 @@ async function render(){
    <input id="filesSearch" placeholder="Search files" oninput="filesPage=1;updateFilesPage()">
    <label><input id="showUnbackedOnly" type="checkbox" onchange="filesPage=1;updateFilesPage()"> <span class="ui-icon">&#9888;</span>Only unbacked</label>
    <label><input id="showDeletedFiles" type="checkbox" onchange="filesPage=1;updateFilesPage()"> <span class="ui-icon">&#128465;</span>Show deleted</label>
-   <label><input id="selectAllFiles" type="checkbox" onchange="toggleSelectAllFiles(this.checked)"> Select page</label>
    <button onclick="boostSelectedFiles()"><span class="ui-icon">&#8593;</span>Bump selected</button>
    ${selectedRestoreDropdown()}
    ${pushLabel()}
@@ -793,11 +800,11 @@ async function render(){
   await updateQueuePage();
  }
  if(page==="Tasks"){
-  c.innerHTML = `<div class="toolbar"><button class="primary" onclick="post('/api/scan').then(updateTasksPage)"><span class="ui-icon">&#128193;</span>Run catalog scan</button>${pushLabel()}</div><div id="taskRows"></div>`;
+  c.innerHTML = `<div id="taskRows"></div>`;
   await updateTasksPage();
  }
  if(page==="Verification"){
-  c.innerHTML = `<div class="toolbar"><input id="verificationSearch" placeholder="Filter verification files" value="${esc(verificationTextFilter)}" oninput="verificationTextFilter=this.value;verificationMissingPage=verificationUnverifiedPage=verificationVerifiedPage=verificationNoChunksPage=1;updateVerificationPage()"><button class="primary" onclick="verifySelectedFiles()"><span class="ui-icon">&#10003;</span>Verify selected</button><button onclick="post('/api/verify',{force:true}).then(updateVerificationPage)"><span class="ui-icon">&#10003;</span>Verify all</button>${pushLabel()}</div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Missing chunks</h2><div id="verificationMissingRows"></div><h2 class="section-title"><span class="ui-icon">&#128269;</span>Unverified</h2><div id="verificationUnverifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Verified</h2><div id="verificationVerifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#128230;</span>No chunks</h2><div id="verificationNoChunksRows"></div>`;
+  c.innerHTML = `<div class="toolbar"><input id="verificationSearch" placeholder="Filter verification files" value="${esc(verificationTextFilter)}" oninput="verificationTextFilter=this.value;verificationMissingPage=verificationUnverifiedPage=verificationVerifiedPage=verificationNoChunksPage=1;updateVerificationPage()"><button class="primary" onclick="verifySelectedFiles()"><span class="ui-icon">&#10003;</span>Verify selected</button><button onclick="verifyAllFiles()"><span class="ui-icon">&#10003;</span>Verify all</button>${pushLabel()}</div><div id="verificationStatus" class="async-status"></div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Missing chunks</h2><div id="verificationMissingRows"></div><h2 class="section-title"><span class="ui-icon">&#128269;</span>Unverified</h2><div id="verificationUnverifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Verified</h2><div id="verificationVerifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#128230;</span>No chunks</h2><div id="verificationNoChunksRows"></div>`;
   await updateVerificationPage();
  }
  if(page==="Statistics"){
@@ -938,15 +945,46 @@ function updateVerificationSelectionState(rows=[]){
 }
 async function verifySelectedFiles(){
  const ids = Array.from(selectedVerificationFiles);
- if(!ids.length) return alert("Select files to verify first");
+ if(!ids.length) return setVerificationStatus("Select files to verify first.", 0, "bad");
+ setVerificationStatus(`Verifying ${ids.length} selected files...`, 35, "warn", true);
  const out = await post("/api/verify", { file_ids:ids });
- if(out.error) alert(out.error);
+ if(out.error) setVerificationStatus(out.error, 100, "bad");
+ else setVerificationStatus(`Verified ${out.verified || 0} chunks for ${ids.length} selected files.`, 100, "ok");
  await updateVerificationPage();
+}
+async function verifyAllFiles(){
+ setVerificationStatus("Verifying all due chunks...", 35, "warn", true);
+ const out = await post("/api/verify", { force:true });
+ if(out.error) setVerificationStatus(out.error, 100, "bad");
+ else setVerificationStatus(`Verified ${out.verified || 0} chunks.`, 100, "ok");
+ await updateVerificationPage();
+}
+function setVerificationStatus(message, pct=0, tone="warn", indeterminate=false){
+ const target = document.getElementById("verificationStatus");
+ if(!target) return;
+ target.innerHTML = statusProgressHtml(message, pct, tone, indeterminate);
 }
 async function updateTasksPage(){
  const rows = await api("/api/tasks");
  const target = document.getElementById("taskRows");
- if(target) target.innerHTML = table(rows, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"]);
+ if(target) target.innerHTML = tasksTable(rows);
+}
+function taskActionButtons(kind, refresh="updateTasksPage"){
+ if(kind === "catalog") return `<button class="primary" onclick="post('/api/scan').then(${refresh})"><span class="ui-icon">&#128193;</span>Scan now</button>`;
+ if(kind === "backup") return `<button onclick="post('/api/queue/enqueue-unbacked').then(${refresh})"><span class="ui-icon">&#10133;</span>Queue unbacked</button><button class="primary" onclick="post('/api/post-next').then(${refresh})"><span class="ui-icon">&#9658;</span>Post next</button>`;
+ if(kind === "verification") return `<button onclick="post('/api/verify',{force:true}).then(${refresh})"><span class="ui-icon">&#10003;</span>Verify chunks</button>`;
+ if(kind === "cloud_backup") return `<button onclick="post('/api/cloud-backup').then(${refresh})"><span class="ui-icon">&#9729;</span>Backup config/db</button>`;
+ return "";
+}
+function tasksTable(rows){
+ if(!rows.length) return "<p class='muted'>No tasks.</p>";
+ return `<table><thead><tr><th>Name</th><th>Kind</th><th>Status</th><th>Interval</th><th>Last Run</th><th>Duration</th><th>Next Run</th><th>Runs</th><th>Actions</th></tr></thead><tbody>`+
+ rows.map(task => {
+  const result = task.last_result ? `<tr class="task-detail"><td colspan="9"><b>Last Result</b>: ${esc(task.last_result)}</td></tr>` : "";
+  const error = task.last_error ? `<tr class="task-detail"><td colspan="9" class="error"><b>Last Error</b>: ${esc(task.last_error)}</td></tr>` : "";
+  return `<tr><td>${esc(task.name)}</td><td>${esc(labelize(task.kind))}</td><td>${statePill(task.paused ? "paused" : task.status)}</td><td>${esc(task.interval_seconds)}</td><td>${esc(formatDateTime(task.last_run) || "not yet")}</td><td>${esc(task.last_run_duration || "-")}</td><td>${esc(task.time_until_next_run || "-")}</td><td>${esc(task.runs || 0)}</td><td><div class="task-row-actions">${taskActionButtons(task.kind)}</div></td></tr>${result}${error}`;
+ }).join("")+
+ "</tbody></table>";
 }
 async function updateVerificationPage(){
  verificationTextFilter = document.getElementById("verificationSearch")?.value || verificationTextFilter;
@@ -1111,15 +1149,8 @@ function taskCard(task){
   <div><span class="ui-icon">&#9201;</span>Duration: ${esc(task.last_run_duration || "-")}</div>
   <div><span class="ui-icon">&#9202;</span>Next run: ${esc(task.time_until_next_run || "-")}</div>
   <div class="${task.last_error ? "error" : "muted"}">${esc(task.last_error || task.last_result || "")}</div>
-  ${taskActions(task.kind)}
+  <div class="toolbar-options">${taskActionButtons(task.kind, "updateStatusPage")}</div>
  </div>`;
-}
-function taskActions(kind){
- if(kind === "catalog") return `<div class="toolbar-options"><button class="primary" onclick="post('/api/scan').then(updateStatusPage)"><span class="ui-icon">&#128193;</span>Scan now</button></div>`;
- if(kind === "backup") return `<div class="toolbar-options"><button onclick="post('/api/queue/enqueue-unbacked').then(updateStatusPage)"><span class="ui-icon">&#10133;</span>Queue unbacked</button><button class="primary" onclick="post('/api/post-next').then(updateStatusPage)"><span class="ui-icon">&#9658;</span>Post next</button></div>`;
- if(kind === "verification") return `<div class="toolbar-options"><button onclick="post('/api/verify',{force:true}).then(updateStatusPage)"><span class="ui-icon">&#10003;</span>Verify chunks</button></div>`;
- if(kind === "cloud_backup") return `<div class="toolbar-options"><button onclick="post('/api/cloud-backup').then(updateStatusPage)"><span class="ui-icon">&#9729;</span>Backup config/db</button></div>`;
- return "";
 }
 function barChart(title, rows){
  const max = Math.max(1, ...rows.map(row => Number(row[1] || 0)));
@@ -1298,7 +1329,7 @@ function fileTree(rows, showDeleted=false){
   }
   node.files.push({...row, display_name: parts[parts.length - 1] || row.path});
  }
- return `<div class="tree"><div class="tree-header"><span></span><span></span><span>Name</span><span>Progress</span><span>Size</span><span>State</span><span>Verification</span><span>Actions</span></div><ul>${treeNode(root, "", showDeleted)}</ul></div>`;
+ return `<div class="tree"><div class="tree-header"><span><input id="selectAllFiles" type="checkbox" title="Select page" onchange="toggleSelectAllFiles(this.checked)"></span><span></span><span>Name</span><span>Progress</span><span>Size</span><span>State</span><span>Verification</span><span>Actions</span></div><ul>${treeNode(root, "", showDeleted)}</ul></div>`;
 }
 function treeNode(node, prefix, showDeleted){
  const dirs = Object.keys(node.dirs).sort((a,b)=>a.localeCompare(b));
@@ -1491,48 +1522,54 @@ async function boostSelectedFiles(){
 async function restoreSelectedFiles(){
  return restoreSelectedFilesMode("origin");
 }
-function setRestoreStatus(message, tone="muted"){
+function statusProgressHtml(message, pct=0, tone="warn", indeterminate=false){
+ const width = Math.max(0, Math.min(100, Number(pct || 0)));
+ return `<span class="pill ${tone}"><span class="ui-icon">${tone === "ok" ? "&#10003;" : tone === "bad" ? "&#9888;" : "&#9658;"}</span>${esc(message)}</span><div class="progress-track"><div class="progress-fill ${indeterminate ? "indeterminate" : ""}" style="width:${indeterminate ? 42 : width}%"></div></div>`;
+}
+function setRestoreStatus(message, pct=0, tone="warn", indeterminate=false){
  const target = document.getElementById("restoreStatus");
  if(target){
-  target.className = tone;
-  target.textContent = message;
+  target.className = "async-status";
+  target.innerHTML = statusProgressHtml(message, pct, tone, indeterminate);
  }
 }
 async function restoreSelectedFilesMode(mode, destValue=""){
  const selectedRows = Array.from(selectedFileData.values()).filter(row => Number(row.chunk_count || 0) > 0);
  if(!selectedRows.length){
-  setRestoreStatus("Select files with recorded chunks first.", "error");
-  return alert("Select files with recorded chunks first");
+  setRestoreStatus("Select files with recorded chunks first.", 0, "bad");
+  return;
  }
  if(mode === "destination" && !destValue){
-  setRestoreStatus("Choose a destination folder first.", "error");
-  return alert("Choose a destination folder first");
+  setRestoreStatus("Choose a destination folder first.", 0, "bad");
+  return;
  }
  closeDropdowns();
  if(mode === "download"){
   const ids = selectedRows.map(row => `file_id=${encodeURIComponent(row.id)}`).join("&");
-  setRestoreStatus(`Preparing restore zip for ${selectedRows.length} files...`);
+  setRestoreStatus(`Preparing restore zip for ${selectedRows.length} files...`, 35, "warn", true);
   window.open(`/api/restore/download-zip?${ids}`, "_blank");
   return;
  }
  const dest = mode === "destination" ? destValue : "";
  let restored = 0;
- setRestoreStatus(`Restoring ${selectedRows.length} files...`);
+ setRestoreStatus(`Restoring ${selectedRows.length} files...`, 5, "warn");
  for(const file of selectedRows){
-  setRestoreStatus(`Restoring ${restored + 1} of ${selectedRows.length}: ${file.relative_path || file.path}`);
+  const startPct = Math.round((restored / selectedRows.length) * 100);
+  setRestoreStatus(`Restoring ${restored + 1} of ${selectedRows.length}: ${file.relative_path || file.path}`, startPct, "warn");
   const confidence = await post("/api/restore/confidence", { path:file.path });
   if(confidence.warning && !confirm(`${file.relative_path || file.path}\n${confidence.warning}\nContinue restore?`)){
-   setRestoreStatus(`Skipped ${file.relative_path || file.path}`);
+   setRestoreStatus(`Skipped ${file.relative_path || file.path}`, startPct, "warn");
    continue;
   }
   const out = await post("/api/restore", { path:file.path, dest:dest || null });
   if(out.error){
-   setRestoreStatus(out.error, "error");
-   return alert(out.error);
+   setRestoreStatus(out.error, Math.max(startPct, 5), "bad");
+   return;
   }
   restored++;
+  setRestoreStatus(`Restored ${restored} of ${selectedRows.length} files.`, Math.round((restored / selectedRows.length) * 100), restored === selectedRows.length ? "ok" : "warn");
  }
- setRestoreStatus(`Restored ${restored} files.`, "muted");
+ setRestoreStatus(`Restored ${restored} files.`, 100, "ok");
 }
 async function restoreCatalogFile(fileId){
  return restoreCatalogFileMode(fileId, "origin");
@@ -1541,24 +1578,23 @@ async function restoreCatalogFileMode(fileId, mode, destValue=""){
  const file = fileRowsCache.find(row => Number(row.id) === Number(fileId));
  if(!file) return;
  if(mode === "download"){
-  setRestoreStatus(`Preparing browser download for ${file.relative_path || file.path}...`);
+  setRestoreStatus(`Preparing browser download for ${file.relative_path || file.path}...`, 35, "warn", true);
   closeDropdowns();
   window.open(`/api/restore/download?path=${encodeURIComponent(file.path)}`, "_blank");
   return;
  }
  if(mode === "destination" && !destValue){
-  setRestoreStatus("Choose a destination path first.", "error");
-  return alert("Choose a destination path first");
+  setRestoreStatus("Choose a destination path first.", 0, "bad");
+  return;
  }
  closeDropdowns();
- setRestoreStatus(`Checking restore confidence for ${file.relative_path || file.path}...`);
+ setRestoreStatus(`Checking restore confidence for ${file.relative_path || file.path}...`, 15, "warn");
  const confidence = await post("/api/restore/confidence", { path:file.path });
  if(confidence.warning && !confirm(`${confidence.warning}\nContinue restore?`)) return;
  const dest = mode === "destination" ? destValue : "";
- setRestoreStatus(`Restoring ${file.relative_path || file.path}...`);
+ setRestoreStatus(`Restoring ${file.relative_path || file.path}...`, 45, "warn", true);
  const out = await post("/api/restore", { path:file.path, dest:dest || null });
- setRestoreStatus(out.error || `Restored to ${out.target}`, out.error ? "error" : "muted");
- alert(out.error || `Restored to ${out.target}`);
+ setRestoreStatus(out.error || `Restored to ${out.target}`, out.error ? 45 : 100, out.error ? "bad" : "ok");
 }
 async function restoreCatalogFolder(path){
  return restoreCatalogFolderMode(path, "origin");
@@ -1566,14 +1602,13 @@ async function restoreCatalogFolder(path){
 async function restoreCatalogFolderMode(path, mode, destValue=""){
  const dest = mode === "destination" ? destValue : "";
  if(mode === "destination" && !dest){
-  setRestoreStatus("Choose a destination folder first.", "error");
-  return alert("Choose a destination folder first");
+  setRestoreStatus("Choose a destination folder first.", 0, "bad");
+  return;
  }
  closeDropdowns();
- setRestoreStatus(`Restoring folder ${path}...`);
+ setRestoreStatus(`Restoring folder ${path}...`, 35, "warn", true);
  const out = await post("/api/restore", { path:path, dest:dest || null, folder:true });
- setRestoreStatus(out.error || `Restored ${out.restored} files from ${path}.`, out.error ? "error" : "muted");
- alert(out.error || `Restored ${out.restored} files`);
+ setRestoreStatus(out.error || `Restored ${out.restored} files from ${path}.`, out.error ? 35 : 100, out.error ? "bad" : "ok");
 }
 function restoreModePrompt(multiple=false){
  const mode = prompt(`${multiple ? "Selected files" : "File"} restore mode: origin, destination, or download`, "origin");
@@ -1667,7 +1702,7 @@ function initSettingsDirtyTracking(){
  });
 }
 function hostRows(hosts){
- return hosts.map((host, index) => hostRow(host, index)).join("") || hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"" }, 0);
+ return hosts.map((host, index) => hostRow(host, index)).join("") || hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"", priority:100 }, 0);
 }
 function hostRow(host, index){
  return `<div class="host-row" data-host-index="${index}">
@@ -1675,6 +1710,7 @@ function hostRow(host, index){
   <div class="host-grid">
    <label class="field"><span><span class="ui-icon">&#128278;</span>Name</span><input class="hostName" value="${esc(host.name)}" placeholder="eweka-read"></label>
    <label class="field"><span><span class="ui-icon">&#8644;</span>Mode</span><select class="hostMode"><option value="read" ${host.mode==="read"?"selected":""}>read</option><option value="post" ${host.mode==="post"?"selected":""}>post</option></select></label>
+   <label class="field"><span><span class="ui-icon">&#8593;</span>Priority</span><input class="hostPriority" type="number" min="0" max="10000" value="${esc(host.priority ?? 100)}"></label>
    <label class="field"><span><span class="ui-icon">&#127760;</span>Server</span><input class="hostServer" value="${esc(host.host)}" placeholder="news.example.com"></label>
    <label class="field"><span><span class="ui-icon">&#128279;</span>Port</span><input class="hostPort" type="number" min="1" value="${esc(host.port || 563)}"></label>
    <label class="field"><span><span class="ui-icon">&#128274;</span>TLS mode</span><select class="hostTls"><option value="implicit" ${host.tls==="implicit"?"selected":""}>implicit</option><option value="starttls" ${host.tls==="starttls"?"selected":""}>starttls</option><option value="plain" ${host.tls==="plain"?"selected":""}>plain</option></select></label>
@@ -1720,7 +1756,7 @@ function cloudRow(target, index){
 function addHost(){
  const list = document.getElementById("hostList");
  const index = list.querySelectorAll(".host-row").length;
- list.insertAdjacentHTML("beforeend", hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"" }, index));
+ list.insertAdjacentHTML("beforeend", hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"", priority:100 }, index));
  renumberHosts();
  initSettingsDirtyTracking();
  setSettingsDirty(true);
@@ -1781,6 +1817,7 @@ function collectHosts(){
  return Array.from(document.querySelectorAll("#hostList > .host-row")).map(row => ({
   name: row.querySelector(".hostName").value.trim(),
   mode: row.querySelector(".hostMode").value,
+  priority: Number(row.querySelector(".hostPriority").value || 100),
   host: row.querySelector(".hostServer").value.trim(),
   port: Number(row.querySelector(".hostPort").value),
   tls: row.querySelector(".hostTls").value,
