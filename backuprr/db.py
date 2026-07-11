@@ -1105,8 +1105,8 @@ class Database:
         with self.connect() as conn:
             return int(conn.execute(f"SELECT COUNT(*) FROM files {where}", params).fetchone()[0])
 
-    def verification_rows(self, limit: int = 200, offset: int = 0, verification_state: str = "") -> List[sqlite3.Row]:
-        where, params = self._verification_state_clause(verification_state)
+    def verification_rows(self, limit: int = 200, offset: int = 0, verification_state: str = "", search: str = "") -> List[sqlite3.Row]:
+        where, params = self._verification_state_clause(verification_state, search)
         with self.connect() as conn:
             return conn.execute(
                 f"""
@@ -1135,13 +1135,13 @@ class Database:
                 (*params, limit, offset),
             ).fetchall()
 
-    def verification_count(self, verification_state: str = "") -> int:
-        where, params = self._verification_state_clause(verification_state)
+    def verification_count(self, verification_state: str = "", search: str = "") -> int:
+        where, params = self._verification_state_clause(verification_state, search)
         with self.connect() as conn:
             row = conn.execute(
                 f"""
                 WITH verification AS (
-                SELECT f.id,
+                SELECT f.id, f.path, f.relative_path,
                        CASE
                          WHEN SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) > 0 THEN 'missing'
                          WHEN COUNT(c.id) = 0 THEN 'no_chunks'
@@ -1159,10 +1159,17 @@ class Database:
             ).fetchone()
             return int(row["total"] or 0)
 
-    def _verification_state_clause(self, verification_state: str) -> tuple[str, List[Any]]:
+    def _verification_state_clause(self, verification_state: str, search: str = "") -> tuple[str, List[Any]]:
+        clauses = []
+        params: List[Any] = []
         if verification_state in {"missing", "unverified", "verified", "no_chunks"}:
-            return "WHERE verification_state = ?", [verification_state]
-        return "", []
+            clauses.append("verification_state = ?")
+            params.append(verification_state)
+        if search:
+            clauses.append("(path LIKE ? OR relative_path LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        return where, params
 
     def list_events(
         self,
@@ -1170,7 +1177,35 @@ class Database:
         limit: int = 300,
         event_types: Optional[List[str]] = None,
         exclude_event_types: Optional[List[str]] = None,
+        offset: int = 0,
+        search: str = "",
     ) -> List[sqlite3.Row]:
+        where, params = self._event_filters(levels, event_types, exclude_event_types, search)
+        with self.connect() as conn:
+            return conn.execute(
+                f"SELECT * FROM events {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+
+    def event_count(
+        self,
+        levels: Optional[List[str]] = None,
+        event_types: Optional[List[str]] = None,
+        exclude_event_types: Optional[List[str]] = None,
+        search: str = "",
+    ) -> int:
+        where, params = self._event_filters(levels, event_types, exclude_event_types, search)
+        with self.connect() as conn:
+            row = conn.execute(f"SELECT COUNT(*) AS total FROM events {where}", params).fetchone()
+            return int(row["total"] or 0)
+
+    def _event_filters(
+        self,
+        levels: Optional[List[str]] = None,
+        event_types: Optional[List[str]] = None,
+        exclude_event_types: Optional[List[str]] = None,
+        search: str = "",
+    ) -> tuple[str, List[Any]]:
         allowed_levels = {"error", "warning", "info", "debug", "verbose"}
         selected = [level for level in (levels or []) if level in allowed_levels]
         clauses = []
@@ -1187,12 +1222,11 @@ class Database:
             placeholders = ",".join("?" for _ in exclude_event_types)
             clauses.append(f"event_type NOT IN ({placeholders})")
             params.extend(exclude_event_types)
+        if search:
+            clauses.append("(message LIKE ? OR event_type LIKE ? OR data LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%", f"%{search}%"])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        with self.connect() as conn:
-            return conn.execute(
-                f"SELECT * FROM events {where} ORDER BY id DESC LIMIT ?",
-                (*params, limit),
-            ).fetchall()
+        return where, params
 
     def event_types(self) -> List[str]:
         with self.connect() as conn:

@@ -1,10 +1,10 @@
-import json
+﻿import json
 import math
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from . import __version__
 from .cloud_backup import backup_config_and_database
@@ -14,7 +14,7 @@ from .log_forwarding import LogForwarder
 from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, MaintenanceMonitor, RestoreDrillMonitor
 from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, restore_plan, run_maintenance, run_restore_drill, test_post_host_article_size
 from .queueing import enqueue_unbacked, move, prioritize
-from .restore import restore_file, restore_folder
+from .restore import restore_file, restore_folder, restored_payloads
 
 
 def rowdicts(rows):
@@ -176,17 +176,20 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(rowdicts(self.db.maintenance_rows(int(query.get("limit", ["50"])[0]))))
         elif parsed.path == "/api/restore-drills":
             self.send_json(rowdicts(self.db.restore_drill_rows(int(query.get("limit", ["50"])[0]))))
+        elif parsed.path == "/api/restore/download":
+            self.stream_restore_download(query.get("path", [""])[0])
         elif parsed.path == "/api/verification":
             page = max(1, int(query.get("page", ["1"])[0]))
             page_size = max(1, min(200, int(query.get("page_size", ["25"])[0])))
             verification_state = query.get("state", [""])[0]
+            search = query.get("q", [""])[0]
             offset = (page - 1) * page_size
             self.send_json(
                 {
-                    "rows": rowdicts(self.db.verification_rows(page_size, offset, verification_state)),
+                    "rows": rowdicts(self.db.verification_rows(page_size, offset, verification_state, search)),
                     "page": page,
                     "page_size": page_size,
-                    "total": self.db.verification_count(verification_state),
+                    "total": self.db.verification_count(verification_state, search),
                     "state": verification_state,
                 }
             )
@@ -196,7 +199,18 @@ class Handler(BaseHTTPRequestHandler):
                 levels = [item for group in query.get("levels", []) for item in group.split(",")]
             event_types = query.get("event_type", [])
             exclude_event_types = query.get("exclude_event_type", [])
-            self.send_json(rowdicts(self.db.list_events(levels, int(query.get("limit", ["300"])[0]), event_types, exclude_event_types)))
+            page = max(1, int(query.get("page", ["1"])[0]))
+            page_size = max(1, min(500, int(query.get("page_size", query.get("limit", ["100"]))[0])))
+            search = query.get("q", [""])[0]
+            offset = (page - 1) * page_size
+            self.send_json(
+                {
+                    "rows": rowdicts(self.db.list_events(levels, page_size, event_types, exclude_event_types, offset, search)),
+                    "page": page,
+                    "page_size": page_size,
+                    "total": self.db.event_count(levels, event_types, exclude_event_types, search),
+                }
+            )
         elif parsed.path == "/api/log/event-types":
             self.send_json(self.db.event_types())
         elif parsed.path == "/api/queue":
@@ -307,6 +321,22 @@ class Handler(BaseHTTPRequestHandler):
         payload["progress_percent"] = min(100, int((posted / expected) * 100))
         payload["progress"] = f"{posted}/{expected} chunks ({payload['progress_percent']}%)"
         return payload
+
+    def stream_restore_download(self, source_path: str) -> None:
+        if not source_path:
+            self.send_json({"error": "path is required"}, 400)
+            return
+        file_row, payloads = restored_payloads(self.db, self.config, source_path)
+        filename = Path(file_row["path"]).name
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(filename)}")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        for payload in payloads:
+            self.wfile.write(payload)
+            self.wfile.flush()
+        self.db.log("info", "restore.download", f"Downloaded restored copy of {source_path}", int(file_row["id"]))
 
     def all_tasks(self) -> list[dict]:
         return (
@@ -455,6 +485,10 @@ tr:hover td { background:var(--row-hover); }
 .file-progress { min-width:160px; max-width:220px; display:grid; gap:3px; }
 .file-progress .progress-track { height:8px; }
 .file-progress span { font-size:12px; color:var(--muted); }
+.mini-progress { display:grid; gap:3px; min-width:180px; }
+.mini-progress .progress-track { height:8px; }
+.toolbar-grid { display:grid; grid-template-columns:minmax(220px,1fr) auto auto; gap:8px; align-items:center; margin-bottom:12px; padding:10px; background:var(--toolbar-bg); border:1px solid var(--line); border-radius:6px; box-shadow:var(--shadow); }
+.toolbar-options { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
 .thread-meter { display:flex; align-items:baseline; gap:8px; margin-bottom:10px; }
 .thread-meter b { font-size:32px; }
 .refresh-note { margin-left:auto; }
@@ -481,16 +515,20 @@ tr:hover td { background:var(--row-hover); }
 .tree ul { list-style:none; margin:0; padding-left:20px; }
 .tree li { margin:2px 0; }
 .tree-row { display:flex; align-items:center; gap:8px; min-height:32px; padding:4px 6px; border-radius:6px; }
+.tree-row.file-row { display:grid; grid-template-columns:24px 24px minmax(220px,1fr) minmax(86px,110px) minmax(112px,130px) minmax(90px,100px) minmax(104px,130px) minmax(170px,220px) minmax(112px,max-content); gap:8px; align-items:center; }
+.tree-row.folder-row { display:grid; grid-template-columns:24px 24px minmax(220px,1fr) minmax(112px,130px) minmax(104px,130px) minmax(120px,150px) minmax(104px,130px); gap:8px; align-items:center; }
 .tree-row:hover { background:var(--row-hover); }
 .tree-name { flex:1; overflow-wrap:anywhere; }
 .tree-meta { color:var(--muted); font-size:12px; }
+.tree-actions { display:flex; gap:6px; justify-content:flex-end; }
 .icon-btn { width:32px; height:32px; display:inline-grid; place-items:center; padding:0; }
 .folder > .tree-row { font-weight:600; }
 .hidden { display:none; }
 .muted { color:var(--muted); }
 .error { color:var(--bad); }
 pre { white-space:pre-wrap; background:var(--panel); border:1px solid var(--line); padding:12px; border-radius:6px; }
-@media (max-width:860px) { header { position:relative; } .app-shell { display:block; } .sidebar { border-right:0; border-bottom:1px solid var(--line); } nav { display:grid; grid-template-columns:repeat(2,1fr); } .side-footer { display:none; } }
+@media (max-width:1100px) { .tree-row.file-row, .tree-row.folder-row { grid-template-columns:24px 24px minmax(180px,1fr) minmax(92px,auto) minmax(100px,auto); } .tree-row.file-row > :nth-child(n+6):not(.tree-actions), .tree-row.folder-row > :nth-child(n+6):not(.tree-actions) { display:none; } .tree-actions { grid-column:auto; } }
+@media (max-width:860px) { header { position:relative; } .app-shell { display:block; } .sidebar { border-right:0; border-bottom:1px solid var(--line); } nav { display:grid; grid-template-columns:repeat(2,1fr); } .side-footer { display:none; } .toolbar-grid { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -514,7 +552,9 @@ let fileRowsCache = [];
 let logLevelSelection = ["error","warning","info"];
 let logEventTypeSelection = [];
 let logExcludeWebAccess = true;
-let logLimitSelection = "300";
+let logPage = 1;
+let logPageSize = 100;
+let logTextFilter = "";
 let eventSource = null;
 let lastChangeToken = null;
 let activeQueuePage = 1;
@@ -525,6 +565,7 @@ let verificationMissingPage = 1;
 let verificationUnverifiedPage = 1;
 let verificationVerifiedPage = 1;
 let verificationNoChunksPage = 1;
+let verificationTextFilter = "";
 let selectedFiles = new Set();
 let selectedFileData = new Map();
 let selectedVerificationFiles = new Set();
@@ -644,12 +685,15 @@ async function render(){
  if(page==="Log"){
   const eventTypes = await api("/api/log/event-types");
   const levels = ["error","warning","info","debug","verbose"];
-  c.innerHTML = `<div class="toolbar">
-   ${levels.map(level=>`<label><input class="logLevel" type="checkbox" value="${level}" ${logLevelSelection.includes(level) ? "checked" : ""}> ${levelPill(level)}</label>`).join("")}
-   <select id="logEventType"><option value="">All event types</option>${eventTypes.map(type=>`<option value="${esc(type)}" ${logEventTypeSelection.includes(type) ? "selected" : ""}>${esc(type)}</option>`).join("")}</select>
-   <label><input id="hideWebAccess" type="checkbox" ${logExcludeWebAccess ? "checked" : ""}> Hide web.access</label>
-   <select id="logLimit"><option ${logLimitSelection==="100"?"selected":""}>100</option><option ${logLimitSelection==="300"?"selected":""}>300</option><option ${logLimitSelection==="1000"?"selected":""}>1000</option></select>
-   <button onclick="loadLog()"><span class="ui-icon">&#128269;</span>Apply</button>${pushLabel()}
+  c.innerHTML = `<div class="toolbar-grid">
+   <input id="logSearch" placeholder="Filter log text" value="${esc(logTextFilter)}" oninput="logTextFilter=this.value;logPage=1;updateLogPage(false)">
+   <div class="toolbar-options">${levels.map(level=>`<label><input class="logLevel" type="checkbox" value="${level}" ${logLevelSelection.includes(level) ? "checked" : ""} onchange="logPage=1;updateLogPage()"> ${levelPill(level)}</label>`).join("")}</div>
+   <div class="toolbar-options">
+    <select id="logEventType" onchange="logPage=1;updateLogPage()"><option value="">All event types</option>${eventTypes.map(type=>`<option value="${esc(type)}" ${logEventTypeSelection.includes(type) ? "selected" : ""}>${esc(type)}</option>`).join("")}</select>
+    <label><input id="hideWebAccess" type="checkbox" ${logExcludeWebAccess ? "checked" : ""} onchange="logPage=1;updateLogPage()"> Hide web.access</label>
+    <select id="logPageSize" onchange="logPageSize=Number(this.value);logPage=1;updateLogPage()"><option value="50" ${logPageSize===50?"selected":""}>50</option><option value="100" ${logPageSize===100?"selected":""}>100</option><option value="250" ${logPageSize===250?"selected":""}>250</option></select>
+    ${pushLabel()}
+   </div>
   </div><div id="logRows"></div>`;
   await updateLogPage();
  }
@@ -662,7 +706,7 @@ async function render(){
   await updateTasksPage();
  }
  if(page==="Verification"){
-  c.innerHTML = `<div class="toolbar"><label><input id="selectAllVerification" type="checkbox" onchange="toggleSelectAllVerification(this.checked)"> Select visible</label><button class="primary" onclick="verifySelectedFiles()"><span class="ui-icon">&#10003;</span>Verify selected</button><button onclick="post('/api/verify',{force:true}).then(updateVerificationPage)"><span class="ui-icon">&#10003;</span>Verify all</button>${pushLabel()}</div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Missing chunks</h2><div id="verificationMissingRows"></div><h2 class="section-title"><span class="ui-icon">&#128269;</span>Unverified</h2><div id="verificationUnverifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Verified</h2><div id="verificationVerifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#128230;</span>No chunks</h2><div id="verificationNoChunksRows"></div>`;
+  c.innerHTML = `<div class="toolbar"><input id="verificationSearch" placeholder="Filter verification files" value="${esc(verificationTextFilter)}" oninput="verificationTextFilter=this.value;verificationMissingPage=verificationUnverifiedPage=verificationVerifiedPage=verificationNoChunksPage=1;updateVerificationPage()"><button class="primary" onclick="verifySelectedFiles()"><span class="ui-icon">&#10003;</span>Verify selected</button><button onclick="post('/api/verify',{force:true}).then(updateVerificationPage)"><span class="ui-icon">&#10003;</span>Verify all</button>${pushLabel()}</div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Missing chunks</h2><div id="verificationMissingRows"></div><h2 class="section-title"><span class="ui-icon">&#128269;</span>Unverified</h2><div id="verificationUnverifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Verified</h2><div id="verificationVerifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#128230;</span>No chunks</h2><div id="verificationNoChunksRows"></div>`;
   await updateVerificationPage();
  }
  if(page==="Statistics"){
@@ -746,17 +790,17 @@ function pagedTable(result, pageVar, cols){
  const pageNo = Number(result.page || 1);
  return table(result.rows || [], cols) + `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);updateQueuePage()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${Number(result.total || 0)} rows</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;updateQueuePage()">Next</button></div>`;
 }
-function verificationTable(rows){
+function verificationTable(rows, tableKey){
  if(!rows.length) return "<p class='muted'>No rows.</p>";
  const cols = ["relative_path","state","verification_state","chunk_count","verified_chunks","missing_chunks","last_verify_at","last_chunk_verify_at"];
- return `<table><thead><tr><th></th>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>`+
+ return `<table><thead><tr><th><input class="verificationTableSelect" data-table-key="${esc(tableKey)}" type="checkbox" onchange="toggleVerificationTable('${esc(tableKey)}', this.checked)"></th>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>`+
  rows.map(row => `<tr><td><input class="verificationSelect" type="checkbox" value="${Number(row.id)}" ${selectedVerificationFiles.has(Number(row.id)) ? "checked" : ""} onchange="setVerificationSelected(${Number(row.id)}, this.checked)"></td>${cols.map(c=>`<td>${formatCellHtml(c, row[c], row)}</td>`).join("")}</tr>`).join("")+
  "</tbody></table>";
 }
 function verificationPagedTable(result, pageVar, state){
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || 25)));
  const pageNo = Number(result.page || 1);
- return verificationTable(result.rows || []) + `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);updateVerificationPage()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${Number(result.total || 0)} ${esc(state.replace("_", " "))}</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;updateVerificationPage()">Next</button></div>`;
+ return verificationTable(result.rows || [], state) + `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);updateVerificationPage()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${Number(result.total || 0)} ${esc(state.replace("_", " "))}</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;updateVerificationPage()">Next</button></div>`;
 }
 function setVerificationSelected(fileId, checked){
  if(checked) selectedVerificationFiles.add(Number(fileId));
@@ -769,6 +813,17 @@ function toggleSelectAllVerification(checked){
   setVerificationSelected(Number(box.value), checked);
  });
 }
+function toggleVerificationTable(tableKey, checked){
+ const container = document.getElementById(`verification${verificationTableId(tableKey)}Rows`);
+ if(!container) return;
+ container.querySelectorAll(".verificationSelect").forEach(box => {
+  box.checked = checked;
+  setVerificationSelected(Number(box.value), checked);
+ });
+}
+function verificationTableId(tableKey){
+ return ({missing:"Missing",unverified:"Unverified",verified:"Verified",no_chunks:"NoChunks"}[tableKey] || "");
+}
 function updateVerificationSelectionState(rows=[]){
  const ids = rows.length ? rows.map(row => Number(row.id)) : Array.from(document.querySelectorAll(".verificationSelect")).map(box => Number(box.value));
  const selected = ids.filter(id => selectedVerificationFiles.has(id)).length;
@@ -777,6 +832,13 @@ function updateVerificationSelectionState(rows=[]){
   selectAll.checked = ids.length > 0 && selected === ids.length;
   selectAll.indeterminate = selected > 0 && selected < ids.length;
  }
+ document.querySelectorAll(".verificationTableSelect").forEach(box => {
+  const container = document.getElementById(`verification${verificationTableId(box.dataset.tableKey)}Rows`);
+  const tableIds = Array.from(container?.querySelectorAll(".verificationSelect") || []).map(item => Number(item.value));
+  const tableSelected = tableIds.filter(id => selectedVerificationFiles.has(id)).length;
+  box.checked = tableIds.length > 0 && tableSelected === tableIds.length;
+  box.indeterminate = tableSelected > 0 && tableSelected < tableIds.length;
+ });
 }
 async function verifySelectedFiles(){
  const ids = Array.from(selectedVerificationFiles);
@@ -791,11 +853,13 @@ async function updateTasksPage(){
  if(target) target.innerHTML = table(rows, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"]);
 }
 async function updateVerificationPage(){
+ verificationTextFilter = document.getElementById("verificationSearch")?.value || verificationTextFilter;
+ const q = encodeURIComponent(verificationTextFilter);
  const [missing, unverified, verified, noChunks] = await Promise.all([
-  api(`/api/verification?state=missing&page=${verificationMissingPage}&page_size=10`),
-  api(`/api/verification?state=unverified&page=${verificationUnverifiedPage}&page_size=10`),
-  api(`/api/verification?state=verified&page=${verificationVerifiedPage}&page_size=10`),
-  api(`/api/verification?state=no_chunks&page=${verificationNoChunksPage}&page_size=10`)
+  api(`/api/verification?state=missing&page=${verificationMissingPage}&page_size=10&q=${q}`),
+  api(`/api/verification?state=unverified&page=${verificationUnverifiedPage}&page_size=10&q=${q}`),
+  api(`/api/verification?state=verified&page=${verificationVerifiedPage}&page_size=10&q=${q}`),
+  api(`/api/verification?state=no_chunks&page=${verificationNoChunksPage}&page_size=10&q=${q}`)
  ]);
  const missingTarget = document.getElementById("verificationMissingRows");
  const unverifiedTarget = document.getElementById("verificationUnverifiedRows");
@@ -857,12 +921,12 @@ function statusDashboard(status, tasks, speed){
   .filter(task => task.status !== "running" && task.time_until_next_run)
   .sort((a,b) => secondsFromLabel(a.time_until_next_run) - secondsFromLabel(b.time_until_next_run))[0];
  return `<div class="dashboard">
-  <div class="toolbar"><button class="primary" onclick="post('/api/scan').then(updateStatusPage)"><span class="ui-icon">&#128193;</span>Scan now</button><button onclick="post('/api/queue/enqueue-unbacked').then(updateStatusPage)"><span class="ui-icon">&#10133;</span>Queue unbacked</button><button onclick="post('/api/verify',{force:true}).then(updateStatusPage)"><span class="ui-icon">&#10003;</span>Verify chunks</button>${pushLabel()}</div>
   <div class="hero-status">
    <h2><span class="ui-icon">${activeTask ? "&#9658;" : "&#10003;"}</span>${esc(activeTask ? `${activeTask.name} is running` : "Backuprr is standing by")}</h2>
    <div class="muted">${esc(activeTask ? activeTask.last_result || "Working through the current task" : nextTask ? `Next: ${nextTask.name} in ${nextTask.time_until_next_run}` : "No scheduled task time reported")}</div>
-   <div class="progress-track"><div class="progress-fill" style="width:${protectedPct}%"></div></div>
-   <div>${protectedPct}% backed up &middot; ${backed} of ${total} files protected (${formatBytes(backedBytes)} of ${formatBytes(totalBytes)}) &middot; ${queued + posting} waiting or posting (${formatBytes(queuedBytes + postingBytes)}) &middot; ${chunks} chunks posted (${formatBytes(chunkBytes)})</div>
+  <div class="progress-track"><div class="progress-fill" style="width:${protectedPct}%"></div></div>
+  <div>${protectedPct}% backed up &middot; ${backed} of ${total} files protected (${formatBytes(backedBytes)} of ${formatBytes(totalBytes)}) &middot; ${queued + posting} waiting or posting (${formatBytes(queuedBytes + postingBytes)}) &middot; ${chunks} chunks posted (${formatBytes(chunkBytes)})</div>
+   <div>${pushLabel()}</div>
   </div>
   <div class="task-strip">${tasks.map(taskCard).join("")}</div>
   <div class="stats">
@@ -950,7 +1014,15 @@ function taskCard(task){
   <div><span class="ui-icon">&#9201;</span>Duration: ${esc(task.last_run_duration || "-")}</div>
   <div><span class="ui-icon">&#9202;</span>Next run: ${esc(task.time_until_next_run || "-")}</div>
   <div class="${task.last_error ? "error" : "muted"}">${esc(task.last_error || task.last_result || "")}</div>
+  ${taskActions(task.kind)}
  </div>`;
+}
+function taskActions(kind){
+ if(kind === "catalog") return `<div class="toolbar-options"><button class="primary" onclick="post('/api/scan').then(updateStatusPage)"><span class="ui-icon">&#128193;</span>Scan now</button></div>`;
+ if(kind === "backup") return `<div class="toolbar-options"><button onclick="post('/api/queue/enqueue-unbacked').then(updateStatusPage)"><span class="ui-icon">&#10133;</span>Queue unbacked</button><button class="primary" onclick="post('/api/post-next').then(updateStatusPage)"><span class="ui-icon">&#9658;</span>Post next</button></div>`;
+ if(kind === "verification") return `<div class="toolbar-options"><button onclick="post('/api/verify',{force:true}).then(updateStatusPage)"><span class="ui-icon">&#10003;</span>Verify chunks</button></div>`;
+ if(kind === "cloud_backup") return `<div class="toolbar-options"><button onclick="post('/api/cloud-backup').then(updateStatusPage)"><span class="ui-icon">&#9729;</span>Backup config/db</button></div>`;
+ return "";
 }
 function barChart(title, rows){
  const max = Math.max(1, ...rows.map(row => Number(row[1] || 0)));
@@ -1110,12 +1182,12 @@ async function updateLogPage(saveSelection=true){
  logLevelSelection = Array.from(document.querySelectorAll(".logLevel:checked")).map(input => input.value);
  logEventTypeSelection = Array.from(document.querySelectorAll("#logEventType")).map(input => input.value).filter(Boolean);
  logExcludeWebAccess = !!document.getElementById("hideWebAccess")?.checked;
- logLimitSelection = document.getElementById("logLimit").value;
+ logTextFilter = document.getElementById("logSearch")?.value || logTextFilter;
  const levels = logLevelSelection.map(level => "level="+encodeURIComponent(level)).join("&");
  const eventTypes = logEventTypeSelection.map(type => "event_type="+encodeURIComponent(type)).join("&");
  const exclude = logExcludeWebAccess ? "exclude_event_type=web.access" : "";
- const limit = encodeURIComponent(logLimitSelection);
- document.getElementById("logRows").innerHTML = table(await api(`/api/log?limit=${limit}&${levels}&${eventTypes}&${exclude}`), ["id","ts","level","event_type","message","file_id"]);
+ const result = await api(`/api/log?page=${logPage}&page_size=${logPageSize}&q=${encodeURIComponent(logTextFilter)}&${levels}&${eventTypes}&${exclude}`);
+ document.getElementById("logRows").innerHTML = table(result.rows || [], ["id","ts","level","event_type","message","file_id"]) + paginationControls(result, "logPage", "updateLogPage");
 }
 async function loadLog(){ await updateLogPage(); }
 function fileTree(rows, showDeleted=false){
@@ -1140,7 +1212,7 @@ function treeNode(node, prefix, showDeleted){
   const state = folderState(node.dirs[name]);
   const canRestore = folderChunkCount(node.dirs[name]) > 0;
   const ids = collectNodeFiles(node.dirs[name]).map(file => Number(file.id));
-  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span>${statePill(state)}<span class="tree-meta">${countFiles(node.dirs[name])} files &middot; ${formatBytes(node.dirs[name].total_size || 0)}</span><button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button>${canRestore ? `<button class="icon-btn" title="Restore folder" onclick="event.preventDefault();restoreCatalogFolder(${jsString(path)})">&#8635;</button>` : ""}</summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
+  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row folder-row"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span class="tree-meta">${countFiles(node.dirs[name])} files &middot; ${formatBytes(node.dirs[name].total_size || 0)}</span><span class="tree-actions"><button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button>${canRestore ? `<button class="icon-btn" title="Restore or download folder" onclick="event.preventDefault();restoreCatalogFolder(${jsString(path)})">&#8635;</button>` : ""}</span></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
  }).join("");
  const fileHtml = node.files.sort((a,b)=>String(a.display_name).localeCompare(String(b.display_name))).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
@@ -1159,6 +1231,16 @@ function folderState(node){
  if(files.some(file => ["queued","posting"].includes(file.state))) return "queued";
  return "discovered";
 }
+function folderVerifiedPill(node){
+ const files = collectNodeFiles(node).filter(file => file.state !== "deleted" && Number(file.chunk_count || 0) > 0);
+ if(!files.length) return `<span class="pill warn" title="No chunk records"><span class="ui-icon">&#128230;</span>No chunks</span>`;
+ const missing = files.filter(file => Number(file.missing_chunks || 0) > 0).length;
+ if(missing) return `<span class="pill bad" title="${missing} file(s) have missing chunks"><span class="ui-icon">&#9888;</span>Missing</span>`;
+ const verified = files.filter(file => file.last_verify_at).length;
+ if(verified === files.length) return `<span class="pill ok" title="All files in this folder have been verified"><span class="ui-icon">&#10003;</span>Verified</span>`;
+ if(verified > 0) return `<span class="pill warn" title="${verified} of ${files.length} restorable files verified"><span class="ui-icon">&#128269;</span>${verified}/${files.length}</span>`;
+ return `<span class="pill warn" title="Files have chunks but have not been verified yet"><span class="ui-icon">&#128269;</span>Unverified</span>`;
+}
 function collectNodeFiles(node){
  return node.files.concat(...Object.values(node.dirs).map(child => collectNodeFiles(child)));
 }
@@ -1167,7 +1249,7 @@ function fileRow(file){
  const hasChunks = Number(file.chunk_count || 0) > 0;
  const checked = selectedFiles.has(Number(file.id)) ? "checked" : "";
  const progress = fileProgress(file);
- return `<li><div class="tree-row">
+ return `<li><div class="tree-row file-row">
   <input type="checkbox" class="fileSelect" value="${Number(file.id)}" ${checked} onchange="setFileSelected(${Number(file.id)}, this.checked)">
   <span>&#128196;</span>
   <span class="tree-name">${esc(file.display_name)}</span>
@@ -1176,24 +1258,26 @@ function fileRow(file){
   <span class="tree-meta">${Number(file.chunk_count || 0)} chunks</span>
   ${verifiedPill(file.last_verify_at)}
   ${progress}
+  <span class="tree-actions">
   ${canQueue ? `<button class="icon-btn" title="Queue file" onclick="queueFile(${Number(file.id)})">&#10133;</button>` : ""}
   ${file.state !== "backed_up" && file.state !== "deleted" ? `<button class="icon-btn" title="Increase queue priority" onclick="boostFile(${Number(file.id)})">&#8593;</button>` : ""}
-  ${hasChunks ? `<button class="icon-btn" title="Restore file" onclick="restoreCatalogFile(${Number(file.id)})">&#8635;</button>` : ""}
+  ${hasChunks ? `<button class="icon-btn" title="Restore or download file" onclick="restoreCatalogFile(${Number(file.id)})">&#8635;</button>` : ""}
+  </span>
  </div></li>`;
 }
 function verifiedPill(timestamp){
- if(!timestamp) return "";
+ if(!timestamp) return `<span></span>`;
  return `<span class="pill ok verified" title="Verified ${esc(formatDateTime(timestamp))}"><span class="ui-icon">&#10003;</span>Verified</span>`;
 }
 function fileProgress(file){
  const active = file.state === "posting" || file.queue_status === "posting";
- if(!active) return "";
+ if(!active) return `<span></span>`;
  const expected = Math.max(1, Math.ceil(Number(file.size || 0) / Number(settingsCache?.article_size || 786432)));
  const chunks = Number(file.progress_chunks || 0);
  const bytes = Number(file.progress_bytes || 0);
  const pct = Math.min(100, Math.round((chunks / expected) * 100));
- const label = `${chunks}/${expected} chunks · ${formatBytes(bytes)} posted · ${pct}%`;
- return `<div class="file-progress"><div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div><span>${esc(label)}</span></div>`;
+ const label = chunks > 0 ? `${chunks}/${expected} chunks - ${formatBytes(bytes)} posted - ${pct}%` : `posting first chunk - ${formatBytes(bytes)} posted`;
+ return `<div class="file-progress"><div class="progress-track"><div class="progress-fill" style="width:${Math.max(3,pct)}%"></div></div><span>${esc(label)}</span></div>`;
 }
 function setFileSelected(fileId, checked){
  const id = Number(fileId);
@@ -1257,8 +1341,10 @@ function updateFilesSelectionSummary(){
  const totalSize = selectedRows.reduce((total, row) => total + Number(row.size || 0), 0);
  const restorable = selectedRows.filter(row => Number(row.chunk_count || 0) > 0).length;
  const unbacked = selectedRows.filter(row => row.state !== "backed_up" && row.state !== "deleted").length;
+ const progressRows = selectedRows.filter(row => row.state === "posting" || row.queue_status === "posting" || Number(row.progress_chunks || 0) > 0);
+ const progressHtml = progressRows.length ? `<div class="toolbar-options">${progressRows.slice(0, 4).map(row => `<div class="mini-progress"><b>${esc(row.relative_path || row.path)}</b>${fileProgress(row)}</div>`).join("")}</div>` : "";
  target.innerHTML = selectedRows.length
-  ? `<b>${selectedRows.length}</b> selected &middot; ${formatBytes(totalSize)} &middot; ${restorable} restorable &middot; ${unbacked} unbacked`
+  ? `<b>${selectedRows.length}</b> selected &middot; ${formatBytes(totalSize)} &middot; ${restorable} restorable &middot; ${unbacked} unbacked${progressHtml}`
   : `<span class="muted">No files selected.</span>`;
 }
 async function queueFile(fileId){
@@ -1286,9 +1372,17 @@ async function boostSelectedFiles(){
 async function restoreSelectedFiles(){
  const selectedRows = Array.from(selectedFileData.values()).filter(row => Number(row.chunk_count || 0) > 0);
  if(!selectedRows.length) return alert("Select files with recorded chunks first");
- const dest = prompt("Restore destination folder, blank for original locations", "");
+ const mode = restoreModePrompt(selectedRows.length > 1);
+ if(!mode) return;
+ if(mode === "download" && selectedRows.length > 1 && !confirm(`Open ${selectedRows.length} browser downloads?`)) return;
+ const dest = mode === "destination" ? prompt("Restore destination folder", "") : "";
  let restored = 0;
  for(const file of selectedRows){
+  if(mode === "download"){
+   window.open(`/api/restore/download?path=${encodeURIComponent(file.path)}`, "_blank");
+   restored++;
+   continue;
+  }
   const confidence = await post("/api/restore/confidence", { path:file.path });
   if(confidence.warning && !confirm(`${file.relative_path || file.path}\n${confidence.warning}\nContinue restore?`)) continue;
   const out = await post("/api/restore", { path:file.path, dest:dest || null });
@@ -1300,16 +1394,35 @@ async function restoreSelectedFiles(){
 async function restoreCatalogFile(fileId){
  const file = fileRowsCache.find(row => Number(row.id) === Number(fileId));
  if(!file) return;
+ const mode = restoreModePrompt(false);
+ if(!mode) return;
+ if(mode === "download"){
+  window.open(`/api/restore/download?path=${encodeURIComponent(file.path)}`, "_blank");
+  return;
+ }
  const confidence = await post("/api/restore/confidence", { path:file.path });
  if(confidence.warning && !confirm(`${confidence.warning}\nContinue restore?`)) return;
- const dest = prompt("Restore destination, blank for original location", "");
+ const dest = mode === "destination" ? prompt("Restore destination", "") : "";
  const out = await post("/api/restore", { path:file.path, dest:dest || null });
  alert(out.error || `Restored to ${out.target}`);
 }
 async function restoreCatalogFolder(path){
- const dest = prompt("Restore destination for this folder, blank for original locations", "");
+ const mode = prompt("Folder restore mode: origin or destination", "origin");
+ if(!mode) return;
+ if(mode.toLowerCase().startsWith("download")) return alert("Browser download is available for individual files. Use destination restore for folders.");
+ const dest = mode.toLowerCase().startsWith("dest") ? prompt("Restore destination for this folder", "") : "";
  const out = await post("/api/restore", { path:path, dest:dest || null, folder:true });
  alert(out.error || `Restored ${out.restored} files`);
+}
+function restoreModePrompt(multiple=false){
+ const mode = prompt(`${multiple ? "Selected files" : "File"} restore mode: origin, destination, or download`, "origin");
+ if(!mode) return "";
+ const normalized = mode.toLowerCase().trim();
+ if(normalized.startsWith("orig")) return "origin";
+ if(normalized.startsWith("dest") || normalized.startsWith("new")) return "destination";
+ if(normalized.startsWith("down")) return "download";
+ alert("Use origin, destination, or download");
+ return "";
 }
 async function search(){ document.getElementById("results").innerHTML = table(await api("/api/search?q="+encodeURIComponent(document.getElementById("q").value)), ["id","relative_path","size","state","updated_at"]); }
 async function restore(){ const out = await post("/api/restore",{path:restorePath.value,dest:restoreDest.value,folder:restoreFolder.checked}); restoreOut.textContent = JSON.stringify(out,null,2); }
@@ -1553,3 +1666,4 @@ render();
 </script>
 </body>
 </html>"""
+

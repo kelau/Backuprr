@@ -1,7 +1,7 @@
 import email
 import hashlib
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from .backup import decode_chunk
 from .config import Config
@@ -28,13 +28,7 @@ def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
 
 
 def restore_file(db: Database, config: Config, source_path: str, dest: Optional[str] = None) -> Path:
-    with db.connect() as conn:
-        file_row = conn.execute("SELECT * FROM files WHERE path=? OR relative_path=?", (source_path, source_path)).fetchone()
-        if not file_row:
-            raise FileNotFoundError(f"No cataloged file matches {source_path}")
-        chunks = conn.execute("SELECT * FROM chunks WHERE file_id=? ORDER BY chunk_index", (file_row["id"],)).fetchall()
-    if not chunks:
-        raise RuntimeError(f"No Usenet chunks recorded for {source_path}")
+    file_row, chunks = restore_source(db, source_path)
     target = Path(dest) if dest else Path(file_row["path"])
     if target.exists() and target.is_dir():
         target = target / Path(file_row["path"]).name
@@ -55,6 +49,36 @@ def restore_file(db: Database, config: Config, source_path: str, dest: Optional[
         db.mark_restored_backed_up(int(file_row["id"]), stat.st_size, stat.st_mtime_ns, sha256_file(target))
     db.log("info", "restore", f"Restored {source_path} to {target}", int(file_row["id"]))
     return target
+
+
+def restore_source(db: Database, source_path: str) -> tuple[Any, list[Any]]:
+    with db.connect() as conn:
+        file_row = conn.execute("SELECT * FROM files WHERE path=? OR relative_path=?", (source_path, source_path)).fetchone()
+        if not file_row:
+            raise FileNotFoundError(f"No cataloged file matches {source_path}")
+        chunks = conn.execute("SELECT * FROM chunks WHERE file_id=? ORDER BY chunk_index", (file_row["id"],)).fetchall()
+    if not chunks:
+        raise RuntimeError(f"No Usenet chunks recorded for {source_path}")
+    return file_row, chunks
+
+
+def restored_payloads(db: Database, config: Config, source_path: str) -> tuple[Any, Iterator[bytes]]:
+    file_row, chunks = restore_source(db, source_path)
+
+    def iterator() -> Iterator[bytes]:
+        host = select_host(config, "read")
+        passphrase = config.encryption_passphrase()
+        with UsenetClient(host) as client:
+            if not client.conn:
+                raise RuntimeError("NNTP connection not open")
+            for chunk in chunks:
+                raw = b"\n".join(article_lines(client.conn.article(chunk["message_id"])))
+                msg = email.message_from_bytes(raw)
+                payload = msg.get_payload(decode=True) or b""
+                db.record_transfer_sample("download", len(payload))
+                yield decode_chunk(payload, passphrase)
+
+    return file_row, iterator()
 
 
 def restore_sample(db: Database, config: Config, source_path: str, max_bytes: int) -> bytes:

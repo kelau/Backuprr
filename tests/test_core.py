@@ -120,7 +120,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.42")
+        self.assertEqual(__version__, "0.2.43")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -210,6 +210,34 @@ class CoreTests(unittest.TestCase):
         rows = self.db.verification_rows(10, 0, "missing")
         self.assertEqual(rows[0]["relative_path"], "missing.mkv")
         self.assertEqual(rows[0]["verification_state"], "missing")
+
+    def test_verification_rows_can_be_filtered_by_text(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "proxmox.iso").write_bytes(b"iso")
+        (media / "ubuntu.iso").write_bytes(b"iso")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_ids = [row["id"] for row in conn.execute("SELECT id FROM files").fetchall()]
+        for file_id in file_ids:
+            self.db.add_chunk(file_id, 0, f"<{file_id}@example.test>", 3, "sha", "")
+        rows = self.db.verification_rows(10, 0, "unverified", "proxmox")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["relative_path"], "proxmox.iso")
+        self.assertEqual(self.db.verification_count("unverified", "proxmox"), 1)
+
+    def test_event_log_supports_text_filter_count_and_pagination(self):
+        self.db.log("info", "backup.task", "Posting proxmox iso")
+        self.db.log("warning", "verify.chunk", "Missing ubuntu chunk")
+        self.db.log("debug", "backup.task", "Posting proxmox chunk")
+        rows = self.db.list_events(["info", "debug"], limit=1, offset=0, search="proxmox")
+        self.assertEqual(len(rows), 1)
+        self.assertIn("proxmox", rows[0]["message"])
+        self.assertEqual(self.db.event_count(["info", "debug"], search="proxmox"), 2)
+        second = self.db.list_events(["info", "debug"], limit=1, offset=1, search="proxmox")
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(rows[0]["id"], second[0]["id"])
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
