@@ -10,6 +10,7 @@ from . import __version__
 from .cloud_backup import backup_config_and_database
 from .config import Config, update_config
 from .db import Database
+from .log_forwarding import LogForwarder
 from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, MaintenanceMonitor, RestoreDrillMonitor
 from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, restore_plan, run_maintenance, run_restore_drill, test_post_host_article_size
 from .queueing import enqueue_unbacked, move, prioritize
@@ -178,8 +179,17 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/verification":
             page = max(1, int(query.get("page", ["1"])[0]))
             page_size = max(1, min(200, int(query.get("page_size", ["25"])[0])))
+            verification_state = query.get("state", [""])[0]
             offset = (page - 1) * page_size
-            self.send_json({"rows": rowdicts(self.db.verification_rows(page_size, offset)), "page": page, "page_size": page_size, "total": self.db.file_count()})
+            self.send_json(
+                {
+                    "rows": rowdicts(self.db.verification_rows(page_size, offset, verification_state)),
+                    "page": page,
+                    "page_size": page_size,
+                    "total": self.db.verification_count(verification_state),
+                    "state": verification_state,
+                }
+            )
         elif parsed.path == "/api/log":
             levels = query.get("level", [])
             if not levels and query.get("levels"):
@@ -277,6 +287,7 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/settings":
                 update_config(self.config, data)
                 self.config.save(self.config_path)
+                self.db.event_forwarder = LogForwarder(self.config.log_destinations)
                 for endpoint in self.config.endpoints:
                     self.db.add_endpoint(endpoint)
                 self.db.log("info", "settings", "Updated configuration from Web UI")
@@ -510,7 +521,10 @@ let activeQueuePage = 1;
 let completedQueuePage = 1;
 let failedQueuePage = 1;
 let filesPage = 1;
-let verificationPage = 1;
+let verificationMissingPage = 1;
+let verificationUnverifiedPage = 1;
+let verificationVerifiedPage = 1;
+let verificationNoChunksPage = 1;
 let selectedFiles = new Set();
 let selectedFileData = new Map();
 let selectedVerificationFiles = new Set();
@@ -544,7 +558,7 @@ function formatCell(col, value){
 function formatCellHtml(col, value, row={}){
  if(["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked","article_size_bytes","max_article_size_bytes","estimated_bytes"].includes(col)) return esc(formatBytes(value));
  if(["ts","created_at","updated_at","last_backup_at","last_verify_at","last_chunk_verify_at","posted_at","verified_at","last_run","started_at","finished_at","checked_at"].includes(col)) return esc(formatDateTime(value));
- if(["state","status"].includes(col)) return statePill(value);
+ if(["state","status","verification_state"].includes(col)) return statePill(value);
  if(col === "level") return levelPill(value);
  if(col === "kind") return iconText(kindIcon(value), value);
  if(col === "progress") return iconText(iconForProgress(row.progress_percent), value);
@@ -558,10 +572,10 @@ function pageIcon(name){
  return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Operations:"&#128736;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
 }
 function stateIcon(value){
- return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",unreadable:"&#128274;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;"}[String(value || "")] || "&#8226;");
+ return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",unreadable:"&#128274;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;",unverified:"&#128269;",no_chunks:"&#128230;"}[String(value || "")] || "&#8226;");
 }
 function stateTone(value){
- return ({backed_up:"ok",done:"ok",restored:"ok",queued:"warn",posting:"warn",running:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad",unreadable:"bad"}[String(value || "")] || "");
+ return ({backed_up:"ok",done:"ok",restored:"ok",verified:"ok",queued:"warn",posting:"warn",running:"warn",unverified:"warn",no_chunks:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad",missing:"bad",unreadable:"bad"}[String(value || "")] || "");
 }
 function statePill(value){
  const tone = stateTone(value);
@@ -648,7 +662,7 @@ async function render(){
   await updateTasksPage();
  }
  if(page==="Verification"){
-  c.innerHTML = `<div class="toolbar"><label><input id="selectAllVerification" type="checkbox" onchange="toggleSelectAllVerification(this.checked)"> Select page</label><button class="primary" onclick="verifySelectedFiles()"><span class="ui-icon">&#10003;</span>Verify selected</button><button onclick="post('/api/verify',{force:true}).then(updateVerificationPage)"><span class="ui-icon">&#10003;</span>Verify all</button>${pushLabel()}</div><div id="verificationRows"></div>`;
+  c.innerHTML = `<div class="toolbar"><label><input id="selectAllVerification" type="checkbox" onchange="toggleSelectAllVerification(this.checked)"> Select visible</label><button class="primary" onclick="verifySelectedFiles()"><span class="ui-icon">&#10003;</span>Verify selected</button><button onclick="post('/api/verify',{force:true}).then(updateVerificationPage)"><span class="ui-icon">&#10003;</span>Verify all</button>${pushLabel()}</div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Missing chunks</h2><div id="verificationMissingRows"></div><h2 class="section-title"><span class="ui-icon">&#128269;</span>Unverified</h2><div id="verificationUnverifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Verified</h2><div id="verificationVerifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#128230;</span>No chunks</h2><div id="verificationNoChunksRows"></div>`;
   await updateVerificationPage();
  }
  if(page==="Statistics"){
@@ -734,10 +748,15 @@ function pagedTable(result, pageVar, cols){
 }
 function verificationTable(rows){
  if(!rows.length) return "<p class='muted'>No rows.</p>";
- const cols = ["relative_path","state","chunk_count","verified_chunks","missing_chunks","last_verify_at","last_chunk_verify_at"];
+ const cols = ["relative_path","state","verification_state","chunk_count","verified_chunks","missing_chunks","last_verify_at","last_chunk_verify_at"];
  return `<table><thead><tr><th></th>${cols.map(c=>`<th>${esc(c)}</th>`).join("")}</tr></thead><tbody>`+
  rows.map(row => `<tr><td><input class="verificationSelect" type="checkbox" value="${Number(row.id)}" ${selectedVerificationFiles.has(Number(row.id)) ? "checked" : ""} onchange="setVerificationSelected(${Number(row.id)}, this.checked)"></td>${cols.map(c=>`<td>${formatCellHtml(c, row[c], row)}</td>`).join("")}</tr>`).join("")+
  "</tbody></table>";
+}
+function verificationPagedTable(result, pageVar, state){
+ const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || 25)));
+ const pageNo = Number(result.page || 1);
+ return verificationTable(result.rows || []) + `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);updateVerificationPage()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${Number(result.total || 0)} ${esc(state.replace("_", " "))}</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;updateVerificationPage()">Next</button></div>`;
 }
 function setVerificationSelected(fileId, checked){
  if(checked) selectedVerificationFiles.add(Number(fileId));
@@ -772,10 +791,21 @@ async function updateTasksPage(){
  if(target) target.innerHTML = table(rows, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"]);
 }
 async function updateVerificationPage(){
- const result = await api(`/api/verification?page=${verificationPage}&page_size=25`);
- const target = document.getElementById("verificationRows");
- if(target) target.innerHTML = verificationTable(result.rows || []) + paginationControls(result, "verificationPage", "updateVerificationPage");
- updateVerificationSelectionState(result.rows || []);
+ const [missing, unverified, verified, noChunks] = await Promise.all([
+  api(`/api/verification?state=missing&page=${verificationMissingPage}&page_size=10`),
+  api(`/api/verification?state=unverified&page=${verificationUnverifiedPage}&page_size=10`),
+  api(`/api/verification?state=verified&page=${verificationVerifiedPage}&page_size=10`),
+  api(`/api/verification?state=no_chunks&page=${verificationNoChunksPage}&page_size=10`)
+ ]);
+ const missingTarget = document.getElementById("verificationMissingRows");
+ const unverifiedTarget = document.getElementById("verificationUnverifiedRows");
+ const verifiedTarget = document.getElementById("verificationVerifiedRows");
+ const noChunksTarget = document.getElementById("verificationNoChunksRows");
+ if(missingTarget) missingTarget.innerHTML = verificationPagedTable(missing, "verificationMissingPage", "missing");
+ if(unverifiedTarget) unverifiedTarget.innerHTML = verificationPagedTable(unverified, "verificationUnverifiedPage", "unverified");
+ if(verifiedTarget) verifiedTarget.innerHTML = verificationPagedTable(verified, "verificationVerifiedPage", "verified");
+ if(noChunksTarget) noChunksTarget.innerHTML = verificationPagedTable(noChunks, "verificationNoChunksPage", "no_chunks");
+ updateVerificationSelectionState([...(missing.rows || []), ...(unverified.rows || []), ...(verified.rows || []), ...(noChunks.rows || [])]);
 }
 async function updateStatisticsPage(){
  const data = await api("/api/statistics");
@@ -1285,7 +1315,7 @@ async function search(){ document.getElementById("results").innerHTML = table(aw
 async function restore(){ const out = await post("/api/restore",{path:restorePath.value,dest:restoreDest.value,folder:restoreFolder.checked}); restoreOut.textContent = JSON.stringify(out,null,2); }
 function settingsForm(s){
  return `<div class="tabs">
-  ${["General","Usenet","Protection","Schedules","Endpoints","Cloud"].map((name,index)=>`<button class="${index===0?"primary":""}" onclick="showSettingsTab('${name}', this)">${name}</button>`).join("")}
+  ${["General","Usenet","Protection","Schedules","Endpoints","Logging","Cloud"].map((name,index)=>`<button class="${index===0?"primary":""}" onclick="showSettingsTab('${name}', this)">${name}</button>`).join("")}
  </div>
  <div id="tabGeneral" class="tab-panel active"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#127912;</span>UI template</span><select id="setUiTheme" onchange="applyTheme(this.value)">${themeOptions(s.ui_theme || "harbor_light")}</select></label>
@@ -1314,10 +1344,6 @@ function settingsForm(s){
   <label><input id="setPar2" type="checkbox" ${s.par2?.enabled?"checked":""}> <span class="ui-icon">&#128737;</span>Generate PAR2 recovery files</label>
   <label class="field"><span><span class="ui-icon">&#9881;</span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
   <label class="field"><span><span class="ui-icon">&#128737;</span>PAR2 redundancy</span><div class="range-field"><input id="setPar2Redundancy" type="range" min="1" max="50" step="1" value="${esc(s.par2?.redundancy_percent ?? 10)}" oninput="setPar2RedundancyLabel.textContent=this.value + '%'"><span id="setPar2RedundancyLabel">${esc(s.par2?.redundancy_percent ?? 10)}%</span></div></label>
-  <label class="field"><span><span class="ui-icon">&#128221;</span>Log retention days</span><input id="setLogRetentionDays" type="number" min="1" max="3650" value="${esc(s.log_retention_days || 30)}"></label>
-  <label class="field"><span><span class="ui-icon">&#128269;</span>Verbose log retention days</span><input id="setVerboseLogRetentionDays" type="number" min="1" max="3650" value="${esc(s.verbose_log_retention_days || 7)}"></label>
-  <label><input id="setLogWebAccess" type="checkbox" ${s.log_web_access?"checked":""}> <span class="ui-icon">&#128221;</span>Log web access requests</label>
-  <label><input id="setLogChunkEvents" type="checkbox" ${s.log_chunk_events?"checked":""}> <span class="ui-icon">&#129513;</span>Log successful per-chunk events</label>
   <label><input id="setCompactChunkMetadata" type="checkbox" ${s.compact_chunk_metadata === false ? "" : "checked"}> <span class="ui-icon">&#128451;</span>Compact stored chunk metadata</label>
   <label class="field"><span><span class="ui-icon">&#8635;</span>Restore drill interval days</span><input id="setRestoreDrillDays" type="number" min="1" max="3650" value="${esc(s.restore_drill_interval_days || 30)}"></label>
   <label class="field"><span><span class="ui-icon">&#128207;</span>Restore drill sample bytes</span><input id="setRestoreDrillBytes" type="number" min="1" value="${esc(s.restore_drill_sample_bytes || 1048576)}"></label>
@@ -1329,10 +1355,17 @@ function settingsForm(s){
  <div id="tabUsenet" class="tab-panel"><div class="form-grid">
   <div class="field full"><span><span class="ui-icon">&#128225;</span>Usenet hosts</span><div id="hostList" class="host-list">${hostRows(s.usenet_hosts || [])}</div></div>
  </div></div>
+ <div id="tabLogging" class="tab-panel"><div class="form-grid">
+  <label class="field"><span><span class="ui-icon">&#128221;</span>Local log retention days</span><input id="setLogRetentionDays" type="number" min="1" max="3650" value="${esc(s.log_retention_days || 30)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128269;</span>Verbose log retention days</span><input id="setVerboseLogRetentionDays" type="number" min="1" max="3650" value="${esc(s.verbose_log_retention_days || 7)}"></label>
+  <label><input id="setLogWebAccess" type="checkbox" ${s.log_web_access?"checked":""}> <span class="ui-icon">&#128221;</span>Log web access requests</label>
+  <label><input id="setLogChunkEvents" type="checkbox" ${s.log_chunk_events?"checked":""}> <span class="ui-icon">&#129513;</span>Log successful per-chunk events</label>
+  <div class="field full"><span><span class="ui-icon">&#128225;</span>Log aggregation destinations</span><div id="logDestinationList" class="host-list">${logDestinationRows(s.log_destinations || [])}</div></div>
+ </div></div>
  <div id="tabCloud" class="tab-panel"><div class="form-grid">
   <div class="field full"><span><span class="ui-icon">&#9729;</span>Cloud backup targets</span><div id="cloudList" class="host-list">${cloudRows(s.cloud_backups || [])}</div></div>
  </div></div>
- <div class="toolbar"><button onclick="addHost()"><span class="ui-icon">&#10133;</span>Add host</button><button onclick="addCloudTarget()"><span class="ui-icon">&#10133;</span>Add cloud target</button><button onclick="post('/api/cloud-backup').then(out=>settingsOut.textContent=JSON.stringify(out,null,2))"><span class="ui-icon">&#9729;</span>Backup config/db now</button><button class="primary" onclick="saveSettings()"><span class="ui-icon">&#128190;</span>Save settings</button><button onclick="render()"><span class="ui-icon">&#8635;</span>Reset</button></div>
+ <div class="toolbar"><button onclick="addHost()"><span class="ui-icon">&#10133;</span>Add host</button><button onclick="addLogDestination()"><span class="ui-icon">&#10133;</span>Add log destination</button><button onclick="addCloudTarget()"><span class="ui-icon">&#10133;</span>Add cloud target</button><button onclick="post('/api/cloud-backup').then(out=>settingsOut.textContent=JSON.stringify(out,null,2))"><span class="ui-icon">&#9729;</span>Backup config/db now</button><button class="primary" onclick="saveSettings()"><span class="ui-icon">&#128190;</span>Save settings</button><button onclick="render()"><span class="ui-icon">&#8635;</span>Reset</button></div>
  <pre id="settingsOut"></pre>`;
 }
 function showSettingsTab(name, button){
@@ -1361,6 +1394,25 @@ function hostRow(host, index){
 function cloudRows(targets){
  return targets.map((target, index) => cloudRow(target, index)).join("") || cloudRow({ name:"", provider:"local", target:"", command:"", enabled:true }, 0);
 }
+function logDestinationRows(destinations){
+ return destinations.map((destination, index) => logDestinationRow(destination, index)).join("") || logDestinationRow({ name:"", platform:"loki", url:"", api_key:"", username:"", password:"", min_level:"info", timeout_seconds:5, enabled:false }, 0);
+}
+function logDestinationRow(destination, index){
+ return `<div class="log-destination-row" data-log-destination-index="${index}">
+  <div class="toolbar"><h3><span class="ui-icon">&#128225;</span>Log destination ${index + 1}</h3><button class="danger" onclick="removeLogDestination(this)"><span class="ui-icon">&#128465;</span>Remove</button></div>
+  <div class="host-grid">
+   <label><input class="logDestinationEnabled" type="checkbox" ${destination.enabled ? "checked" : ""}> Enabled</label>
+   <label class="field"><span><span class="ui-icon">&#128278;</span>Name</span><input class="logDestinationName" value="${esc(destination.name || "")}" placeholder="home-loki"></label>
+   <label class="field"><span><span class="ui-icon">&#128225;</span>Platform</span><select class="logDestinationPlatform"><option value="loki" ${destination.platform==="loki"?"selected":""}>Grafana Loki</option><option value="seq" ${destination.platform==="seq"?"selected":""}>Seq</option><option value="graylog" ${destination.platform==="graylog"?"selected":""}>Graylog GELF HTTP</option><option value="elastic" ${destination.platform==="elastic"?"selected":""}>Elastic HTTP</option><option value="logstash" ${destination.platform==="logstash"?"selected":""}>Logstash HTTP</option><option value="splunk_hec" ${destination.platform==="splunk_hec"?"selected":""}>Splunk HEC</option></select></label>
+   <label class="field"><span><span class="ui-icon">&#127760;</span>URL</span><input class="logDestinationUrl" value="${esc(destination.url || "")}" placeholder="http://server:3100/loki/api/v1/push"></label>
+   <label class="field"><span><span class="ui-icon">&#9888;</span>Minimum level</span><select class="logDestinationMinLevel">${["error","warning","info","debug","verbose"].map(level=>`<option value="${level}" ${destination.min_level===level?"selected":""}>${level}</option>`).join("")}</select></label>
+   <label class="field"><span><span class="ui-icon">&#128273;</span>API token</span><input class="logDestinationApiKey" type="password" value="${esc(destination.api_key || "")}" autocomplete="new-password" placeholder="${destination.has_api_key ? "stored; leave blank to keep" : "optional"}"></label>
+   <label class="field"><span><span class="ui-icon">&#128100;</span>Username</span><input class="logDestinationUsername" value="${esc(destination.username || "")}" autocomplete="off"></label>
+   <label class="field"><span><span class="ui-icon">&#128273;</span>Password</span><input class="logDestinationPassword" type="password" value="${esc(destination.password || "")}" autocomplete="new-password" placeholder="${destination.has_password ? "stored; leave blank to keep" : "optional"}"></label>
+   <label class="field"><span><span class="ui-icon">&#9201;</span>Timeout seconds</span><input class="logDestinationTimeout" type="number" min="1" max="60" value="${esc(destination.timeout_seconds || 5)}"></label>
+  </div>
+ </div>`;
+}
 function cloudRow(target, index){
  return `<div class="cloud-row" data-cloud-index="${index}">
   <div class="toolbar"><h3><span class="ui-icon">&#9729;</span>Cloud target ${index + 1}</h3><button class="danger" onclick="removeCloudTarget(this)"><span class="ui-icon">&#128465;</span>Remove</button></div>
@@ -1384,6 +1436,23 @@ function addCloudTarget(){
  const index = list.querySelectorAll(".cloud-row").length;
  list.insertAdjacentHTML("beforeend", cloudRow({ name:"", provider:"local", target:"", command:"", enabled:true }, index));
  renumberCloudTargets();
+}
+function addLogDestination(){
+ const list = document.getElementById("logDestinationList");
+ const index = list.querySelectorAll(".log-destination-row").length;
+ list.insertAdjacentHTML("beforeend", logDestinationRow({ name:"", platform:"loki", url:"", api_key:"", username:"", password:"", min_level:"info", timeout_seconds:5, enabled:false }, index));
+ renumberLogDestinations();
+}
+function removeLogDestination(button){
+ button.closest(".log-destination-row").remove();
+ if(!document.querySelector(".log-destination-row")) addLogDestination();
+ renumberLogDestinations();
+}
+function renumberLogDestinations(){
+ document.querySelectorAll(".log-destination-row").forEach((row, index) => {
+  row.dataset.logDestinationIndex = index;
+  row.querySelector("h3").textContent = `Log destination ${index + 1}`;
+ });
 }
 function removeCloudTarget(button){
  button.closest(".cloud-row").remove();
@@ -1427,6 +1496,19 @@ function collectCloudTargets(){
   enabled: row.querySelector(".cloudEnabled").checked
  })).filter(target => target.name || target.target || target.command);
 }
+function collectLogDestinations(){
+ return Array.from(document.querySelectorAll(".log-destination-row")).map(row => ({
+  name: row.querySelector(".logDestinationName").value.trim(),
+  platform: row.querySelector(".logDestinationPlatform").value,
+  url: row.querySelector(".logDestinationUrl").value.trim(),
+  api_key: row.querySelector(".logDestinationApiKey").value,
+  username: row.querySelector(".logDestinationUsername").value.trim(),
+  password: row.querySelector(".logDestinationPassword").value,
+  min_level: row.querySelector(".logDestinationMinLevel").value,
+  timeout_seconds: Number(row.querySelector(".logDestinationTimeout").value),
+  enabled: row.querySelector(".logDestinationEnabled").checked
+ })).filter(destination => destination.name || destination.url || destination.enabled);
+}
 async function saveSettings(){
  const payload = {
   newsgroup: setNewsgroup.value,
@@ -1459,6 +1541,7 @@ async function saveSettings(){
   auto_queue_exclude_patterns: setAutoQueueExcludePatterns.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   usenet_hosts: collectHosts(),
   cloud_backups: collectCloudTargets(),
+  log_destinations: collectLogDestinations(),
   par2: { enabled: setPar2.checked, command: setPar2Command.value, redundancy_percent: Number(setPar2Redundancy.value) }
  };
  const out = await post("/api/settings", payload);

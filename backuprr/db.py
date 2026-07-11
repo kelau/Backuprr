@@ -3,7 +3,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 
 SCHEMA_VERSION = 8
@@ -15,8 +15,9 @@ def utcnow() -> str:
 
 
 class Database:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, event_forwarder: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.path = Path(path)
+        self.event_forwarder = event_forwarder
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -163,11 +164,14 @@ class Database:
         return self.get_meta(f"pause.{kind}") == "1"
 
     def log(self, level: str, event_type: str, message: str, file_id: Optional[int] = None, data: str = "") -> None:
+        event = {"ts": utcnow(), "level": level, "event_type": event_type, "message": message, "file_id": file_id, "data": data}
         with self.connect() as conn:
             conn.execute(
                 "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
-                (utcnow(), level, event_type, message, file_id, data),
+                (event["ts"], level, event_type, message, file_id, data),
             )
+        if self.event_forwarder:
+            self.event_forwarder(event)
 
     def add_endpoint(self, path: str) -> None:
         with self.connect() as conn:
@@ -1101,24 +1105,64 @@ class Database:
         with self.connect() as conn:
             return int(conn.execute(f"SELECT COUNT(*) FROM files {where}", params).fetchone()[0])
 
-    def verification_rows(self, limit: int = 200, offset: int = 0) -> List[sqlite3.Row]:
+    def verification_rows(self, limit: int = 200, offset: int = 0, verification_state: str = "") -> List[sqlite3.Row]:
+        where, params = self._verification_state_clause(verification_state)
         with self.connect() as conn:
             return conn.execute(
-                """
+                f"""
+                WITH verification AS (
                 SELECT f.id, f.path, f.relative_path, f.state, f.last_verify_at,
                        COUNT(c.id) AS chunk_count,
                        SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END) AS verified_chunks,
                        SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) AS missing_chunks,
-                       MAX(c.verified_at) AS last_chunk_verify_at
+                       MAX(c.verified_at) AS last_chunk_verify_at,
+                       CASE
+                         WHEN SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) > 0 THEN 'missing'
+                         WHEN COUNT(c.id) = 0 THEN 'no_chunks'
+                         WHEN f.last_verify_at IS NULL AND SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END) = 0 THEN 'unverified'
+                         ELSE 'verified'
+                       END AS verification_state
                 FROM files f
                 LEFT JOIN chunks c ON c.file_id = f.id
                 WHERE f.state != 'deleted'
                 GROUP BY f.id
-                ORDER BY f.last_verify_at IS NULL DESC, f.last_verify_at ASC, f.relative_path
+                )
+                SELECT * FROM verification
+                {where}
+                ORDER BY last_verify_at IS NULL DESC, last_verify_at ASC, relative_path
                 LIMIT ? OFFSET ?
                 """,
-                (limit, offset),
+                (*params, limit, offset),
             ).fetchall()
+
+    def verification_count(self, verification_state: str = "") -> int:
+        where, params = self._verification_state_clause(verification_state)
+        with self.connect() as conn:
+            row = conn.execute(
+                f"""
+                WITH verification AS (
+                SELECT f.id,
+                       CASE
+                         WHEN SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) > 0 THEN 'missing'
+                         WHEN COUNT(c.id) = 0 THEN 'no_chunks'
+                         WHEN f.last_verify_at IS NULL AND SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END) = 0 THEN 'unverified'
+                         ELSE 'verified'
+                       END AS verification_state
+                FROM files f
+                LEFT JOIN chunks c ON c.file_id = f.id
+                WHERE f.state != 'deleted'
+                GROUP BY f.id
+                )
+                SELECT COUNT(*) AS total FROM verification {where}
+                """,
+                params,
+            ).fetchone()
+            return int(row["total"] or 0)
+
+    def _verification_state_clause(self, verification_state: str) -> tuple[str, List[Any]]:
+        if verification_state in {"missing", "unverified", "verified", "no_chunks"}:
+            return "WHERE verification_state = ?", [verification_state]
+        return "", []
 
     def list_events(
         self,

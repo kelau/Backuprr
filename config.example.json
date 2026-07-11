@@ -7,6 +7,19 @@
   "backup_interval_seconds": 300,
   "file_stability_seconds": 300,
   "ui_theme": "harbor_light",
+  "log_destinations": [
+    {
+      "name": "home-loki",
+      "platform": "loki",
+      "url": "http://127.0.0.1:3100/loki/api/v1/push",
+      "api_key": "",
+      "username": "",
+      "password": "",
+      "min_level": "info",
+      "timeout_seconds": 5,
+      "enabled": false
+    }
+  ],
   "usenet_hosts": [
     {
       "name": "eweka-read",

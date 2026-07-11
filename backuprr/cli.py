@@ -7,6 +7,7 @@ from .backup import post_next, verify_due_chunks
 from .cloud_backup import backup_config_and_database
 from .config import Config
 from .db import Database
+from .log_forwarding import LogForwarder
 from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill, test_post_host_article_size
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
@@ -16,7 +17,7 @@ from .web import run_web
 
 def load_db(config_path: str) -> tuple[Config, Database]:
     config = Config.load(config_path)
-    db = Database(config.db_path())
+    db = Database(config.db_path(), LogForwarder(config.log_destinations))
     return config, db
 
 

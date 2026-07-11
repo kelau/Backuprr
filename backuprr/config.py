@@ -51,6 +51,41 @@ class CloudBackupTarget:
 
 
 @dataclass
+class LogDestination:
+    name: str
+    platform: str = "loki"
+    url: str = ""
+    api_key: str = ""
+    username: str = ""
+    password: str = ""
+    min_level: str = "info"
+    timeout_seconds: int = 5
+    enabled: bool = False
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "LogDestination":
+        supported = {
+            key: data.get(key)
+            for key in ("name", "platform", "url", "api_key", "username", "password", "min_level", "timeout_seconds", "enabled")
+        }
+        if supported["enabled"] is None:
+            supported["enabled"] = False
+        if supported["timeout_seconds"] is None:
+            supported["timeout_seconds"] = 5
+        return cls(**supported)
+
+    def public_dict(self) -> Dict[str, Any]:
+        data = self.__dict__.copy()
+        data["has_api_key"] = bool(data.get("api_key"))
+        data["has_password"] = bool(data.get("password"))
+        if data.get("api_key"):
+            data["api_key"] = ""
+        if data.get("password"):
+            data["password"] = ""
+        return data
+
+
+@dataclass
 class Config:
     database: str = "backuprr.sqlite3"
     article_size: int = 768 * 1024
@@ -80,6 +115,7 @@ class Config:
     ui_theme: str = "harbor_light"
     usenet_hosts: List[UsenetHost] = field(default_factory=list)
     cloud_backups: List[CloudBackupTarget] = field(default_factory=list)
+    log_destinations: List[LogDestination] = field(default_factory=list)
     endpoints: List[str] = field(default_factory=list)
     zip_subfolders: bool = False
     encrypt_bodies: bool = False
@@ -96,9 +132,11 @@ class Config:
             data = json.loads(config_path.read_text(encoding="utf-8-sig"))
         hosts = [UsenetHost.from_dict(item) for item in data.pop("usenet_hosts", [])]
         cloud_backups = [CloudBackupTarget.from_dict(item) for item in data.pop("cloud_backups", [])]
+        log_destinations = [LogDestination.from_dict(item) for item in data.pop("log_destinations", [])]
         config = cls(**data)
         config.usenet_hosts = hosts
         config.cloud_backups = cloud_backups
+        config.log_destinations = log_destinations
         config.base_dir = config_path.resolve().parent
         config.source_path = config_path.resolve()
         return config
@@ -147,6 +185,7 @@ class Config:
             "ui_theme": self.ui_theme,
             "usenet_hosts": [host.__dict__ for host in self.usenet_hosts],
             "cloud_backups": [target.__dict__ for target in self.cloud_backups],
+            "log_destinations": [destination.__dict__ for destination in self.log_destinations],
             "endpoints": self.endpoints,
             "zip_subfolders": self.zip_subfolders,
             "encrypt_bodies": self.encrypt_bodies,
@@ -157,6 +196,7 @@ class Config:
     def public_dict(self) -> Dict[str, Any]:
         data = self.to_dict()
         data["usenet_hosts"] = [host.public_dict() for host in self.usenet_hosts]
+        data["log_destinations"] = [destination.public_dict() for destination in self.log_destinations]
         return data
 
 
@@ -321,6 +361,37 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
                 raise ValueError("Cloud backup targets require a destination path")
             targets.append(target)
         config.cloud_backups = targets
+    if "log_destinations" in data:
+        destinations = []
+        existing_api_keys = {destination.name: destination.api_key for destination in config.log_destinations if destination.api_key}
+        existing_passwords = {destination.name: destination.password for destination in config.log_destinations if destination.password}
+        for item in data["log_destinations"]:
+            destination = LogDestination.from_dict(item)
+            destination.name = str(destination.name or "").strip()
+            destination.platform = str(destination.platform or "loki").strip()
+            destination.url = str(destination.url or "").strip()
+            destination.api_key = str(destination.api_key or "")
+            destination.username = str(destination.username or "").strip()
+            destination.password = str(destination.password or "")
+            destination.min_level = str(destination.min_level or "info").strip()
+            destination.timeout_seconds = int(destination.timeout_seconds or 5)
+            destination.enabled = bool(destination.enabled)
+            if destination.api_key == "" and destination.name in existing_api_keys:
+                destination.api_key = existing_api_keys[destination.name]
+            if destination.password == "" and destination.name in existing_passwords:
+                destination.password = existing_passwords[destination.name]
+            if not destination.name:
+                raise ValueError("Log destination name is required")
+            if destination.platform not in {"loki", "seq", "graylog", "elastic", "logstash", "splunk_hec"}:
+                raise ValueError("Log destination platform is not supported")
+            if destination.min_level not in {"error", "warning", "info", "debug", "verbose"}:
+                raise ValueError("Log destination min_level is not supported")
+            if destination.timeout_seconds < 1 or destination.timeout_seconds > 60:
+                raise ValueError("Log destination timeout_seconds must be between 1 and 60")
+            if destination.enabled and not destination.url:
+                raise ValueError("Enabled log destinations require a URL")
+            destinations.append(destination)
+        config.log_destinations = destinations
     if "par2" in data:
         par2 = dict(config.par2)
         par2.update(data["par2"] or {})

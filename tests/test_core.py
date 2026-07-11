@@ -8,9 +8,10 @@ from unittest.mock import patch
 from backuprr import __version__
 from backuprr.backup import decode_chunk, encode_chunk, post_next, verify_due_chunks, verify_file_chunks
 from backuprr.cloud_backup import backup_config_and_database, backup_config_and_database_if_changed
-from backuprr.config import Config, UsenetHost, update_config
+from backuprr.config import Config, LogDestination, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
+from backuprr.log_forwarding import build_payload
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
 from backuprr.operations import check_usenet_hosts, dry_run_plan, restore_confidence, restore_plan, run_maintenance, run_restore_drill, test_post_host_article_size
 from backuprr.queueing import enqueue_unbacked, prioritize
@@ -119,7 +120,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.41")
+        self.assertEqual(__version__, "0.2.42")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -182,6 +183,33 @@ class CoreTests(unittest.TestCase):
         table_stats = {row["table"]: row for row in self.db.table_stats()}
         self.assertIn("backup_manifests", table_stats)
         self.assertIn("estimated_bytes", table_stats["files"])
+
+    def test_verification_rows_can_be_split_by_verification_state(self):
+        media = self.root / "media"
+        media.mkdir()
+        for name in ["verified.mkv", "unverified.mkv", "missing.mkv", "no-chunks.mkv"]:
+            (media / name).write_bytes(name.encode("utf-8"))
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            ids = {row["relative_path"]: row["id"] for row in conn.execute("SELECT id, relative_path FROM files").fetchall()}
+            conn.execute("UPDATE files SET state='backed_up'")
+        self.db.add_chunk(ids["verified.mkv"], 0, "<verified@example.test>", 8, "sha", "")
+        self.db.add_chunk(ids["unverified.mkv"], 0, "<unverified@example.test>", 8, "sha", "")
+        self.db.add_chunk(ids["missing.mkv"], 0, "<missing@example.test>", 8, "sha", "")
+        with self.db.connect() as conn:
+            verified_chunk_id = conn.execute("SELECT id FROM chunks WHERE file_id=?", (ids["verified.mkv"],)).fetchone()["id"]
+            missing_chunk_id = conn.execute("SELECT id FROM chunks WHERE file_id=?", (ids["missing.mkv"],)).fetchone()["id"]
+        self.db.mark_chunk_verified(verified_chunk_id, True)
+        self.db.mark_chunk_verified(missing_chunk_id, False)
+
+        self.assertEqual(self.db.verification_count("verified"), 1)
+        self.assertEqual(self.db.verification_count("unverified"), 1)
+        self.assertEqual(self.db.verification_count("missing"), 1)
+        self.assertEqual(self.db.verification_count("no_chunks"), 1)
+        rows = self.db.verification_rows(10, 0, "missing")
+        self.assertEqual(rows[0]["relative_path"], "missing.mkv")
+        self.assertEqual(rows[0]["verification_state"], "missing")
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -1110,6 +1138,17 @@ class CoreTests(unittest.TestCase):
                 "cloud_backups": [
                     {"name": "local", "provider": "local", "target": str(self.root / "cloud"), "enabled": True}
                 ],
+                "log_destinations": [
+                    {
+                        "name": "loki",
+                        "platform": "loki",
+                        "url": "http://127.0.0.1:3100/loki/api/v1/push",
+                        "api_key": "token",
+                        "min_level": "warning",
+                        "timeout_seconds": 9,
+                        "enabled": True,
+                    }
+                ],
             },
         )
         self.assertEqual(self.config.article_size, 256 * 1024)
@@ -1145,6 +1184,57 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.usenet_hosts[0].resolved_password(), "provider-password")
         self.assertEqual(self.config.par2["redundancy_percent"], 12)
         self.assertEqual(self.config.cloud_backups[0].provider, "local")
+        self.assertEqual(self.config.log_destinations[0].platform, "loki")
+        self.assertEqual(self.config.log_destinations[0].api_key, "token")
+        self.assertEqual(self.config.log_destinations[0].min_level, "warning")
+
+    def test_update_config_preserves_blank_existing_log_destination_secret(self):
+        self.config.log_destinations = [
+            LogDestination(name="seq", platform="seq", url="http://seq.example.test", api_key="secret", enabled=True)
+        ]
+        update_config(
+            self.config,
+            {
+                "log_destinations": [
+                    {
+                        "name": "seq",
+                        "platform": "seq",
+                        "url": "http://seq.example.test",
+                        "api_key": "",
+                        "min_level": "info",
+                        "timeout_seconds": 5,
+                        "enabled": True,
+                    }
+                ]
+            },
+        )
+        self.assertEqual(self.config.log_destinations[0].api_key, "secret")
+        public = self.config.public_dict()["log_destinations"][0]
+        self.assertEqual(public["api_key"], "")
+        self.assertTrue(public["has_api_key"])
+
+    def test_log_forwarding_payloads_match_platform(self):
+        event = {
+            "ts": "2026-07-11T08:00:00+00:00",
+            "level": "warning",
+            "event_type": "backup.task",
+            "message": "worker paused",
+            "file_id": 7,
+            "data": "",
+        }
+        splunk_body, splunk_headers = build_payload(
+            LogDestination(name="splunk", platform="splunk_hec", url="http://splunk.example.test", api_key="hec"),
+            event,
+        )
+        self.assertEqual(splunk_headers["Authorization"], "Splunk hec")
+        self.assertIn(b'"sourcetype": "backuprr:event"', splunk_body)
+
+        loki_body, loki_headers = build_payload(
+            LogDestination(name="loki", platform="loki", url="http://loki.example.test"),
+            event,
+        )
+        self.assertEqual(loki_headers["Content-Type"], "application/json")
+        self.assertIn(b'"streams"', loki_body)
 
     def test_cloud_backup_writes_config_and_database_archive(self):
         config_path = self.root / "config.json"
