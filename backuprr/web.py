@@ -45,6 +45,22 @@ def throughput_summary(samples: list[dict[str, Any]]) -> dict[str, float]:
     }
 
 
+PAGE_ROUTES = {
+    "/": "Status",
+    "/status": "Status",
+    "/files": "Files",
+    "/search": "Search",
+    "/log": "Log",
+    "/queue": "Queue",
+    "/tasks": "Tasks",
+    "/verification": "Verification",
+    "/statistics": "Statistics",
+    "/operations": "Operations",
+    "/settings": "Settings",
+    "/about": "About",
+}
+
+
 def thread_usage_summary(posting_rows: list[dict[str, Any]], article_size: int, configured_threads: int) -> dict[str, int]:
     total = max(1, int(configured_threads or 1))
     size = max(1, int(article_size or 1))
@@ -276,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        if parsed.path == "/":
+        if parsed.path in PAGE_ROUTES:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
@@ -835,6 +851,11 @@ pre { white-space:pre-wrap; background:var(--panel); border:1px solid var(--line
 </main>
 <script>
 const pages = ["Status","Files","Search","Log","Queue","Tasks","Verification","Statistics","Operations","Settings","About"];
+const pageSlugs = {
+ Status:"/status", Files:"/files", Search:"/search", Log:"/log", Queue:"/queue", Tasks:"/tasks",
+ Verification:"/verification", Statistics:"/statistics", Operations:"/operations", Settings:"/settings", About:"/about"
+};
+const slugPages = Object.fromEntries(Object.entries(pageSlugs).map(([name, slug]) => [slug, name]));
 const themeTemplates = [
  { id:"harbor_light", name:"Harbor Light" },
  { id:"emerald_console", name:"Emerald Console" },
@@ -842,7 +863,7 @@ const themeTemplates = [
  { id:"graphite", name:"Graphite" },
  { id:"nordic_mint", name:"Nordic Mint" }
 ];
-let page = "Status";
+let page = pageFromPath(location.pathname);
 let settingsCache = null;
 let fileRowsCache = [];
 let operationRowsCache = [];
@@ -927,6 +948,20 @@ function iconText(icon, text, cls=""){
 function pageIcon(name){
  return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Operations:"&#128736;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
 }
+function pageFromPath(path){
+ const clean = String(path || "/").replace(/\/+$/, "") || "/";
+ return slugPages[clean.toLowerCase()] || "Status";
+}
+function pagePath(name){
+ return pageSlugs[name] || "/status";
+}
+function navigatePage(name){
+ if(!pages.includes(name)) name = "Status";
+ page = name;
+ const path = pagePath(name);
+ if(location.pathname !== path) history.pushState({ page:name }, "", path);
+ render();
+}
 function stateIcon(value){
  return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",downloading:"&#11015;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",unreadable:"&#128274;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;",unverified:"&#128269;",no_chunks:"&#128230;"}[String(value || "")] || "&#8226;");
 }
@@ -953,7 +988,7 @@ function iconForProgress(value){
  return "&#9711;";
 }
 function nav(){
- document.getElementById("nav").innerHTML = pages.map(p=>`<button class="${p===page?"active":""}" onclick="page='${p}';render()"><span class="nav-icon">${pageIcon(p)}</span>${p}</button>`).join("");
+ document.getElementById("nav").innerHTML = pages.map(p=>`<button class="${p===page?"active":""}" onclick="navigatePage('${p}')"><span class="nav-icon">${pageIcon(p)}</span>${p}</button>`).join("");
  const title = document.getElementById("pageTitle");
  if(title) title.textContent = page;
 }
@@ -983,6 +1018,13 @@ document.addEventListener("click", event => {
 document.addEventListener("keydown", event => {
  if(event.key === "Escape") closeDropdowns();
 });
+window.addEventListener("popstate", () => {
+ page = pageFromPath(location.pathname);
+ render();
+});
+if(location.pathname === "/"){
+ history.replaceState({ page }, "", pagePath(page));
+}
 function multiSelectDropdown(label, cls, options, selected, renderer=""){
  const summary = selected.length === options.length ? `All ${label}` : `${label}: ${selected.length}`;
  return `<details class="dropdown"><summary>${esc(summary)}</summary><div class="dropdown-menu">${options.map(option => {
