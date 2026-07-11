@@ -521,17 +521,37 @@ class Handler(BaseHTTPRequestHandler):
         if not source_path:
             self.send_json({"error": "path is required"}, 400)
             return
-        file_row, payloads = restored_payloads(self.db, self.config, source_path)
+        with self.db.connect() as conn:
+            file_row = conn.execute("SELECT * FROM files WHERE path=? OR relative_path=?", (source_path, source_path)).fetchone()
+        if not file_row:
+            self.send_json({"error": f"No cataloged file matches {source_path}"}, 404)
+            return
+        operation_id = self.create_operation(
+            "download",
+            int(file_row["id"]),
+            str(file_row["relative_path"] or file_row["path"]),
+            self.db.chunk_count_for_file(int(file_row["id"])),
+        )
+
+        def progress(done: int, total_chunks: int, bytes_done: int) -> None:
+            self.update_operation(operation_id, done, total_chunks, bytes_done, f"Downloaded {done}/{total_chunks} chunks")
+
+        file_row, payloads = restored_payloads(self.db, self.config, source_path, progress=progress)
         filename = Path(file_row["path"]).name
-        self.send_response(200)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(filename)}")
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        for payload in payloads:
-            self.wfile.write(payload)
-            self.wfile.flush()
-        self.db.log("info", "restore.download", f"Downloaded restored copy of {source_path}", int(file_row["id"]))
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(filename)}")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            for payload in payloads:
+                self.wfile.write(payload)
+                self.wfile.flush()
+            self.finish_operation(operation_id, "done", f"Downloaded {source_path}")
+            self.db.log("info", "restore.download", f"Downloaded restored copy of {source_path}", int(file_row["id"]))
+        except Exception as exc:
+            self.finish_operation(operation_id, "failed", str(exc))
+            raise
 
     def stream_restore_zip(self, file_ids: list[int]) -> None:
         if not file_ids:
@@ -544,15 +564,32 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         writer = ResponseZipWriter(self.wfile)
         restored = 0
+        operations: dict[int, str] = {}
         with ZipFile(writer, "w", compression=ZIP_DEFLATED) as archive:
             for file_id in file_ids:
                 file_row = self.db.file_by_id(int(file_id))
-                _, payloads = restored_payloads(self.db, self.config, str(file_row["path"]))
+                operation_id = self.create_operation(
+                    "download",
+                    int(file_id),
+                    str(file_row["relative_path"] or file_row["path"]),
+                    self.db.chunk_count_for_file(int(file_id)),
+                )
+                operations[int(file_id)] = operation_id
+
+                def progress(done: int, total_chunks: int, bytes_done: int, op_id: str = operation_id) -> None:
+                    self.update_operation(op_id, done, total_chunks, bytes_done, f"Downloaded {done}/{total_chunks} chunks")
+
+                _, payloads = restored_payloads(self.db, self.config, str(file_row["path"]), progress=progress)
                 name = str(file_row["relative_path"] or Path(file_row["path"]).name).replace("\\", "/")
-                with archive.open(name, "w") as entry:
-                    for payload in payloads:
-                        entry.write(payload)
-                restored += 1
+                try:
+                    with archive.open(name, "w") as entry:
+                        for payload in payloads:
+                            entry.write(payload)
+                    restored += 1
+                    self.finish_operation(operation_id, "done", f"Added {name} to restore zip")
+                except Exception as exc:
+                    self.finish_operation(operation_id, "failed", str(exc))
+                    raise
         self.db.log("info", "restore.download", f"Downloaded restore zip with {restored} files")
 
     def all_tasks(self) -> list[dict]:
@@ -891,10 +928,10 @@ function pageIcon(name){
  return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Operations:"&#128736;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
 }
 function stateIcon(value){
- return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",unreadable:"&#128274;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;",unverified:"&#128269;",no_chunks:"&#128230;"}[String(value || "")] || "&#8226;");
+ return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",downloading:"&#11015;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",unreadable:"&#128274;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;",unverified:"&#128269;",no_chunks:"&#128230;"}[String(value || "")] || "&#8226;");
 }
 function stateTone(value){
- return ({backed_up:"ok",done:"ok",restored:"ok",verified:"ok",queued:"warn",posting:"warn",running:"warn",verifying:"warn",restoring:"warn",unverified:"warn",no_chunks:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad",missing:"bad",unreadable:"bad"}[String(value || "")] || "");
+ return ({backed_up:"ok",done:"ok",restored:"ok",verified:"ok",queued:"warn",posting:"warn",running:"warn",verifying:"warn",restoring:"warn",downloading:"warn",unverified:"warn",no_chunks:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad",missing:"bad",unreadable:"bad"}[String(value || "")] || "");
 }
 function statePill(value){
  const tone = stateTone(value);
@@ -1620,7 +1657,7 @@ function fileRow(file){
  const hasChunks = Number(file.chunk_count || 0) > 0;
  const checked = selectedFiles.has(Number(file.id)) ? "checked" : "";
  const progress = fileProgress(file);
- const displayState = activeOperationFor("restore", Number(file.id)) ? "restoring" : file.state;
+ const displayState = activeOperationFor("download", Number(file.id)) ? "downloading" : activeOperationFor("restore", Number(file.id)) ? "restoring" : file.state;
  return `<li><div class="tree-row file-row">
   <input type="checkbox" class="fileSelect" value="${Number(file.id)}" ${checked} onchange="setFileSelected(${Number(file.id)}, this.checked)">
   <span>&#128196;</span>
@@ -1680,6 +1717,8 @@ function operationProgressHtml(kind, fileId){
  return `<div class="file-progress"><div class="progress-track"><div class="progress-fill" style="width:${Math.max(3,pct)}%"></div></div><span>${esc(label)}</span></div>`;
 }
 function fileProgress(file){
+ const downloadProgress = operationProgressHtml("download", Number(file.id));
+ if(downloadProgress) return downloadProgress;
  const restoreProgress = operationProgressHtml("restore", Number(file.id));
  if(restoreProgress) return restoreProgress;
  const active = file.state === "posting" || file.queue_status === "posting";

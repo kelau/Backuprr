@@ -17,7 +17,7 @@ from backuprr.log_forwarding import build_payload
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
 from backuprr.operations import check_usenet_hosts, dry_run_plan, restore_confidence, restore_plan, run_maintenance, run_restore_drill, test_post_host_article_size
 from backuprr.queueing import enqueue_unbacked, excluded_by_auto_queue_filter, prioritize
-from backuprr.restore import restore_file, restore_sample
+from backuprr.restore import restore_file, restore_sample, restored_payloads
 from backuprr.scanner import scan_all
 from backuprr.web import ResponseZipWriter, hourly_post_budget, thread_usage_summary, throughput_summary
 
@@ -130,7 +130,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.52")
+        self.assertEqual(__version__, "0.2.53")
 
     def test_response_zip_writer_supports_streamed_zip_downloads(self):
         buffer = io.BytesIO()
@@ -1580,6 +1580,23 @@ class CoreTests(unittest.TestCase):
         with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
             self.assertEqual(restore_file(self.db, self.config, str(path), str(target), progress=lambda done, total, bytes_done: progress.append((done, total, bytes_done))), target)
         self.assertEqual(target.read_bytes(), b"restored payload")
+        self.assertEqual(progress, [(1, 1, len(b"restored payload"))])
+
+    def test_restored_payloads_reports_download_progress(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"placeholder")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        progress = []
+        with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
+            _, payloads = restored_payloads(self.db, self.config, str(path), progress=lambda done, total, bytes_done: progress.append((done, total, bytes_done)))
+            self.assertEqual(b"".join(payloads), b"restored payload")
         self.assertEqual(progress, [(1, 1, len(b"restored payload"))])
 
     def test_restore_confidence_reports_chunk_state(self):

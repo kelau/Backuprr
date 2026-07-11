@@ -77,21 +77,32 @@ def restore_source(db: Database, source_path: str) -> tuple[Any, list[Any]]:
     return file_row, chunks
 
 
-def restored_payloads(db: Database, config: Config, source_path: str) -> tuple[Any, Iterator[bytes]]:
+def restored_payloads(
+    db: Database,
+    config: Config,
+    source_path: str,
+    progress: Optional[Callable[[int, int, int], None]] = None,
+) -> tuple[Any, Iterator[bytes]]:
     file_row, chunks = restore_source(db, source_path)
 
     def iterator() -> Iterator[bytes]:
         host = select_host(config, "read")
         passphrase = config.encryption_passphrase()
+        restored_bytes = 0
+        total_chunks = len(chunks)
         with UsenetClient(host) as client:
             if not client.conn:
                 raise RuntimeError("NNTP connection not open")
-            for chunk in chunks:
+            for index, chunk in enumerate(chunks, start=1):
                 raw = b"\n".join(article_lines(client.conn.article(chunk["message_id"])))
                 msg = email.message_from_bytes(raw)
                 payload = msg.get_payload(decode=True) or b""
                 db.record_transfer_sample("download", len(payload))
-                yield decode_chunk(payload, passphrase)
+                decoded = decode_chunk(payload, passphrase)
+                restored_bytes += len(decoded)
+                if progress:
+                    progress(index, total_chunks, restored_bytes)
+                yield decoded
 
     return file_row, iterator()
 
