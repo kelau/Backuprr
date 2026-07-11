@@ -1,0 +1,9 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.sqlite3
+config.json
+data
+docs/screenshots/*.tmp

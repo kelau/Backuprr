@@ -2,7 +2,7 @@ import email
 import hashlib
 import os
 from pathlib import Path
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 from .backup import decode_chunk
 from .config import Config
@@ -28,7 +28,13 @@ def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
-def restore_file(db: Database, config: Config, source_path: str, dest: Optional[str] = None) -> Path:
+def restore_file(
+    db: Database,
+    config: Config,
+    source_path: str,
+    dest: Optional[str] = None,
+    progress: Optional[Callable[[int, int, int], None]] = None,
+) -> Path:
     file_row, chunks = restore_source(db, source_path)
     target = Path(dest) if dest else Path(file_row["path"])
     if target.exists() and target.is_dir():
@@ -36,15 +42,21 @@ def restore_file(db: Database, config: Config, source_path: str, dest: Optional[
     target.parent.mkdir(parents=True, exist_ok=True)
     host = select_host(config, "read")
     passphrase = config.encryption_passphrase()
+    restored_bytes = 0
+    total_chunks = len(chunks)
     with UsenetClient(host) as client, target.open("wb") as output:
         if not client.conn:
             raise RuntimeError("NNTP connection not open")
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks, start=1):
             raw = b"\n".join(article_lines(client.conn.article(chunk["message_id"])))
             msg = email.message_from_bytes(raw)
             payload = msg.get_payload(decode=True) or b""
             db.record_transfer_sample("download", len(payload))
-            output.write(decode_chunk(payload, passphrase))
+            decoded = decode_chunk(payload, passphrase)
+            output.write(decoded)
+            restored_bytes += len(decoded)
+            if progress:
+                progress(index, total_chunks, restored_bytes)
     if target.resolve() == Path(file_row["path"]).resolve():
         original_mtime_ns = int(file_row["mtime_ns"] or target.stat().st_mtime_ns)
         os.utime(target, ns=(original_mtime_ns, original_mtime_ns))

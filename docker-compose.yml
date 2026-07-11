@@ -1,0 +1,12 @@
+services:
+  backuprr:
+    build: .
+    container_name: backuprr
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      BACKUPRR_CONFIG: /data/config.json
+    volumes:
+      - ./data:/data
+      - /srv/media:/media:rw

@@ -1,5 +1,7 @@
-﻿import json
+import itertools
+import json
 import math
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9,6 +11,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from . import __version__
+from .backup import verify_due_chunks, verify_file_chunks
 from .cloud_backup import backup_config_and_database
 from .config import Config, update_config
 from .db import Database
@@ -76,6 +79,10 @@ class Handler(BaseHTTPRequestHandler):
     cloud_backup_monitor: CloudBackupMonitor
     maintenance_monitor: MaintenanceMonitor
     restore_drill_monitor: RestoreDrillMonitor
+    operation_lock = threading.Lock()
+    operation_counter = itertools.count(1)
+    operation_revision = 0
+    operations: dict[str, dict[str, Any]] = {}
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if getattr(self.config, "log_web_access", False):
@@ -94,6 +101,177 @@ class Handler(BaseHTTPRequestHandler):
         if length == 0:
             return {}
         return json.loads(self.rfile.read(length).decode("utf-8"))
+
+    def create_operation(self, kind: str, file_id: int | None, label: str, total: int = 0) -> str:
+        with Handler.operation_lock:
+            operation_id = str(next(Handler.operation_counter))
+            Handler.operations[operation_id] = {
+                "id": operation_id,
+                "kind": kind,
+                "file_id": file_id,
+                "label": label,
+                "status": "running",
+                "done": 0,
+                "total": int(total or 0),
+                "bytes_done": 0,
+                "message": "Starting",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            Handler.operation_revision += 1
+            return operation_id
+
+    def update_operation(self, operation_id: str, done: int, total: int | None = None, bytes_done: int | None = None, message: str = "") -> None:
+        with Handler.operation_lock:
+            operation = Handler.operations.get(operation_id)
+            if not operation:
+                return
+            operation["done"] = int(done)
+            if total is not None:
+                operation["total"] = int(total)
+            if bytes_done is not None:
+                operation["bytes_done"] = int(bytes_done)
+            if message:
+                operation["message"] = message
+            operation["updated_at"] = datetime.now(timezone.utc).isoformat()
+            Handler.operation_revision += 1
+
+    def finish_operation(self, operation_id: str, status: str, message: str = "") -> None:
+        with Handler.operation_lock:
+            operation = Handler.operations.get(operation_id)
+            if not operation:
+                return
+            operation["status"] = status
+            if message:
+                operation["message"] = message
+            if status == "done" and operation.get("total"):
+                operation["done"] = operation["total"]
+            operation["updated_at"] = datetime.now(timezone.utc).isoformat()
+            operation["finished_at"] = datetime.now(timezone.utc).isoformat()
+            Handler.operation_revision += 1
+
+    def operation_rows(self) -> list[dict[str, Any]]:
+        cutoff = time.time() - 600
+        rows: list[dict[str, Any]] = []
+        with Handler.operation_lock:
+            stale = []
+            for operation_id, operation in Handler.operations.items():
+                updated = datetime.fromisoformat(str(operation["updated_at"])).timestamp()
+                if operation.get("status") != "running" and updated < cutoff:
+                    stale.append(operation_id)
+                else:
+                    rows.append(dict(operation))
+            for operation_id in stale:
+                Handler.operations.pop(operation_id, None)
+        return rows
+
+    def start_restore_operation(self, source_path: str, dest: str | None = None) -> str:
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT id, path, relative_path FROM files WHERE path=? OR relative_path=?",
+                (source_path, source_path),
+            ).fetchone()
+            if not row:
+                raise FileNotFoundError(f"No cataloged file matches {source_path}")
+            total = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_id=?", (row["id"],)).fetchone()[0]
+        operation_id = self.create_operation("restore", int(row["id"]), str(row["relative_path"] or row["path"]), total)
+
+        def worker() -> None:
+            try:
+                def progress(done: int, total_chunks: int, bytes_done: int) -> None:
+                    self.update_operation(operation_id, done, total_chunks, bytes_done, f"Restored {done}/{total_chunks} chunks")
+
+                target = restore_file(self.db, self.config, source_path, dest, progress=progress)
+                self.finish_operation(operation_id, "done", f"Restored to {target}")
+            except Exception as exc:
+                self.db.log("error", "restore", f"Restore failed for {source_path}: {exc}", int(row["id"]))
+                self.finish_operation(operation_id, "failed", str(exc))
+
+        threading.Thread(target=worker, name=f"backuprr-restore-{operation_id}", daemon=True).start()
+        return operation_id
+
+    def start_folder_restore_operations(self, folder_path: str, dest: str | None = None) -> list[str]:
+        raw_folder = str(folder_path).rstrip("\\/")
+        alt_folder = raw_folder.replace("/", "\\")
+        folder = str(Path(folder_path).resolve()) if Path(folder_path).is_absolute() else raw_folder
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, path, relative_path, (SELECT COUNT(*) FROM chunks WHERE file_id=files.id) AS chunk_count
+                FROM files
+                WHERE id IN (SELECT DISTINCT file_id FROM chunks)
+                  AND (path LIKE ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?)
+                ORDER BY relative_path
+                """,
+                (folder + "%", raw_folder, raw_folder + "/%", alt_folder, alt_folder + "\\%"),
+            ).fetchall()
+        operations: list[tuple[str, Any, str | None]] = []
+        for row in rows:
+            target = None
+            if dest:
+                if Path(folder).is_absolute():
+                    relative = Path(row["path"]).relative_to(folder)
+                else:
+                    relative_text = str(row["relative_path"]).replace("\\", "/")
+                    relative = Path(relative_text).relative_to(raw_folder.replace("\\", "/"))
+                target = str(Path(dest) / relative)
+            operation_id = self.create_operation("restore", int(row["id"]), str(row["relative_path"] or row["path"]), int(row["chunk_count"] or 0))
+            operations.append((operation_id, row, target))
+
+        def worker() -> None:
+            for operation_id, row, target in operations:
+                try:
+                    def progress(done: int, total_chunks: int, bytes_done: int, op_id: str = operation_id) -> None:
+                        self.update_operation(op_id, done, total_chunks, bytes_done, f"Restored {done}/{total_chunks} chunks")
+
+                    restored_to = restore_file(self.db, self.config, str(row["path"]), target, progress=progress)
+                    self.finish_operation(operation_id, "done", f"Restored to {restored_to}")
+                except Exception as exc:
+                    self.db.log("error", "restore", f"Restore failed for {row['path']}: {exc}", int(row["id"]))
+                    self.finish_operation(operation_id, "failed", str(exc))
+
+        threading.Thread(target=worker, name="backuprr-folder-restore", daemon=True).start()
+        return [operation_id for operation_id, _, _ in operations]
+
+    def start_verification_operation(self, file_ids: list[int], force: bool = False) -> list[str]:
+        if file_ids:
+            operations: list[tuple[str, int]] = []
+            for file_id in file_ids:
+                row = self.db.file_by_id(int(file_id))
+                label = str(row["relative_path"] or row["path"])
+                operation_id = self.create_operation("verify", int(file_id), label, self.db.chunk_count_for_file(int(file_id)))
+                operations.append((operation_id, int(file_id)))
+
+            def selected_worker() -> None:
+                for operation_id, file_id in operations:
+                    try:
+                        def progress(done: int, total: int, op_id: str = operation_id) -> None:
+                            self.update_operation(op_id, done, total, message=f"Verified {done}/{total} chunks")
+
+                        verified = verify_file_chunks(self.db, self.config, [file_id], progress=progress)
+                        self.finish_operation(operation_id, "done", f"Verified {verified} chunks")
+                    except Exception as exc:
+                        self.db.log("error", "verify", f"Verification failed: {exc}", file_id)
+                        self.finish_operation(operation_id, "failed", str(exc))
+
+            threading.Thread(target=selected_worker, name="backuprr-selected-verify", daemon=True).start()
+            return [operation_id for operation_id, _ in operations]
+
+        operation_id = self.create_operation("verify", None, "All due chunks")
+
+        def worker() -> None:
+            try:
+                def progress(done: int, total: int) -> None:
+                    self.update_operation(operation_id, done, total, message=f"Verified {done}/{total} chunks")
+
+                verified = verify_due_chunks(self.db, self.config, force=force, progress=progress)
+                self.finish_operation(operation_id, "done", f"Verified {verified} chunks")
+            except Exception as exc:
+                self.db.log("error", "verify", f"Verification failed: {exc}")
+                self.finish_operation(operation_id, "failed", str(exc))
+
+        threading.Thread(target=worker, name=f"backuprr-verify-{operation_id}", daemon=True).start()
+        return [operation_id]
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -229,6 +407,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(self.all_tasks())
         elif parsed.path == "/api/settings":
             self.send_json(self.config.public_dict())
+        elif parsed.path == "/api/operations/progress":
+            self.send_json({"operations": self.operation_rows()})
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -261,9 +441,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"changed": self.db.boost_folder_priority(data["path"], amount=int(data.get("amount", 10)))})
             elif parsed.path == "/api/post-next":
                 self.send_json({"file_id": self.backup_monitor.post_once()})
+            elif parsed.path == "/api/backup/run":
+                self.backup_monitor.trigger()
+                self.send_json({"ok": True})
             elif parsed.path == "/api/verify":
                 file_ids = [int(file_id) for file_id in data.get("file_ids", [])]
                 self.send_json({"verified": self.verification_monitor.verify_once(force=bool(data.get("force")) or bool(file_ids), file_ids=file_ids)})
+            elif parsed.path == "/api/verify/start":
+                file_ids = [int(file_id) for file_id in data.get("file_ids", [])]
+                self.send_json({"operation_ids": self.start_verification_operation(file_ids, force=bool(data.get("force")) or bool(file_ids))})
             elif parsed.path == "/api/cloud-backup":
                 results = backup_config_and_database(self.db, self.config)
                 self.db.log("info", "cloud.backup", f"Backed up config/database to {len(results)} cloud targets")
@@ -302,6 +488,11 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"restored": restore_folder(self.db, self.config, data["path"], data.get("dest"))})
                 else:
                     self.send_json({"target": str(restore_file(self.db, self.config, data["path"], data.get("dest")))})
+            elif parsed.path == "/api/restore/start":
+                if data.get("folder"):
+                    self.send_json({"operation_ids": self.start_folder_restore_operations(data["path"], data.get("dest"))})
+                else:
+                    self.send_json({"operation_id": self.start_restore_operation(data["path"], data.get("dest"))})
             elif parsed.path == "/api/settings":
                 update_config(self.config, data)
                 self.config.save(self.config_path)
@@ -386,6 +577,7 @@ class Handler(BaseHTTPRequestHandler):
                 token = self.db.change_token()
                 tasks = self.all_tasks()
                 token["task_revision"] = sum(int(task.get("revision", 0)) for task in tasks)
+                token["operation_revision"] = Handler.operation_revision
                 if any(task.get("status") == "running" for task in tasks):
                     token["running_task_tick"] = int(time.time())
                 payload = json.dumps(token, default=str)
@@ -529,6 +721,7 @@ tr:hover td { background:var(--row-hover); }
 .bar-fill.bad { background:var(--bad); }
 .progress-track { height:16px; background:var(--track-bg); border-radius:999px; overflow:hidden; border:1px solid rgba(125,211,199,.10); }
 .progress-fill { height:100%; background:linear-gradient(90deg,#0f867a,#4adecf); border-radius:999px; transition:width .2s ease; }
+.progress-fill.bad { background:var(--bad); }
 .progress-fill.indeterminate { width:42%; min-width:32px; animation:progress-slide 1.1s ease-in-out infinite; }
 @keyframes progress-slide { 0% { transform:translateX(-120%); } 100% { transform:translateX(260%); } }
 .async-status { display:grid; gap:6px; max-width:560px; margin:8px 0 12px; }
@@ -577,13 +770,13 @@ tr:hover td { background:var(--row-hover); }
 .tree ul { list-style:none; margin:0; padding-left:20px; }
 .tree li { margin:2px 0; }
 .tree-row { display:flex; align-items:center; gap:8px; min-height:32px; padding:4px 6px; border-radius:6px; }
-.tree-row.file-row, .tree-row.folder-row, .tree-header { display:grid; grid-template-columns:24px 24px minmax(280px,1fr) minmax(178px,200px) minmax(88px,96px) minmax(112px,124px) minmax(112px,132px) minmax(96px,max-content); gap:8px; align-items:center; min-width:940px; }
+.tree-row.file-row, .tree-row.folder-row, .tree-header { display:grid; grid-template-columns:24px 24px minmax(280px,1fr) minmax(178px,200px) minmax(88px,96px) minmax(112px,124px) minmax(112px,132px) max-content; gap:8px; align-items:center; min-width:940px; }
 .tree-header { color:var(--muted); font-size:12px; font-weight:800; text-transform:uppercase; background:var(--table-head-bg); border:1px solid var(--line); border-radius:6px; padding:7px 6px; margin-bottom:6px; }
 .tree-row:hover { background:var(--row-hover); }
 .tree-name { flex:1; overflow-wrap:anywhere; }
 .tree-meta { color:var(--muted); font-size:12px; text-align:right; justify-self:end; }
-.tree-actions { display:flex; gap:6px; justify-content:flex-end; }
-.icon-btn { width:32px; height:32px; display:inline-grid; place-items:center; padding:0; }
+.tree-actions { display:flex; gap:4px; justify-content:flex-end; white-space:nowrap; }
+.icon-btn { width:30px; height:30px; display:inline-grid; place-items:center; padding:0; }
 .folder > .tree-row { font-weight:600; }
 .hidden { display:none; }
 .muted { color:var(--muted); }
@@ -614,6 +807,7 @@ const themeTemplates = [
 let page = "Status";
 let settingsCache = null;
 let fileRowsCache = [];
+let operationRowsCache = [];
 let logLevelSelection = ["error","warning","info"];
 let logEventTypeSelection = [];
 let logPage = 1;
@@ -796,7 +990,7 @@ async function render(){
   await updateLogPage();
  }
  if(page==="Queue"){
-  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(updateQueuePage)"><span class="ui-icon">&#8593;</span>Apply filter</button><button class="primary" onclick="post('/api/post-next').then(updateQueuePage)"><span class="ui-icon">&#9658;</span>Post next</button>${pushLabel()}</div><h2 class="section-title"><span class="ui-icon">&#9658;</span>Active</h2><div id="activeQueueRows"></div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Failed</h2><div id="failedQueueRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Completed</h2><div id="completedQueueRows"></div>`;
+  c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(updateQueuePage)"><span class="ui-icon">&#8593;</span>Apply filter</button><button class="primary" onclick="post('/api/backup/run').then(updateQueuePage)"><span class="ui-icon">&#9658;</span>Backup now</button>${pushLabel()}</div><h2 class="section-title"><span class="ui-icon">&#9658;</span>Active</h2><div id="activeQueueRows"></div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Failed</h2><div id="failedQueueRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Completed</h2><div id="completedQueueRows"></div>`;
   await updateQueuePage();
  }
  if(page==="Tasks"){
@@ -834,12 +1028,13 @@ async function refreshPageForChanges(previous, token){
  const transferChanged = previous.transfer_id !== token.transfer_id;
  const chunksChanged = previous.chunks_total !== token.chunks_total;
  const tasksChanged = previous.task_revision !== token.task_revision;
- if(page==="Status" && (filesChanged || queueChanged || chunksChanged || tasksChanged || transferChanged)) await updateStatusPage();
- if(page==="Files" && (filesChanged || queueChanged || transferChanged)) await updateFilesPage();
+ const operationsChanged = previous.operation_revision !== token.operation_revision;
+ if(page==="Status" && (filesChanged || queueChanged || chunksChanged || tasksChanged || transferChanged || operationsChanged)) await updateStatusPage();
+ if(page==="Files" && (filesChanged || queueChanged || transferChanged || operationsChanged)) await updateFilesPage();
  if(page==="Log" && eventsChanged) await updateLogPage(false);
  if(page==="Queue" && (queueChanged || filesChanged || transferChanged)) await updateQueuePage();
  if(page==="Tasks" && (eventsChanged || tasksChanged)) await updateTasksPage();
- if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged)) await updateVerificationPage();
+ if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged || operationsChanged)) await updateVerificationPage();
  if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged || transferChanged)) await updateStatisticsPage();
  if(page==="Operations" && (eventsChanged || tasksChanged || transferChanged)) await updateOperationsPage();
 }
@@ -852,6 +1047,7 @@ async function updateStatusPage(){
  if(panel) panel.innerHTML = statusDashboard(s, tasks, speed);
 }
 async function updateFilesPage(){
+ await refreshOperationProgress();
  const openFolders = new Set(Array.from(document.querySelectorAll("#filesTree details[data-path][open]")).map(item => item.dataset.path));
  const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
  const unbacked = !!document.getElementById("showUnbackedOnly")?.checked;
@@ -870,6 +1066,10 @@ async function updateFilesPage(){
   updateFolderCheckboxStates();
   updateFilesSelectionSummary();
  }
+}
+async function refreshOperationProgress(){
+ const result = await api("/api/operations/progress");
+ operationRowsCache = result.operations || [];
 }
 async function updateQueuePage(){
  const active = await api(`/api/queue?page=${activeQueuePage}&page_size=${queuePageSize}`);
@@ -890,14 +1090,14 @@ function pagedTable(result, pageVar, cols){
 function verificationTable(rows, tableKey){
  if(!rows.length) return "<p class='muted'>No rows.</p>";
  const colsByTable = {
-  missing:["relative_path","state","chunk_count","missing_chunks","last_chunk_verify_at"],
-  unverified:["relative_path","state","chunk_count"],
-  verified:["relative_path","state","chunk_count","last_verify_at","last_chunk_verify_at"],
-  no_chunks:["relative_path","state"]
+  missing:["relative_path","progress","state","chunk_count","missing_chunks","last_chunk_verify_at"],
+  unverified:["relative_path","progress","state","chunk_count"],
+  verified:["relative_path","progress","state","chunk_count","last_verify_at","last_chunk_verify_at"],
+  no_chunks:["relative_path","progress","state"]
  };
  const cols = colsByTable[tableKey] || ["relative_path","state"];
  return `<table><thead><tr><th><input class="verificationTableSelect" data-table-key="${esc(tableKey)}" type="checkbox" onchange="toggleVerificationTable('${esc(tableKey)}', this.checked)"></th>${cols.map(c=>`<th>${esc(labelize(c))}</th>`).join("")}</tr></thead><tbody>`+
- rows.map(row => `<tr><td><input class="verificationSelect" type="checkbox" value="${Number(row.id)}" ${selectedVerificationFiles.has(Number(row.id)) ? "checked" : ""} onchange="setVerificationSelected(${Number(row.id)}, this.checked)"></td>${cols.map(c=>`<td>${formatCellHtml(c, row[c], row)}</td>`).join("")}</tr>`).join("")+
+ rows.map(row => `<tr><td><input class="verificationSelect" type="checkbox" value="${Number(row.id)}" ${selectedVerificationFiles.has(Number(row.id)) ? "checked" : ""} onchange="setVerificationSelected(${Number(row.id)}, this.checked)"></td>${cols.map(c=>`<td>${c === "progress" ? operationProgressHtml("verify", Number(row.id)) || "<span></span>" : formatCellHtml(c, row[c], row)}</td>`).join("")}</tr>`).join("")+
  "</tbody></table>";
 }
 function verificationPagedTable(result, pageVar, state){
@@ -946,17 +1146,17 @@ function updateVerificationSelectionState(rows=[]){
 async function verifySelectedFiles(){
  const ids = Array.from(selectedVerificationFiles);
  if(!ids.length) return setVerificationStatus("Select files to verify first.", 0, "bad");
- setVerificationStatus(`Verifying ${ids.length} selected files...`, 35, "warn", true);
- const out = await post("/api/verify", { file_ids:ids });
- if(out.error) setVerificationStatus(out.error, 100, "bad");
- else setVerificationStatus(`Verified ${out.verified || 0} chunks for ${ids.length} selected files.`, 100, "ok");
+ setVerificationStatus(`Started verification for ${ids.length} selected files.`, 5, "warn");
+ const out = await post("/api/verify/start", { file_ids:ids });
+ if(out.error) setVerificationStatus(out.error, 0, "bad");
+ else setVerificationStatus(`Verification is running for ${ids.length} selected files.`, 5, "warn");
  await updateVerificationPage();
 }
 async function verifyAllFiles(){
- setVerificationStatus("Verifying all due chunks...", 35, "warn", true);
- const out = await post("/api/verify", { force:true });
- if(out.error) setVerificationStatus(out.error, 100, "bad");
- else setVerificationStatus(`Verified ${out.verified || 0} chunks.`, 100, "ok");
+ setVerificationStatus("Started verification for all due chunks.", 5, "warn");
+ const out = await post("/api/verify/start", { force:true });
+ if(out.error) setVerificationStatus(out.error, 0, "bad");
+ else setVerificationStatus("Verification is running.", 5, "warn");
  await updateVerificationPage();
 }
 function setVerificationStatus(message, pct=0, tone="warn", indeterminate=false){
@@ -971,8 +1171,8 @@ async function updateTasksPage(){
 }
 function taskActionButtons(kind, refresh="updateTasksPage"){
  if(kind === "catalog") return `<button class="primary" onclick="post('/api/scan').then(${refresh})"><span class="ui-icon">&#128193;</span>Scan now</button>`;
- if(kind === "backup") return `<button onclick="post('/api/queue/enqueue-unbacked').then(${refresh})"><span class="ui-icon">&#10133;</span>Queue unbacked</button><button class="primary" onclick="post('/api/post-next').then(${refresh})"><span class="ui-icon">&#9658;</span>Post next</button>`;
- if(kind === "verification") return `<button onclick="post('/api/verify',{force:true}).then(${refresh})"><span class="ui-icon">&#10003;</span>Verify chunks</button>`;
+ if(kind === "backup") return `<button class="primary" onclick="post('/api/backup/run').then(${refresh})"><span class="ui-icon">&#9658;</span>Backup now</button>`;
+ if(kind === "verification") return `<button onclick="post('/api/verify/start',{force:true}).then(${refresh})"><span class="ui-icon">&#10003;</span>Verify chunks</button>`;
  if(kind === "cloud_backup") return `<button onclick="post('/api/cloud-backup').then(${refresh})"><span class="ui-icon">&#9729;</span>Backup config/db</button>`;
  return "";
 }
@@ -987,6 +1187,7 @@ function tasksTable(rows){
  "</tbody></table>";
 }
 async function updateVerificationPage(){
+ await refreshOperationProgress();
  verificationTextFilter = document.getElementById("verificationSearch")?.value || verificationTextFilter;
  const q = encodeURIComponent(verificationTextFilter);
  const [missing, unverified, verified, noChunks] = await Promise.all([
@@ -1419,7 +1620,26 @@ function verifiedPill(timestamp){
  if(!timestamp) return `<span></span>`;
  return `<span class="pill ok verified" title="Verified ${esc(formatDateTime(timestamp))}"><span class="ui-icon">&#10003;</span>Verified</span>`;
 }
+function operationFor(kind, fileId){
+ const matching = operationRowsCache.filter(op => op.kind === kind && Number(op.file_id || 0) === Number(fileId));
+ return matching.sort((a,b)=>String(b.updated_at || "").localeCompare(String(a.updated_at || "")))[0] || null;
+}
+function operationProgressHtml(kind, fileId){
+ const op = operationFor(kind, fileId);
+ if(!op) return "";
+ const total = Number(op.total || 0);
+ const done = Number(op.done || 0);
+ const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+ const tone = op.status === "failed" ? "bad" : op.status === "done" ? "ok" : "warn";
+ const detail = Number(op.bytes_done || 0) ? ` - ${formatBytes(op.bytes_done)}` : "";
+ const label = op.status === "running"
+  ? `${labelize(kind)} ${total ? `${done}/${total}` : "starting"}${detail}`
+  : `${labelize(op.status)}: ${op.message || labelize(kind)}`;
+ return `<div class="file-progress"><div class="progress-track"><div class="progress-fill ${tone === "bad" ? "bad" : ""}" style="width:${Math.max(3,pct)}%"></div></div><span>${esc(label)}</span></div>`;
+}
 function fileProgress(file){
+ const restoreProgress = operationProgressHtml("restore", Number(file.id));
+ if(restoreProgress) return restoreProgress;
  const active = file.state === "posting" || file.queue_status === "posting";
  if(!active) return `<span></span>`;
  const expected = Math.max(1, Math.ceil(Number(file.size || 0) / Number(settingsCache?.article_size || 786432)));
@@ -1552,24 +1772,24 @@ async function restoreSelectedFilesMode(mode, destValue=""){
  }
  const dest = mode === "destination" ? destValue : "";
  let restored = 0;
- setRestoreStatus(`Restoring ${selectedRows.length} files...`, 5, "warn");
+ setRestoreStatus(`Starting restore for ${selectedRows.length} files...`, 5, "warn");
  for(const file of selectedRows){
   const startPct = Math.round((restored / selectedRows.length) * 100);
-  setRestoreStatus(`Restoring ${restored + 1} of ${selectedRows.length}: ${file.relative_path || file.path}`, startPct, "warn");
   const confidence = await post("/api/restore/confidence", { path:file.path });
   if(confidence.warning && !confirm(`${file.relative_path || file.path}\n${confidence.warning}\nContinue restore?`)){
    setRestoreStatus(`Skipped ${file.relative_path || file.path}`, startPct, "warn");
    continue;
   }
-  const out = await post("/api/restore", { path:file.path, dest:dest || null });
+  const out = await post("/api/restore/start", { path:file.path, dest:dest || null });
   if(out.error){
    setRestoreStatus(out.error, Math.max(startPct, 5), "bad");
    return;
   }
   restored++;
-  setRestoreStatus(`Restored ${restored} of ${selectedRows.length} files.`, Math.round((restored / selectedRows.length) * 100), restored === selectedRows.length ? "ok" : "warn");
+  setRestoreStatus(`Started ${restored} of ${selectedRows.length} restore jobs.`, Math.round((restored / selectedRows.length) * 100), "warn");
  }
- setRestoreStatus(`Restored ${restored} files.`, 100, "ok");
+ setRestoreStatus(`Restore jobs started for ${restored} files.`, 100, "ok");
+ await updateFilesPage();
 }
 async function restoreCatalogFile(fileId){
  return restoreCatalogFileMode(fileId, "origin");
@@ -1592,9 +1812,10 @@ async function restoreCatalogFileMode(fileId, mode, destValue=""){
  const confidence = await post("/api/restore/confidence", { path:file.path });
  if(confidence.warning && !confirm(`${confidence.warning}\nContinue restore?`)) return;
  const dest = mode === "destination" ? destValue : "";
- setRestoreStatus(`Restoring ${file.relative_path || file.path}...`, 45, "warn", true);
- const out = await post("/api/restore", { path:file.path, dest:dest || null });
- setRestoreStatus(out.error || `Restored to ${out.target}`, out.error ? 45 : 100, out.error ? "bad" : "ok");
+ setRestoreStatus(`Starting restore for ${file.relative_path || file.path}...`, 10, "warn");
+ const out = await post("/api/restore/start", { path:file.path, dest:dest || null });
+ setRestoreStatus(out.error || `Restore started for ${file.relative_path || file.path}.`, out.error ? 10 : 20, out.error ? "bad" : "warn");
+ await updateFilesPage();
 }
 async function restoreCatalogFolder(path){
  return restoreCatalogFolderMode(path, "origin");
@@ -1606,9 +1827,11 @@ async function restoreCatalogFolderMode(path, mode, destValue=""){
   return;
  }
  closeDropdowns();
- setRestoreStatus(`Restoring folder ${path}...`, 35, "warn", true);
- const out = await post("/api/restore", { path:path, dest:dest || null, folder:true });
- setRestoreStatus(out.error || `Restored ${out.restored} files from ${path}.`, out.error ? 35 : 100, out.error ? "bad" : "ok");
+ setRestoreStatus(`Starting folder restore for ${path}...`, 10, "warn");
+ const out = await post("/api/restore/start", { path:path, dest:dest || null, folder:true });
+ const count = (out.operation_ids || []).length;
+ setRestoreStatus(out.error || `Restore started for ${count} files from ${path}.`, out.error ? 10 : 20, out.error ? "bad" : "warn");
+ await updateFilesPage();
 }
 function restoreModePrompt(multiple=false){
  const mode = prompt(`${multiple ? "Selected files" : "File"} restore mode: origin, destination, or download`, "origin");

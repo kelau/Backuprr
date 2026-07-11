@@ -9,7 +9,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 
 from . import __version__
 from .config import Config
@@ -310,7 +310,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         cleanup_payload(payload, original)
 
 
-def verify_chunks(db: Database, config: Config, chunks: Iterable[Any]) -> int:
+def verify_chunks(db: Database, config: Config, chunks: Iterable[Any], progress: Optional[Callable[[int, int], None]] = None) -> int:
     chunks = list(chunks)
     if not chunks:
         return 0
@@ -333,10 +333,12 @@ def verify_chunks(db: Database, config: Config, chunks: Iterable[Any]) -> int:
             if not exists or getattr(config, "log_chunk_events", False):
                 db.log("debug" if exists else "warning", "verify.chunk", f"Chunk {message_id} exists={exists}", file_id)
             count += 1
+            if progress:
+                progress(count, len(chunks))
     return count
 
 
-def verify_due_chunks(db: Database, config: Config, force: bool = False) -> int:
+def verify_due_chunks(db: Database, config: Config, force: bool = False, progress: Optional[Callable[[int, int], None]] = None) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=config.verification_interval_days)
     older_than = datetime.max.replace(tzinfo=timezone.utc).isoformat() if force else cutoff.replace(microsecond=0).isoformat()
     chunks = (
@@ -344,8 +346,13 @@ def verify_due_chunks(db: Database, config: Config, force: bool = False) -> int:
         if force
         else db.chunks_due_for_file_verification(older_than, config.verification_files_per_run)
     )
-    return verify_chunks(db, config, chunks)
+    return verify_chunks(db, config, chunks, progress=progress)
 
 
-def verify_file_chunks(db: Database, config: Config, file_ids: Iterable[int]) -> int:
-    return verify_chunks(db, config, db.chunks_for_file_ids(file_ids))
+def verify_file_chunks(
+    db: Database,
+    config: Config,
+    file_ids: Iterable[int],
+    progress: Optional[Callable[[int, int], None]] = None,
+) -> int:
+    return verify_chunks(db, config, db.chunks_for_file_ids(file_ids), progress=progress)

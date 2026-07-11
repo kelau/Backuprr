@@ -49,14 +49,67 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 cp config.example.json config.json
-backuprr init --config config.json
-backuprr add-endpoint /srv/media/movies --config config.json
-backuprr scan --config config.json
-backuprr web --config config.json --host 0.0.0.0 --port 8080
+backuprr --config config.json init
+backuprr --config config.json add-endpoint /srv/media/movies
+backuprr --config config.json scan
+backuprr --config config.json web --host 0.0.0.0 --port 8080
 ```
 
 On CentOS Stream, run the service behind a firewall or reverse proxy and use a
 systemd unit to start `backuprr web`.
+
+## Docker
+
+Build and run the container locally:
+
+```bash
+mkdir -p data
+cp config.example.json data/config.json
+docker compose up -d --build
+```
+
+The compose file stores config and the SQLite database in `./data` and mounts
+media at `/media` inside the container. Add endpoints in the Web UI using the
+container path, for example `/media/movies`, not the host path.
+
+For a direct `docker run` deployment:
+
+```bash
+docker build -t backuprr:local .
+docker run -d \
+  --name backuprr \
+  --restart unless-stopped \
+  -p 8080:8080 \
+  -e BACKUPRR_CONFIG=/data/config.json \
+  -v "$(pwd)/data:/data" \
+  -v "/srv/media:/media:rw" \
+  backuprr:local
+```
+
+### Portainer
+
+In Portainer, create a new Stack and paste this compose template. Change the
+host media path before deploying:
+
+```yaml
+services:
+  backuprr:
+    image: backuprr:local
+    build: .
+    container_name: backuprr
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      BACKUPRR_CONFIG: /data/config.json
+    volumes:
+      - /opt/backuprr/data:/data
+      - /srv/media:/media:rw
+```
+
+Create `/opt/backuprr/data/config.json` first, or bind a directory containing
+your existing `config.json`. Set `"database": "/data/backuprr.sqlite3"` in that
+config so the catalog persists across container upgrades.
 
 ## Configuration
 
@@ -100,23 +153,23 @@ direct provider username/password used for NNTP authentication:
 ## CLI
 
 ```bash
-backuprr init --config config.json
-backuprr add-endpoint /srv/media/series --config config.json
-backuprr scan --config config.json
-backuprr status --config config.json
-backuprr queue list --config config.json
-backuprr queue prioritize --filter older-first --config config.json
-backuprr post-next --config config.json
-backuprr verify --config config.json
-backuprr dry-run --config config.json
-backuprr health-check --config config.json
-backuprr article-size-test --config config.json
-backuprr maintenance --vacuum --config config.json
-backuprr restore-drill --config config.json
-backuprr pause backup --config config.json
-backuprr resume backup --config config.json
-backuprr restore --path /srv/media/movie/file.mkv --dest /restore-test --config config.json
-backuprr web --config config.json
+backuprr --config config.json init
+backuprr --config config.json add-endpoint /srv/media/series
+backuprr --config config.json scan
+backuprr --config config.json status
+backuprr --config config.json queue list
+backuprr --config config.json queue prioritize --filter older-first
+backuprr --config config.json post-next
+backuprr --config config.json verify
+backuprr --config config.json dry-run
+backuprr --config config.json health-check
+backuprr --config config.json article-size-test
+backuprr --config config.json maintenance --vacuum
+backuprr --config config.json restore-drill
+backuprr --config config.json pause backup
+backuprr --config config.json resume backup
+backuprr --config config.json restore --path /srv/media/movie/file.mkv --dest /restore-test
+backuprr --config config.json web
 ```
 
 ## Notes on Usenet posting

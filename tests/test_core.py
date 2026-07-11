@@ -130,7 +130,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.50")
+        self.assertEqual(__version__, "0.2.51")
 
     def test_response_zip_writer_supports_streamed_zip_downloads(self):
         buffer = io.BytesIO()
@@ -1524,8 +1524,10 @@ class CoreTests(unittest.TestCase):
         self.db.add_chunk(rows[0]["id"], 0, "<one@example.test>", 3, "abc", "[one]")
         self.db.add_chunk(rows[1]["id"], 0, "<two@example.test>", 3, "def", "[two]")
         self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        progress = []
         with patch("backuprr.backup.UsenetClient", FakeReadClient):
-            self.assertEqual(verify_file_chunks(self.db, self.config, [rows[0]["id"]]), 1)
+            self.assertEqual(verify_file_chunks(self.db, self.config, [rows[0]["id"]], progress=lambda done, total: progress.append((done, total))), 1)
+        self.assertEqual(progress, [(1, 1)])
         with self.db.connect() as conn:
             verified = conn.execute("SELECT file_id FROM chunks WHERE status='verified'").fetchall()
         self.assertEqual([row["file_id"] for row in verified], [rows[0]["id"]])
@@ -1574,9 +1576,11 @@ class CoreTests(unittest.TestCase):
         self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
         self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
         target = self.root / "restore" / "movie.mkv"
+        progress = []
         with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
-            self.assertEqual(restore_file(self.db, self.config, str(path), str(target)), target)
+            self.assertEqual(restore_file(self.db, self.config, str(path), str(target), progress=lambda done, total, bytes_done: progress.append((done, total, bytes_done))), target)
         self.assertEqual(target.read_bytes(), b"restored payload")
+        self.assertEqual(progress, [(1, 1, len(b"restored payload"))])
 
     def test_restore_confidence_reports_chunk_state(self):
         media = self.root / "media"
