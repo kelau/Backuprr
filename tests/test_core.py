@@ -118,7 +118,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.39")
+        self.assertEqual(__version__, "0.2.40")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -1016,6 +1016,7 @@ class CoreTests(unittest.TestCase):
                 "hourly_post_limit_bytes": 123456,
                 "usenet_retry_attempts": 4,
                 "usenet_retry_backoff_seconds": 8,
+                "ui_theme": "nordic_mint",
                 "log_retention_days": 40,
                 "verbose_log_retention_days": 5,
                 "restore_drill_interval_days": 9,
@@ -1060,6 +1061,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.hourly_post_limit_bytes, 123456)
         self.assertEqual(self.config.usenet_retry_attempts, 4)
         self.assertEqual(self.config.usenet_retry_backoff_seconds, 8)
+        self.assertEqual(self.config.ui_theme, "nordic_mint")
         self.assertEqual(self.config.log_retention_days, 40)
         self.assertEqual(self.config.verbose_log_retention_days, 5)
         self.assertEqual(self.config.restore_drill_interval_days, 9)

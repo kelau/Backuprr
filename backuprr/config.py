@@ -76,6 +76,7 @@ class Config:
     compact_chunk_metadata: bool = True
     transfer_sample_bucket_seconds: int = 60
     auto_queue_exclude_patterns: List[str] = field(default_factory=list)
+    ui_theme: str = "harbor_light"
     usenet_hosts: List[UsenetHost] = field(default_factory=list)
     cloud_backups: List[CloudBackupTarget] = field(default_factory=list)
     endpoints: List[str] = field(default_factory=list)
@@ -141,6 +142,7 @@ class Config:
             "compact_chunk_metadata": self.compact_chunk_metadata,
             "transfer_sample_bucket_seconds": self.transfer_sample_bucket_seconds,
             "auto_queue_exclude_patterns": self.auto_queue_exclude_patterns,
+            "ui_theme": self.ui_theme,
             "usenet_hosts": [host.__dict__ for host in self.usenet_hosts],
             "cloud_backups": [target.__dict__ for target in self.cloud_backups],
             "endpoints": self.endpoints,
@@ -260,6 +262,11 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         config.transfer_sample_bucket_seconds = seconds
     if "auto_queue_exclude_patterns" in data:
         config.auto_queue_exclude_patterns = [str(item).strip() for item in data["auto_queue_exclude_patterns"] if str(item).strip()]
+    if "ui_theme" in data:
+        theme = str(data["ui_theme"]).strip()
+        if theme not in {"harbor_light", "emerald_console", "slate_cinema", "graphite", "nordic_mint"}:
+            raise ValueError("ui_theme is not a supported template")
+        config.ui_theme = theme
     if "zip_subfolders" in data:
         config.zip_subfolders = bool(data["zip_subfolders"])
     if "encrypt_bodies" in data:
