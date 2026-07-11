@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
+from . import __version__
 from .config import Config
 from .crypto import xor_crypt
 from .db import Database, utcnow
@@ -72,6 +73,19 @@ def estimated_body_size(chunk: bytes, config: Config) -> int:
     return len(chunk) + (len(b"BACKUPRR-ENC1") + 16 if config.encrypt_bodies else 0)
 
 
+def queued_file_is_stable(item: Any, path: Path, stability_seconds: int) -> bool:
+    if stability_seconds <= 0:
+        return True
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    if stat.st_size != int(item["size"]) or stat.st_mtime_ns != int(item["mtime_ns"]):
+        return False
+    age_seconds = max(0.0, time.time() - (stat.st_mtime_ns / 1_000_000_000))
+    return age_seconds >= stability_seconds
+
+
 def post_next(db: Database, config: Config) -> Optional[int]:
     item = db.next_queue_item()
     if not item:
@@ -90,6 +104,11 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         db.set_queue_status(file_id, "failed")
         db.log("error", "post", f"Queued file no longer exists: {original}", file_id)
         return file_id
+    stability_seconds = int(getattr(config, "file_stability_seconds", 0) or 0)
+    if stability_seconds and not queued_file_is_stable(item, original, stability_seconds):
+        db.requeue_file(file_id, "file-changing")
+        db.log("debug", "post.stability", f"Waiting for stable file before posting: {original}", file_id)
+        return None
     db.set_queue_status(file_id, "posting")
     db.update_file_state(file_id, "posting")
     payload = original
@@ -198,6 +217,12 @@ def post_next(db: Database, config: Config) -> Optional[int]:
             return None
         if final_chunks < expected_chunks:
             raise RuntimeError(f"Only {final_chunks} of {expected_chunks} chunks are cataloged")
+        if stability_seconds and not queued_file_is_stable(item, original, stability_seconds):
+            db.requeue_file(file_id, "file-changing")
+            if run_id is not None:
+                db.finish_backup_run(run_id, "paused", "file-changing")
+            db.log("warning", "post.stability", f"File changed while posting; waiting before retrying: {original}", file_id)
+            return None
         trimmed = db.trim_chunks(file_id, expected_chunks)
         final_chunks = db.chunk_count_for_file(file_id)
         db.set_queue_progress(file_id, final_chunks, posted_bytes)
@@ -207,6 +232,29 @@ def post_next(db: Database, config: Config) -> Optional[int]:
             conn.execute("UPDATE queue SET status='done', updated_at=? WHERE file_id=?", (utcnow(), file_id))
         if run_id is not None:
             db.finish_backup_run(run_id, "done")
+        flags = []
+        if config.encrypt_bodies:
+            flags.append("encrypted")
+        if config.zip_subfolders:
+            flags.append("zip")
+        if config.par2.get("enabled"):
+            flags.append("par2")
+        db.record_backup_manifest(
+            file_id,
+            run_id,
+            {
+                "app_version": __version__,
+                "path": str(original),
+                "file_sha256": str(item["sha256"] or ""),
+                "article_size": article_size,
+                "chunk_count": final_chunks,
+                "bytes_total": int(payload.stat().st_size),
+                "flags": flags,
+                "newsgroup": config.newsgroup,
+                "host_mode": "post",
+                "created_at": utcnow(),
+            },
+        )
         db.log("info", "post", f"Posted backup for {original}", file_id)
         return file_id
     except Exception as exc:

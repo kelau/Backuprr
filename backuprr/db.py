@@ -1,3 +1,4 @@
+import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -5,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 STALE_POSTING_SECONDS = 15 * 60
 
 
@@ -121,6 +122,24 @@ class Database:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS backup_manifests (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              file_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
+              backup_run_id INTEGER REFERENCES backup_runs(id) ON DELETE SET NULL,
+              path TEXT NOT NULL,
+              file_sha256 TEXT NOT NULL DEFAULT '',
+              app_version TEXT NOT NULL DEFAULT '',
+              article_size INTEGER NOT NULL DEFAULT 0,
+              chunk_count INTEGER NOT NULL DEFAULT 0,
+              bytes_total INTEGER NOT NULL DEFAULT 0,
+              flags TEXT NOT NULL DEFAULT '',
+              manifest_json TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
+            )
+            """
+        )
 
     def get_meta(self, key: str) -> Optional[str]:
         with self.connect() as conn:
@@ -174,9 +193,10 @@ class Database:
         with self.connect() as conn:
             row = conn.execute("SELECT id, size, mtime_ns, sha256, state FROM files WHERE path = ?", (record["path"],)).fetchone()
             if row:
-                changed = row["size"] != record["size"] or row["mtime_ns"] != record["mtime_ns"] or row["sha256"] != record["sha256"]
+                content_changed = row["size"] != record["size"] or row["sha256"] != record["sha256"]
+                metadata_changed = row["mtime_ns"] != record["mtime_ns"]
                 revived = row["state"] in {"deleted", "unreadable"}
-                state = "changed" if changed else record.get("state", "discovered")
+                state = "changed" if content_changed else record.get("state", "discovered")
                 conn.execute(
                     """
                     UPDATE files
@@ -190,7 +210,7 @@ class Database:
                         record["size"],
                         record["mtime_ns"],
                         record["sha256"],
-                        1 if changed or revived else 0,
+                        1 if content_changed or revived else 0,
                         state,
                         now,
                         row["id"],
@@ -368,7 +388,7 @@ class Database:
         with self.connect() as conn:
             return conn.execute(
                 """
-                SELECT q.*, f.path, f.size, f.sha256, f.state FROM queue q
+                SELECT q.*, f.path, f.size, f.mtime_ns, f.sha256, f.state FROM queue q
                 JOIN files f ON f.id = q.file_id
                 WHERE q.status='queued'
                   AND f.state NOT IN ('backed_up', 'deleted', 'posting', 'unreadable')
@@ -576,6 +596,36 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM backup_runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
+    def record_backup_manifest(self, file_id: int, backup_run_id: Optional[int], manifest: Dict[str, Any]) -> None:
+        flags = ",".join(str(item) for item in manifest.get("flags", []))
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO backup_manifests(
+                  file_id, backup_run_id, path, file_sha256, app_version, article_size,
+                  chunk_count, bytes_total, flags, manifest_json, created_at
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    file_id,
+                    backup_run_id,
+                    str(manifest.get("path", "")),
+                    str(manifest.get("file_sha256", "")),
+                    str(manifest.get("app_version", "")),
+                    int(manifest.get("article_size", 0) or 0),
+                    int(manifest.get("chunk_count", 0) or 0),
+                    int(manifest.get("bytes_total", 0) or 0),
+                    flags,
+                    json.dumps(manifest, sort_keys=True),
+                    utcnow(),
+                ),
+            )
+
+    def backup_manifest_rows(self, limit: int = 50) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM backup_manifests ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
     def record_host_check(
         self,
         host_name: str,
@@ -594,6 +644,22 @@ class Database:
     def host_health_rows(self, limit: int = 50) -> List[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM host_stats ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def provider_profiles(self) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute(
+                """
+                SELECT host_name, mode,
+                       COUNT(*) AS checks,
+                       SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failures,
+                       MAX(article_size_bytes) AS max_article_size_bytes,
+                       ROUND(AVG(latency_ms), 1) AS avg_latency_ms,
+                       MAX(checked_at) AS last_checked_at
+                FROM host_stats
+                GROUP BY host_name, mode
+                ORDER BY host_name, mode
+                """
+            ).fetchall()
 
     def record_maintenance(self, kind: str, started_at: str, result: str, details: str = "") -> None:
         with self.connect() as conn:
@@ -935,11 +1001,44 @@ class Database:
             self.queue_file(missing_file_id, priority=10, reason="missing-chunks")
 
     def list_rows(self, table: str, limit: int = 200) -> List[sqlite3.Row]:
-        allowed = {"files", "events", "queue", "chunks", "endpoints", "backup_runs", "host_stats", "maintenance_runs", "restore_drills"}
+        allowed = {"files", "events", "queue", "chunks", "endpoints", "backup_runs", "backup_manifests", "host_stats", "maintenance_runs", "restore_drills"}
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")
         with self.connect() as conn:
             return conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def table_stats(self) -> List[Dict[str, Any]]:
+        tables = ["files", "chunks", "queue", "events", "backup_runs", "backup_manifests", "host_stats", "maintenance_runs", "restore_drills", "transfer_samples"]
+        with self.connect() as conn:
+            page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
+            page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
+            rows: List[Dict[str, Any]] = []
+            for table in tables:
+                count = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                rows.append({"table": table, "rows": count, "estimated_bytes": 0})
+            if rows:
+                rows[0]["estimated_bytes"] = page_size * page_count
+            return rows
+
+    def verification_backlog_summary(self, interval_days: int) -> Dict[str, Any]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=interval_days)).replace(microsecond=0).isoformat()
+        with self.connect() as conn:
+            due = conn.execute(
+                """
+                SELECT COUNT(*) FROM files
+                WHERE state='backed_up'
+                  AND id IN (SELECT DISTINCT file_id FROM chunks WHERE status != 'missing')
+                  AND (last_verify_at IS NULL OR last_verify_at <= ?)
+                """,
+                (cutoff,),
+            ).fetchone()[0]
+            oldest = conn.execute(
+                """
+                SELECT MIN(COALESCE(last_verify_at, last_backup_at, updated_at)) FROM files
+                WHERE state='backed_up'
+                """
+            ).fetchone()[0]
+        return {"due_files": int(due or 0), "oldest_verification_basis": oldest or "", "interval_days": int(interval_days)}
 
     def list_files(
         self,
@@ -980,6 +1079,13 @@ class Database:
                 """,
                 (*params, limit, offset),
             ).fetchall()
+
+    def file_by_id(self, file_id: int) -> sqlite3.Row:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
+            if row is None:
+                raise FileNotFoundError(f"No file with id {file_id}")
+            return row
 
     def file_count(self, search: str = "", include_deleted: bool = False, unbacked_only: bool = False) -> int:
         clauses = []
@@ -1217,6 +1323,21 @@ CREATE TABLE IF NOT EXISTS backup_runs (
   bytes_total INTEGER NOT NULL DEFAULT 0,
   bytes_done INTEGER NOT NULL DEFAULT 0,
   error TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS backup_manifests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  file_id INTEGER REFERENCES files(id) ON DELETE SET NULL,
+  backup_run_id INTEGER REFERENCES backup_runs(id) ON DELETE SET NULL,
+  path TEXT NOT NULL,
+  file_sha256 TEXT NOT NULL DEFAULT '',
+  app_version TEXT NOT NULL DEFAULT '',
+  article_size INTEGER NOT NULL DEFAULT 0,
+  chunk_count INTEGER NOT NULL DEFAULT 0,
+  bytes_total INTEGER NOT NULL DEFAULT 0,
+  flags TEXT NOT NULL DEFAULT '',
+  manifest_json TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS host_stats (

@@ -11,7 +11,7 @@ from .cloud_backup import backup_config_and_database
 from .config import Config, update_config
 from .db import Database
 from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, MaintenanceMonitor, RestoreDrillMonitor
-from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill, test_post_host_article_size
+from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, restore_plan, run_maintenance, run_restore_drill, test_post_host_article_size
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
 
@@ -150,7 +150,11 @@ class Handler(BaseHTTPRequestHandler):
                     "speed": self.db.speed_samples(120, 300),
                     "events": rowdicts(self.db.list_events(limit=50, exclude_event_types=["web.access"])),
                     "backup_runs": rowdicts(self.db.backup_run_rows(20)),
+                    "backup_manifests": rowdicts(self.db.backup_manifest_rows(20)),
                     "host_health": rowdicts(self.db.host_health_rows(20)),
+                    "provider_profiles": rowdicts(self.db.provider_profiles()),
+                    "db_tables": self.db.table_stats(),
+                    "verification_backlog": self.db.verification_backlog_summary(self.config.verification_interval_days),
                     "maintenance": rowdicts(self.db.maintenance_rows(20)),
                     "restore_drills": rowdicts(self.db.restore_drill_rows(20)),
                 }
@@ -161,6 +165,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"hosts": rowdicts(self.db.host_health_rows(50))})
         elif parsed.path == "/api/backup-runs":
             self.send_json(rowdicts(self.db.backup_run_rows(int(query.get("limit", ["50"])[0]))))
+        elif parsed.path == "/api/backup-manifests":
+            self.send_json(rowdicts(self.db.backup_manifest_rows(int(query.get("limit", ["50"])[0]))))
+        elif parsed.path == "/api/provider-profiles":
+            self.send_json(rowdicts(self.db.provider_profiles()))
+        elif parsed.path == "/api/db-tables":
+            self.send_json(self.db.table_stats())
         elif parsed.path == "/api/maintenance":
             self.send_json(rowdicts(self.db.maintenance_rows(int(query.get("limit", ["50"])[0]))))
         elif parsed.path == "/api/restore-drills":
@@ -257,6 +267,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(run_restore_drill(self.db, self.config))
             elif parsed.path == "/api/restore/confidence":
                 self.send_json(restore_confidence(self.db, data["path"]))
+            elif parsed.path == "/api/restore/plan":
+                self.send_json(restore_plan(self.db, data["path"], data.get("dest") or ""))
             elif parsed.path == "/api/restore":
                 if data.get("folder"):
                     self.send_json({"restored": restore_folder(self.db, self.config, data["path"], data.get("dest"))})
@@ -527,10 +539,10 @@ function table(rows, cols){
  rows.map(r=>`<tr>${cols.map(c=>`<td>${formatCellHtml(c, r[c], r)}</td>`).join("")}</tr>`).join("")+"</tbody></table>";
 }
 function formatCell(col, value){
- return ["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked","article_size_bytes"].includes(col) ? formatBytes(value) : value;
+ return ["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked","article_size_bytes","max_article_size_bytes","estimated_bytes"].includes(col) ? formatBytes(value) : value;
 }
 function formatCellHtml(col, value, row={}){
- if(["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked","article_size_bytes"].includes(col)) return esc(formatBytes(value));
+ if(["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked","article_size_bytes","max_article_size_bytes","estimated_bytes"].includes(col)) return esc(formatBytes(value));
  if(["ts","created_at","updated_at","last_backup_at","last_verify_at","last_chunk_verify_at","posted_at","verified_at","last_run","started_at","finished_at","checked_at"].includes(col)) return esc(formatDateTime(value));
  if(["state","status"].includes(col)) return statePill(value);
  if(col === "level") return levelPill(value);
@@ -923,7 +935,11 @@ function statisticsDashboard(data){
  const speed = data.speed || [];
  const events = data.events || [];
  const backupRuns = data.backup_runs || [];
+ const backupManifests = data.backup_manifests || [];
  const hostHealth = data.host_health || [];
+ const providerProfiles = data.provider_profiles || [];
+ const dbTables = data.db_tables || [];
+ const verificationBacklog = data.verification_backlog || {};
  const maintenance = data.maintenance || [];
  const restoreDrills = data.restore_drills || [];
  const eventCounts = {};
@@ -936,6 +952,7 @@ function statisticsDashboard(data){
    ${statCard("Data cataloged", formatBytes(stats.files_bytes_total || 0), "&#128190;")}
    ${statCard("Chunks", Number(stats.chunks_total || 0), "&#129513;")}
    ${statCard("NNTP threads", settingsCache?.nntp_threads || "-", "&#128225;")}
+   ${statCard("Verify backlog", verificationBacklog.due_files || 0, "&#10003;")}
   </div>
   <div class="chart-grid">
    ${speedChart("Two hour transfer speed", speed)}
@@ -946,6 +963,12 @@ function statisticsDashboard(data){
   ${table(tasks, ["name","kind","status","interval_seconds","last_run","last_run_duration","time_until_next_run","runs","last_result","last_error"])}
   <h2 class="section-title"><span class="ui-icon">&#128230;</span>Backup runs</h2>
   ${table(backupRuns, ["id","file_id","status","reason","host","started_at","finished_at","chunks_done","chunks_total","bytes_done","bytes_total","error"])}
+  <h2 class="section-title"><span class="ui-icon">&#128221;</span>Backup manifests</h2>
+  ${table(backupManifests, ["id","file_id","backup_run_id","app_version","article_size","chunk_count","bytes_total","flags","created_at"])}
+  <h2 class="section-title"><span class="ui-icon">&#128202;</span>Database tables</h2>
+  ${table(dbTables, ["table","rows","estimated_bytes"])}
+  <h2 class="section-title"><span class="ui-icon">&#128225;</span>Provider profiles</h2>
+  ${table(providerProfiles, ["host_name","mode","checks","failures","max_article_size_bytes","avg_latency_ms","last_checked_at"])}
   <h2 class="section-title"><span class="ui-icon">&#128225;</span>Host health</h2>
   ${table(hostHealth, ["host_name","mode","status","article_size_bytes","latency_ms","checked_at","message"])}
   <h2 class="section-title"><span class="ui-icon">&#128736;</span>Maintenance</h2>
@@ -957,6 +980,8 @@ function statisticsDashboard(data){
 function operationsDashboard(tasks, plan, health, maintenance, drills, runs){
  return `<div class="dashboard">
   <div class="toolbar">
+   <button class="danger" onclick="post('/api/worker/pause',{kind:'all'}).then(updateOperationsPage)"><span class="ui-icon">&#9208;</span>Pause all workers</button>
+   <button onclick="post('/api/worker/resume',{kind:'all'}).then(updateOperationsPage)"><span class="ui-icon">&#9658;</span>Resume all workers</button>
    <button class="primary" onclick="post('/api/health/check').then(updateOperationsPage)"><span class="ui-icon">&#128225;</span>Check hosts + article size</button>
    <button onclick="post('/api/maintenance/run', { vacuum:false }).then(updateOperationsPage)"><span class="ui-icon">&#128736;</span>Prune logs</button>
    <button onclick="post('/api/maintenance/run', { vacuum:true }).then(updateOperationsPage)"><span class="ui-icon">&#128190;</span>Vacuum database</button>
@@ -1280,6 +1305,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#9729;</span>Cloud backup interval seconds</span><input id="setCloudBackupInterval" type="number" min="1" value="${esc(s.cloud_backup_interval_seconds || 3600)}"></label>
   <label class="field"><span><span class="ui-icon">&#128736;</span>Maintenance interval seconds</span><input id="setMaintenanceInterval" type="number" min="1" value="${esc(s.maintenance_interval_seconds || 86400)}"></label>
   <label class="field"><span><span class="ui-icon">&#8635;</span>Restore drill task interval seconds</span><input id="setRestoreDrillTaskInterval" type="number" min="1" value="${esc(s.restore_drill_task_interval_seconds || 86400)}"></label>
+  <label class="field"><span><span class="ui-icon">&#9202;</span>File stability seconds before posting</span><input id="setFileStabilitySeconds" type="number" min="0" max="86400" value="${esc(s.file_stability_seconds ?? 300)}"></label>
  </div></div>
  <div id="tabProtection" class="tab-panel"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#128274;</span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
@@ -1413,6 +1439,7 @@ async function saveSettings(){
   cloud_backup_interval_seconds: Number(setCloudBackupInterval.value),
   maintenance_interval_seconds: Number(setMaintenanceInterval.value),
   restore_drill_task_interval_seconds: Number(setRestoreDrillTaskInterval.value),
+  file_stability_seconds: Number(setFileStabilitySeconds.value),
   nntp_threads: Number(setNntpThreads.value),
   hourly_post_limit_bytes: gbToBytes(setHourlyPostLimitGb.value),
   usenet_retry_attempts: Number(setRetryAttempts.value),

@@ -12,7 +12,7 @@ from backuprr.config import Config, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
-from backuprr.operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill, test_post_host_article_size
+from backuprr.operations import check_usenet_hosts, dry_run_plan, restore_confidence, restore_plan, run_maintenance, run_restore_drill, test_post_host_article_size
 from backuprr.queueing import enqueue_unbacked, prioritize
 from backuprr.restore import restore_file, restore_sample
 from backuprr.scanner import scan_all
@@ -109,6 +109,7 @@ class CoreTests(unittest.TestCase):
         self.config = Config(
             database=str(self.root / "test.sqlite3"),
             article_size=8,
+            file_stability_seconds=0,
             newsgroup="alt.binaries.backup",
             usenet_hosts=[UsenetHost(name="post", mode="post", host="example.test", port=563, tls="implicit")],
             base_dir=self.root,
@@ -118,7 +119,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.40")
+        self.assertEqual(__version__, "0.2.41")
 
     def test_queue_schema_tracks_live_posting_progress(self):
         with self.db.connect() as conn:
@@ -138,6 +139,7 @@ class CoreTests(unittest.TestCase):
                 for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             }
         self.assertIn("backup_runs", tables)
+        self.assertIn("backup_manifests", tables)
         self.assertIn("host_stats", tables)
         self.assertIn("maintenance_runs", tables)
         self.assertIn("restore_drills", tables)
@@ -168,6 +170,18 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(results[0]["status"], "ok")
         self.assertEqual(results[0]["article_size_bytes"], 200 * 1024)
         self.assertIn("max article size", results[0]["message"])
+
+    def test_provider_profiles_and_table_stats_are_available(self):
+        self.db.record_host_check("post", "post", "ok", "ok", latency_ms=10, article_size_bytes=1024)
+        self.db.record_host_check("post", "post", "failed", "nope", latency_ms=30)
+        profiles = self.db.provider_profiles()
+        self.assertEqual(profiles[0]["host_name"], "post")
+        self.assertEqual(profiles[0]["checks"], 2)
+        self.assertEqual(profiles[0]["failures"], 1)
+        self.assertEqual(profiles[0]["max_article_size_bytes"], 1024)
+        table_stats = {row["table"]: row for row in self.db.table_stats()}
+        self.assertIn("backup_manifests", table_stats)
+        self.assertIn("estimated_bytes", table_stats["files"])
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"
@@ -244,6 +258,25 @@ class CoreTests(unittest.TestCase):
         with patch("backuprr.scanner.sha256_file", side_effect=AssertionError("unchanged file should not be rehashed")):
             self.assertEqual(scan_all(self.db), 1)
 
+    def test_scan_preserves_backed_up_state_when_only_mtime_changes(self):
+        media = self.root / "media"
+        media.mkdir()
+        movie = media / "movie.mkv"
+        movie.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db, self.config)
+        with patch("backuprr.backup.UsenetClient", FakePostClient):
+            self.assertIsNotNone(post_next(self.db, self.config))
+        os.utime(movie, (movie.stat().st_atime + 10, movie.stat().st_mtime + 10))
+        self.assertEqual(scan_all(self.db), 1)
+        self.assertEqual(enqueue_unbacked(self.db, self.config), 0)
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT state, sha256 FROM files WHERE path=?", (str(movie.resolve()),)).fetchone()
+            queue_row = conn.execute("SELECT status FROM queue").fetchone()
+        self.assertEqual(row["state"], "backed_up")
+        self.assertEqual(queue_row["status"], "done")
+
     def test_scan_revives_deleted_file_at_same_path(self):
         media = self.root / "media"
         media.mkdir()
@@ -259,6 +292,18 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(row["state"], "discovered")
         with patch("backuprr.scanner.sha256_file", side_effect=AssertionError("revived unchanged file should not be rehashed")):
             self.assertEqual(scan_all(self.db), 1)
+
+    def test_auto_queue_waits_for_file_stability_window(self):
+        media = self.root / "media"
+        media.mkdir()
+        movie = media / "movie.mkv"
+        movie.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        self.assertEqual(scan_all(self.db), 1)
+        self.config.file_stability_seconds = 3600
+        self.assertEqual(enqueue_unbacked(self.db, self.config), 0)
+        self.config.file_stability_seconds = 0
+        self.assertEqual(enqueue_unbacked(self.db, self.config), 1)
 
     def test_scan_skips_unreadable_file_content(self):
         media = self.root / "media"
@@ -472,6 +517,10 @@ class CoreTests(unittest.TestCase):
         runs = self.db.backup_run_rows()
         self.assertEqual(runs[0]["status"], "done")
         self.assertEqual(runs[0]["chunks_done"], 2)
+        manifests = self.db.backup_manifest_rows()
+        self.assertEqual(manifests[0]["file_id"], int(chunks[0]["file_id"]))
+        self.assertEqual(manifests[0]["article_size"], 8)
+        self.assertEqual(manifests[0]["chunk_count"], 2)
         self.assertEqual(self.db.list_events(["debug"], event_types=["post.chunk"]), [])
 
     def test_chunk_event_logging_can_be_enabled(self):
@@ -506,6 +555,21 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             queue_row = conn.execute("SELECT status FROM queue").fetchone()
         self.assertEqual(queue_row["status"], "queued")
+
+    def test_post_next_waits_for_queued_file_stability(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        self.config.file_stability_seconds = 3600
+        with patch("backuprr.backup.UsenetClient", side_effect=AssertionError("unstable file should not post")):
+            self.assertIsNone(post_next(self.db, self.config))
+        with self.db.connect() as conn:
+            queue_row = conn.execute("SELECT status, reason FROM queue").fetchone()
+        self.assertEqual(queue_row["status"], "queued")
+        self.assertEqual(queue_row["reason"], "file-changing")
 
     def test_post_next_pauses_large_file_at_hourly_limit_and_resumes(self):
         media = self.root / "media"
@@ -1012,6 +1076,7 @@ class CoreTests(unittest.TestCase):
                 "cloud_backup_interval_seconds": 55,
                 "maintenance_interval_seconds": 66,
                 "restore_drill_task_interval_seconds": 77,
+                "file_stability_seconds": 88,
                 "nntp_threads": 6,
                 "hourly_post_limit_bytes": 123456,
                 "usenet_retry_attempts": 4,
@@ -1057,6 +1122,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.cloud_backup_interval_seconds, 55)
         self.assertEqual(self.config.maintenance_interval_seconds, 66)
         self.assertEqual(self.config.restore_drill_task_interval_seconds, 77)
+        self.assertEqual(self.config.file_stability_seconds, 88)
         self.assertEqual(self.config.nntp_threads, 6)
         self.assertEqual(self.config.hourly_post_limit_bytes, 123456)
         self.assertEqual(self.config.usenet_retry_attempts, 4)
@@ -1339,6 +1405,23 @@ class CoreTests(unittest.TestCase):
         confidence = restore_confidence(self.db, str(path))
         self.assertTrue(confidence["restorable"])
         self.assertEqual(confidence["chunk_count"], 1)
+
+    def test_restore_plan_reports_destination_and_overwrite(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"placeholder")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
+        target = self.root / "restore.mkv"
+        target.write_bytes(b"old")
+        plan = restore_plan(self.db, str(path), str(target))
+        self.assertTrue(plan["will_overwrite"])
+        self.assertEqual(plan["target"], str(target))
+        self.assertEqual(plan["bytes_total"], len(b"placeholder"))
 
     def test_restore_sample_and_restore_drill_download_limited_bytes(self):
         media = self.root / "media"

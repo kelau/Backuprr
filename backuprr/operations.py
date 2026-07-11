@@ -158,6 +158,22 @@ def restore_confidence(db: Database, source_path: str) -> Dict[str, Any]:
     }
 
 
+def restore_plan(db: Database, source_path: str, dest: str = "") -> Dict[str, Any]:
+    confidence = restore_confidence(db, source_path)
+    file_row = db.file_by_id(int(confidence["file_id"]))
+    target = Path(dest) if dest else Path(confidence["path"])
+    if dest and (target.exists() and target.is_dir()):
+        target = target / Path(confidence["path"]).name
+    return {
+        **confidence,
+        "target": str(target),
+        "target_exists": target.exists(),
+        "will_overwrite": target.exists() and target.is_file(),
+        "bytes_total": int(file_row["size"]),
+        "estimated_download_bytes": int(file_row["size"]),
+    }
+
+
 def run_restore_drill(db: Database, config: Config) -> Dict[str, Any]:
     candidate = db.restore_drill_candidate()
     if not candidate:

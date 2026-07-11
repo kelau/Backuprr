@@ -63,6 +63,7 @@ class Config:
     cloud_backup_interval_seconds: int = 3600
     maintenance_interval_seconds: int = 86400
     restore_drill_task_interval_seconds: int = 86400
+    file_stability_seconds: int = 300
     nntp_threads: int = 4
     hourly_post_limit_bytes: int = 0
     usenet_retry_attempts: int = 2
@@ -129,6 +130,7 @@ class Config:
             "cloud_backup_interval_seconds": self.cloud_backup_interval_seconds,
             "maintenance_interval_seconds": self.maintenance_interval_seconds,
             "restore_drill_task_interval_seconds": self.restore_drill_task_interval_seconds,
+            "file_stability_seconds": self.file_stability_seconds,
             "nntp_threads": self.nntp_threads,
             "hourly_post_limit_bytes": self.hourly_post_limit_bytes,
             "usenet_retry_attempts": self.usenet_retry_attempts,
@@ -209,6 +211,11 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if interval <= 0:
             raise ValueError("restore_drill_task_interval_seconds must be greater than zero")
         config.restore_drill_task_interval_seconds = interval
+    if "file_stability_seconds" in data:
+        seconds = int(data["file_stability_seconds"])
+        if seconds < 0 or seconds > 86400:
+            raise ValueError("file_stability_seconds must be between 0 and 86400")
+        config.file_stability_seconds = seconds
     if "nntp_threads" in data:
         threads = int(data["nntp_threads"])
         if threads < 1 or threads > 50:
