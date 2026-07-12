@@ -1,14 +1,27 @@
 import io
+import json
 import os
 import email.message
 import tempfile
 import unittest
 import zipfile
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
 from backuprr import __version__
-from backuprr.backup import decode_chunk, encode_chunk, post_next, verify_due_chunks, verify_file_chunks
+from backuprr.backup import (
+    cleanup_payload,
+    compression_enabled_for,
+    decode_chunk,
+    encode_chunk,
+    iter_compressed_chunks,
+    post_next,
+    prepare_payload,
+    resolve_par2_command,
+    verify_due_chunks,
+    verify_file_chunks,
+)
 from backuprr.cloud_backup import backup_config_and_database, backup_config_and_database_if_changed
 from backuprr.config import Config, LogDestination, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
@@ -19,7 +32,8 @@ from backuprr.operations import check_usenet_hosts, dry_run_plan, restore_confid
 from backuprr.queueing import enqueue_unbacked, excluded_by_auto_queue_filter, prioritize
 from backuprr.restore import restore_file, restore_sample, restored_payloads
 from backuprr.scanner import scan_all
-from backuprr.web import ResponseZipWriter, hourly_post_budget, thread_usage_summary, throughput_summary
+from backuprr.update_checker import check_for_updates, compare_versions, update_result
+from backuprr.web import Handler, ResponseZipWriter, hourly_post_budget, thread_usage_summary, throughput_summary
 
 
 class FakePostClient:
@@ -111,6 +125,20 @@ class FakeRestoreClient:
         return None
 
 
+class FakeGitHubResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return None
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
 class CoreTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -130,7 +158,41 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.55")
+        self.assertEqual(__version__, "0.2.73")
+
+    def test_compare_versions_handles_prefixed_semver(self):
+        self.assertGreater(compare_versions("v0.2.10", "0.2.9"), 0)
+        self.assertEqual(compare_versions("v1.0.0", "1"), 0)
+        self.assertLess(compare_versions("0.2.8", "0.2.9"), 0)
+
+    def test_update_checker_records_github_release_result(self):
+        requests = []
+
+        def fake_opener(request, timeout):
+            requests.append((request, timeout))
+            return FakeGitHubResponse(
+                {
+                    "tag_name": "v9.9.9",
+                    "html_url": "https://github.com/kelau/Backuprr/releases/tag/v9.9.9",
+                    "name": "Backuprr 9.9.9",
+                    "published_at": "2099-01-01T00:00:00Z",
+                    "body": "Future release notes",
+                }
+            )
+
+        result = check_for_updates(self.db, self.config, opener=fake_opener)
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["update_available"])
+        self.assertEqual(result["latest_version"], "9.9.9")
+        self.assertEqual(update_result(self.db)["latest_version"], "9.9.9")
+        self.assertEqual(requests[0][1], self.config.update_check_timeout_seconds)
+        self.assertIn("/repos/kelau/Backuprr/releases/latest", requests[0][0].full_url)
+
+    def test_update_checker_can_be_disabled(self):
+        self.config.update_check_enabled = False
+        result = check_for_updates(self.db, self.config, opener=lambda *_args, **_kwargs: self.fail("network should not be used"))
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(update_result(self.db)["status"], "disabled")
 
     def test_response_zip_writer_supports_streamed_zip_downloads(self):
         buffer = io.BytesIO()
@@ -312,6 +374,77 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(stats["files_total"], 1)
         self.assertEqual(stats["files_all_total"], 2)
         self.assertEqual(stats["files_deleted"], 1)
+
+    def test_stats_include_compression_and_par2_rollups(self):
+        media = self.root / "media"
+        media.mkdir()
+        first = media / "first.txt"
+        second = media / "second.txt"
+        first.write_bytes(b"a" * 100)
+        second.write_bytes(b"b" * 200)
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT id FROM files ORDER BY relative_path").fetchall()
+            conn.execute("UPDATE files SET state='backed_up' WHERE id IN (?,?)", (rows[0]["id"], rows[1]["id"]))
+        self.db.set_file_backup_features(rows[0]["id"], 100, 40, True, True)
+        self.db.set_file_backup_features(rows[1]["id"], 200, 180, True, False)
+        stats = self.db.stats()
+        self.assertEqual(stats["files_compressed"], 2)
+        self.assertEqual(stats["files_par2"], 1)
+        self.assertEqual(stats["files_compressible_backed_up"], 2)
+        self.assertEqual(stats["backup_uncompressed_bytes_total"], 300)
+        self.assertEqual(stats["backup_compressed_bytes_total"], 220)
+        self.assertEqual(stats["backup_par2_bytes_total"], 40)
+
+    def test_queue_attention_status_includes_failed_and_blocked_items(self):
+        media = self.root / "media"
+        media.mkdir()
+        failed = media / "failed.pdf"
+        blocked = media / "blocked.pdf"
+        done_blocked = media / "done-blocked.pdf"
+        normal = media / "normal.pdf"
+        failed.write_bytes(b"failed")
+        blocked.write_bytes(b"blocked")
+        done_blocked.write_bytes(b"done")
+        normal.write_bytes(b"normal")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            rows = conn.execute("SELECT id, relative_path FROM files").fetchall()
+            ids = {row["relative_path"]: row["id"] for row in rows}
+        self.db.queue_file(ids["failed.pdf"], reason="manual")
+        self.db.queue_file(ids["blocked.pdf"], reason="network-blocked")
+        self.db.queue_file(ids["done-blocked.pdf"], reason="network-blocked")
+        self.db.queue_file(ids["normal.pdf"], reason="manual")
+        with self.db.connect() as conn:
+            conn.execute("UPDATE queue SET status='failed', reason='par2-missing' WHERE file_id=?", (ids["failed.pdf"],))
+            conn.execute("UPDATE files SET state='failed' WHERE id=?", (ids["failed.pdf"],))
+            conn.execute("UPDATE queue SET status='done' WHERE file_id=?", (ids["done-blocked.pdf"],))
+            conn.execute("UPDATE files SET state='backed_up' WHERE id=?", (ids["done-blocked.pdf"],))
+        attention = self.db.list_queue(status="attention")
+        self.assertEqual(self.db.queue_count(status="attention"), 2)
+        self.assertEqual({row["relative_path"] for row in attention}, {"failed.pdf", "blocked.pdf"})
+
+    def test_recover_retryable_failed_requeues_failed_items_without_chunks(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "manual.pdf"
+        path.write_bytes(b"pdf")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.queue_file(file_id, reason="unbacked")
+        with self.db.connect() as conn:
+            conn.execute("UPDATE queue SET status='failed' WHERE file_id=?", (file_id,))
+            conn.execute("UPDATE files SET state='failed' WHERE id=?", (file_id,))
+        self.assertEqual(self.db.recover_retryable_failed(), 1)
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT q.status, q.reason, f.state FROM queue q JOIN files f ON f.id=q.file_id WHERE q.file_id=?", (file_id,)).fetchone()
+        self.assertEqual(row["status"], "queued")
+        self.assertEqual(row["reason"], "failed-retry")
+        self.assertEqual(row["state"], "queued")
 
     def test_scan_updates_relative_path_for_moved_file(self):
         media = self.root / "media"
@@ -607,6 +740,44 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(manifests[0]["chunk_count"], 2)
         self.assertEqual(self.db.list_events(["debug"], event_types=["post.chunk"]), [])
 
+    def test_compressed_chunks_round_trip_and_skip_known_compressed_extensions(self):
+        media = self.root / "media"
+        media.mkdir()
+        text_path = media / "notes.txt"
+        text_path.write_bytes((b"compress me " * 1000))
+        compressed = b"".join(iter_compressed_chunks(text_path, 37))
+        self.assertEqual(zlib.decompress(compressed, wbits=31), text_path.read_bytes())
+
+        self.config.compress_files = True
+        self.assertTrue(compression_enabled_for(text_path, self.config))
+        self.assertFalse(compression_enabled_for(media / "movie.mkv", self.config))
+        self.assertFalse(compression_enabled_for(media / "archive.zip", self.config))
+
+    def test_post_next_records_compressed_backup_metadata(self):
+        media = self.root / "media"
+        media.mkdir()
+        data = b"same text " * 500
+        (media / "notes.txt").write_bytes(data)
+        self.config.compress_files = True
+        self.config.article_size = 64
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        CountingPostClient.posts = []
+        with patch("backuprr.backup.UsenetClient", CountingPostClient):
+            self.assertIsNotNone(post_next(self.db, self.config))
+        with self.db.connect() as conn:
+            file_row = conn.execute("SELECT state, backup_uncompressed_size, backup_compressed_size, backup_compressed, backup_par2 FROM files").fetchone()
+            manifest = conn.execute("SELECT flags, bytes_total FROM backup_manifests ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(file_row["state"], "backed_up")
+        self.assertEqual(file_row["backup_uncompressed_size"], len(data))
+        self.assertEqual(file_row["backup_compressed"], 1)
+        self.assertEqual(file_row["backup_par2"], 0)
+        self.assertGreater(file_row["backup_compressed_size"], 0)
+        self.assertLess(file_row["backup_compressed_size"], len(data))
+        self.assertIn("compressed", manifest["flags"])
+        self.assertEqual(manifest["bytes_total"], file_row["backup_compressed_size"])
+
     def test_chunk_event_logging_can_be_enabled(self):
         media = self.root / "media"
         media.mkdir()
@@ -812,6 +983,44 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(file_row["state"], "failed")
         self.assertEqual(queue_row["status"], "failed")
         self.assertIn("PAR2 command not found", event["message"])
+
+    def test_prepare_payload_invokes_configured_par2_command(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.config.par2 = {"enabled": True, "command": "fake-par2", "redundancy_percent": 17}
+
+        calls = []
+
+        def fake_run(args, check, cwd):
+            calls.append((args, check, cwd))
+            Path(cwd, "movie.mkv.par2").write_bytes(b"par2")
+
+        with patch("backuprr.backup.shutil.which", return_value="C:/tools/fake-par2.exe"):
+            with patch("backuprr.backup.subprocess.run", side_effect=fake_run):
+                payload = prepare_payload(path, self.config)
+        try:
+            self.assertNotEqual(payload, path)
+            self.assertEqual(payload.name, "movie.mkv")
+            self.assertTrue(payload.exists())
+            self.assertEqual(payload.read_bytes(), b"0123456789abcdef")
+            self.assertEqual(len(calls), 1)
+            args, check, cwd = calls[0]
+            self.assertEqual(args, ["C:/tools/fake-par2.exe", "create", "-r17", str(payload)])
+            self.assertTrue(check)
+            self.assertEqual(cwd, str(payload.parent))
+            self.assertTrue(Path(cwd, "movie.mkv.par2").exists())
+        finally:
+            cleanup_payload(payload, path)
+
+    def test_resolve_par2_command_uses_bundled_candidate(self):
+        bundled = self.root / "bin" / "par2.exe"
+        bundled.parent.mkdir()
+        bundled.write_bytes(b"fake")
+        self.config.base_dir = self.root
+        with patch("backuprr.backup.shutil.which", return_value=None):
+            self.assertEqual(resolve_par2_command("par2", self.config), str(bundled))
 
     def test_post_next_requeues_when_socket_access_is_blocked(self):
         media = self.root / "media"
@@ -1109,6 +1318,65 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(rows[0]["posted_chunks"], 1)
         self.assertEqual(rows[0]["posted_bytes"], 120)
 
+    def test_completed_queue_payload_shows_stored_chunks_not_progress(self):
+        handler = object.__new__(Handler)
+        handler.config = self.config
+        payload = handler.queue_row_payload(
+            {
+                "file_id": 1,
+                "path": "movie.mkv",
+                "size": 10,
+                "status": "done",
+                "posted_chunks": 24,
+                "posted_bytes": 10,
+            }
+        )
+        self.assertEqual(payload["chunk_count"], 24)
+        self.assertEqual(payload["progress"], "24 chunks stored")
+        self.assertEqual(payload["progress_percent"], 100)
+
+    def test_completed_queue_orders_by_completion_time_ascending(self):
+        media = self.root / "media"
+        media.mkdir()
+        older = media / "older.mkv"
+        newer = media / "newer.mkv"
+        older.write_bytes(b"older")
+        newer.write_bytes(b"newer")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            ids = {row["relative_path"]: row["id"] for row in conn.execute("SELECT id, relative_path FROM files").fetchall()}
+            conn.execute("UPDATE queue SET status='done', updated_at='2026-01-01T00:00:00+00:00' WHERE file_id=?", (ids["older.mkv"],))
+            conn.execute("UPDATE queue SET status='done', updated_at='2026-01-02T00:00:00+00:00' WHERE file_id=?", (ids["newer.mkv"],))
+        rows = self.db.list_queue(status="done")
+        self.assertEqual([row["relative_path"] for row in rows], ["older.mkv", "newer.mkv"])
+
+    def test_queue_sort_applies_before_pagination(self):
+        media = self.root / "media"
+        media.mkdir()
+        small = media / "small.mkv"
+        large = media / "large.mkv"
+        small.write_bytes(b"1")
+        large.write_bytes(b"1" * 100)
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        rows = self.db.list_queue_sorted(limit=1, sort_by="size", sort_dir="desc")
+        self.assertEqual(rows[0]["relative_path"], "large.mkv")
+
+    def test_file_sort_applies_before_pagination(self):
+        media = self.root / "media"
+        media.mkdir()
+        small = media / "small.mkv"
+        large = media / "large.mkv"
+        small.write_bytes(b"1")
+        large.write_bytes(b"1" * 100)
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        rows = self.db.list_files(limit=1, sort_by="size", sort_dir="desc")
+        self.assertEqual(rows[0]["relative_path"], "large.mkv")
+
     def test_recover_stale_posting_requeues_file(self):
         media = self.root / "media"
         media.mkdir()
@@ -1190,6 +1458,7 @@ class CoreTests(unittest.TestCase):
                 "cloud_backup_interval_seconds": 55,
                 "maintenance_interval_seconds": 66,
                 "restore_drill_task_interval_seconds": 77,
+                "update_check_interval_seconds": 86400,
                 "file_stability_seconds": 88,
                 "nntp_threads": 6,
                 "hourly_post_limit_bytes": 123456,
@@ -1204,7 +1473,11 @@ class CoreTests(unittest.TestCase):
                 "log_chunk_events": True,
                 "compact_chunk_metadata": False,
                 "transfer_sample_bucket_seconds": 60,
+                "update_check_enabled": True,
+                "update_github_repo": "example/Backuprr",
+                "update_check_timeout_seconds": 12,
                 "auto_queue_exclude_patterns": ["*.sample", ".tmp"],
+                "external_api_keys": ["ha-key", "automation-key"],
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
                 "encryption_passphrase_env": "BACKUPRR_SECRET",
@@ -1248,6 +1521,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.cloud_backup_interval_seconds, 55)
         self.assertEqual(self.config.maintenance_interval_seconds, 66)
         self.assertEqual(self.config.restore_drill_task_interval_seconds, 77)
+        self.assertEqual(self.config.update_check_interval_seconds, 86400)
         self.assertEqual(self.config.file_stability_seconds, 88)
         self.assertEqual(self.config.nntp_threads, 6)
         self.assertEqual(self.config.hourly_post_limit_bytes, 123456)
@@ -1262,8 +1536,13 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(self.config.log_chunk_events)
         self.assertFalse(self.config.compact_chunk_metadata)
         self.assertEqual(self.config.transfer_sample_bucket_seconds, 60)
+        self.assertTrue(self.config.update_check_enabled)
+        self.assertEqual(self.config.update_github_repo, "example/Backuprr")
+        self.assertEqual(self.config.update_check_timeout_seconds, 12)
         self.assertEqual(self.config.auto_queue_exclude_patterns, ["*.sample", ".tmp"])
+        self.assertEqual(self.config.external_api_keys, ["ha-key", "automation-key"])
         self.assertTrue(self.config.zip_subfolders)
+        self.assertTrue(self.config.compress_files)
         self.assertTrue(self.config.encrypt_bodies)
         self.assertEqual(self.config.endpoints, [str(self.root / "media")])
         self.assertEqual(self.config.usenet_hosts[0].tls, "implicit")
@@ -1470,6 +1749,16 @@ class CoreTests(unittest.TestCase):
         self.assertIn("time_until_next_run", tasks[0])
         self.assertNotIn("last_started_at", tasks[0])
         self.assertIn("files scanned", tasks[0]["last_result"])
+        self.assertGreater(tasks[0]["revision"], 0)
+
+    def test_worker_next_run_persists_for_restart(self):
+        monitor = CatalogMonitor(self.db, self.config)
+        monitor._schedule_next(123)
+        original_next_run = monitor.tasks()[0]["next_run_at"]
+        restarted = CatalogMonitor(self.db, self.config)
+        tasks = restarted.tasks()
+        self.assertEqual(tasks[0]["next_run_at"], original_next_run)
+        self.assertEqual(tasks[0]["name"], "Catalog monitor")
         self.assertGreater(tasks[0]["revision"], 0)
 
     def test_backup_monitor_posts_next_queued_file(self):

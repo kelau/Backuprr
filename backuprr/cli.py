@@ -12,6 +12,7 @@ from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, ru
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
 from .scanner import scan_all
+from .update_checker import check_for_updates
 from .web import run_web
 
 
@@ -51,6 +52,7 @@ def main(argv=None) -> int:
     maintenance = sub.add_parser("maintenance")
     maintenance.add_argument("--vacuum", action="store_true")
     sub.add_parser("restore-drill")
+    sub.add_parser("update-check")
     pause = sub.add_parser("pause")
     pause.add_argument("kind", nargs="?", default="all")
     resume = sub.add_parser("resume")
@@ -122,6 +124,8 @@ def main(argv=None) -> int:
         print(json.dumps(run_maintenance(db, config, vacuum=args.vacuum), indent=2))
     elif args.command == "restore-drill":
         print(json.dumps(run_restore_drill(db, config), indent=2))
+    elif args.command == "update-check":
+        print(json.dumps(check_for_updates(db, config), indent=2))
     elif args.command == "pause":
         db.set_paused(args.kind, True)
         print(f"Paused {args.kind}")

@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -101,6 +102,7 @@ class Config:
     cloud_backup_interval_seconds: int = 3600
     maintenance_interval_seconds: int = 86400
     restore_drill_task_interval_seconds: int = 86400
+    update_check_interval_seconds: int = 86400
     file_stability_seconds: int = 300
     nntp_threads: int = 4
     hourly_post_limit_bytes: int = 0
@@ -115,11 +117,16 @@ class Config:
     compact_chunk_metadata: bool = True
     transfer_sample_bucket_seconds: int = 60
     auto_queue_exclude_patterns: List[str] = field(default_factory=list)
+    external_api_keys: List[str] = field(default_factory=list)
     ui_theme: str = "harbor_light"
+    update_check_enabled: bool = True
+    update_github_repo: str = "kelau/Backuprr"
+    update_check_timeout_seconds: int = 10
     usenet_hosts: List[UsenetHost] = field(default_factory=list)
     cloud_backups: List[CloudBackupTarget] = field(default_factory=list)
     log_destinations: List[LogDestination] = field(default_factory=list)
     endpoints: List[str] = field(default_factory=list)
+    compress_files: bool = False
     zip_subfolders: bool = False
     encrypt_bodies: bool = False
     encryption_passphrase_env: str = "BACKUPRR_ENCRYPTION_PASSPHRASE"
@@ -133,6 +140,7 @@ class Config:
         data: Dict[str, Any] = {}
         if config_path.exists():
             data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        legacy_zip_subfolders = bool(data.get("zip_subfolders")) and "compress_files" not in data
         hosts = [UsenetHost.from_dict(item) for item in data.pop("usenet_hosts", [])]
         cloud_backups = [CloudBackupTarget.from_dict(item) for item in data.pop("cloud_backups", [])]
         log_destinations = [LogDestination.from_dict(item) for item in data.pop("log_destinations", [])]
@@ -140,6 +148,8 @@ class Config:
         config.usenet_hosts = hosts
         config.cloud_backups = cloud_backups
         config.log_destinations = log_destinations
+        if legacy_zip_subfolders:
+            config.compress_files = True
         config.base_dir = config_path.resolve().parent
         config.source_path = config_path.resolve()
         return config
@@ -171,6 +181,7 @@ class Config:
             "cloud_backup_interval_seconds": self.cloud_backup_interval_seconds,
             "maintenance_interval_seconds": self.maintenance_interval_seconds,
             "restore_drill_task_interval_seconds": self.restore_drill_task_interval_seconds,
+            "update_check_interval_seconds": self.update_check_interval_seconds,
             "file_stability_seconds": self.file_stability_seconds,
             "nntp_threads": self.nntp_threads,
             "hourly_post_limit_bytes": self.hourly_post_limit_bytes,
@@ -185,11 +196,16 @@ class Config:
             "compact_chunk_metadata": self.compact_chunk_metadata,
             "transfer_sample_bucket_seconds": self.transfer_sample_bucket_seconds,
             "auto_queue_exclude_patterns": self.auto_queue_exclude_patterns,
+            "external_api_keys": self.external_api_keys,
             "ui_theme": self.ui_theme,
+            "update_check_enabled": self.update_check_enabled,
+            "update_github_repo": self.update_github_repo,
+            "update_check_timeout_seconds": self.update_check_timeout_seconds,
             "usenet_hosts": [host.__dict__ for host in self.usenet_hosts],
             "cloud_backups": [target.__dict__ for target in self.cloud_backups],
             "log_destinations": [destination.__dict__ for destination in self.log_destinations],
             "endpoints": self.endpoints,
+            "compress_files": self.compress_files,
             "zip_subfolders": self.zip_subfolders,
             "encrypt_bodies": self.encrypt_bodies,
             "encryption_passphrase_env": self.encryption_passphrase_env,
@@ -200,6 +216,8 @@ class Config:
         data = self.to_dict()
         data["usenet_hosts"] = [host.public_dict() for host in self.usenet_hosts]
         data["log_destinations"] = [destination.public_dict() for destination in self.log_destinations]
+        data["external_api_key_count"] = len(self.external_api_keys)
+        data["external_api_keys"] = []
         return data
 
 
@@ -254,6 +272,11 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if interval <= 0:
             raise ValueError("restore_drill_task_interval_seconds must be greater than zero")
         config.restore_drill_task_interval_seconds = interval
+    if "update_check_interval_seconds" in data:
+        interval = int(data["update_check_interval_seconds"])
+        if interval < 3600 or interval > 30 * 86400:
+            raise ValueError("update_check_interval_seconds must be between 1 hour and 30 days")
+        config.update_check_interval_seconds = interval
     if "file_stability_seconds" in data:
         seconds = int(data["file_stability_seconds"])
         if seconds < 0 or seconds > 86400:
@@ -312,13 +335,36 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         config.transfer_sample_bucket_seconds = seconds
     if "auto_queue_exclude_patterns" in data:
         config.auto_queue_exclude_patterns = [str(item).strip() for item in data["auto_queue_exclude_patterns"] if str(item).strip()]
+    if "external_api_keys" in data:
+        keys = [str(item).strip() for item in data["external_api_keys"] if str(item).strip()]
+        if keys:
+            config.external_api_keys = keys
+        elif data.get("clear_external_api_keys"):
+            config.external_api_keys = []
     if "ui_theme" in data:
         theme = str(data["ui_theme"]).strip()
         if theme not in {"harbor_light", "emerald_console", "slate_cinema", "graphite", "nordic_mint"}:
             raise ValueError("ui_theme is not a supported template")
         config.ui_theme = theme
+    if "update_check_enabled" in data:
+        config.update_check_enabled = bool(data["update_check_enabled"])
+    if "update_github_repo" in data:
+        repo = str(data["update_github_repo"]).strip().strip("/")
+        if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo):
+            raise ValueError("update_github_repo must be in owner/repo format")
+        config.update_github_repo = repo
+    if "update_check_timeout_seconds" in data:
+        timeout = int(data["update_check_timeout_seconds"])
+        if timeout < 1 or timeout > 60:
+            raise ValueError("update_check_timeout_seconds must be between 1 and 60")
+        config.update_check_timeout_seconds = timeout
     if "zip_subfolders" in data:
         config.zip_subfolders = bool(data["zip_subfolders"])
+        if "compress_files" not in data:
+            config.compress_files = bool(data["zip_subfolders"])
+    if "compress_files" in data:
+        config.compress_files = bool(data["compress_files"])
+        config.zip_subfolders = False
     if "encrypt_bodies" in data:
         config.encrypt_bodies = bool(data["encrypt_bodies"])
     if "encryption_passphrase_env" in data:

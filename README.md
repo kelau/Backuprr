@@ -19,7 +19,7 @@ a CLI and an AJAX-enabled Web UI.
 - Multiple Usenet hosts for read and post modes.
 - Plain NNTP, STARTTLS, and implicit TLS.
 - Obfuscated post subjects.
-- Optional body encryption, zip grouping for subfolders, and PAR2 generation
+- Optional body encryption, compression before posting, and PAR2 generation
   hooks.
 - Periodic chunk existence checks, defaulting to 90 days per file and spread
   across worker runs by each file's last verification or backup time.
@@ -35,12 +35,38 @@ a CLI and an AJAX-enabled Web UI.
   provider accepts before tuning large-scale backup chunking.
 - Backup run history, host health history, maintenance history, and restore
   drill history for production troubleshooting.
+- Daily GitHub release checks with Status/Tasks visibility and manual run
+  controls.
 - Chunk-level hourly throttling, resumable posts, and retry/failover across
   configured post hosts.
 - Volume controls for large catalogs: web access logs and successful per-chunk
   logs are disabled by default, transfer samples are bucketed, and new chunk
   rows omit debug-only subject/body-hash metadata unless explicitly enabled.
 - CLI commands matching the Web UI operations.
+
+## Application flow
+
+```mermaid
+flowchart LR
+    A[Watch endpoints] --> B[Catalog files]
+    B --> C[Queue unprotected files]
+    C --> D[Prepare payload]
+    D --> E{Compression enabled?}
+    E -->|Yes, file is suitable| F[Stream gzip payload or create temp payload for PAR2]
+    E -->|No or already compressed| G[Use original payload]
+    F --> H{PAR2 enabled?}
+    G --> H
+    H -->|Yes| I[Generate recovery data for payload]
+    H -->|No| J[Split into articles]
+    I --> J
+    J --> K[Encrypt body if enabled]
+    K --> L[Post obfuscated subjects to Usenet hosts]
+    L --> M[Record chunks, sizes, manifests, and progress]
+    M --> N[Scheduled per-file verification]
+    N -->|Chunks missing| C
+    N -->|Chunks present| O[Ready for restore]
+    O --> P[Restore to origin, alternate path, or browser download]
+```
 
 ## Quick start
 
@@ -126,6 +152,11 @@ direct provider username/password used for NNTP authentication:
   "verification_files_per_run": 1,
   "scan_interval_seconds": 300,
   "backup_interval_seconds": 300,
+  "update_check_interval_seconds": 86400,
+  "update_check_enabled": true,
+  "update_github_repo": "kelau/Backuprr",
+  "update_check_timeout_seconds": 10,
+  "external_api_keys": ["change-this-long-random-token"],
   "usenet_hosts": [
     {
       "name": "eweka-read",
@@ -166,6 +197,7 @@ backuprr --config config.json health-check
 backuprr --config config.json article-size-test
 backuprr --config config.json maintenance --vacuum
 backuprr --config config.json restore-drill
+backuprr --config config.json update-check
 backuprr --config config.json pause backup
 backuprr --config config.json resume backup
 backuprr --config config.json restore --path /srv/media/movie/file.mkv --dest /restore-test
@@ -192,8 +224,33 @@ Body encryption uses a passphrase-derived HMAC-SHA256 keystream implemented with
 the Python standard library. For high-assurance environments, integrate a
 dedicated audited encryption package before storing sensitive data offsite.
 
-PAR2 support is implemented as an external command hook. Configure `par2` in
-`config.json` if installed on the CentOS host.
+PAR2 support is implemented as a command hook. Backuprr resolves the configured
+command from `PATH` and also checks for bundled executables in `backuprr/bin`
+or `./bin`, so distribution packages can include platform-specific PAR2
+binaries. If compression is enabled, Backuprr creates a temporary compressed
+payload before invoking PAR2 because PAR2 tools need a complete file path and
+write sidecar recovery files. If compression is disabled, Backuprr still works
+in a temporary directory to avoid leaving `.par2` files beside your media.
+
+## APIs
+
+The Web UI uses `/api/*` as an internal API and sends a per-process token that
+is embedded into the served app page. Direct calls to `/api/*` without that
+token are rejected.
+
+Integrations such as Home Assistant should use `/external-api/*` with either
+`X-API-Key: <key>` or `Authorization: Bearer <key>`. Configure keys in Settings
+or in `config.json` under `external_api_keys`.
+
+Available integration endpoints:
+
+- `GET /external-api/status`
+- `GET /external-api/files?page=1&page_size=100&q=&unbacked=0`
+- `GET /external-api/queue`
+- `GET /external-api/tasks`
+- `POST /external-api/backup/run`
+- `POST /external-api/scan`
+- `POST /external-api/verify/start`
 
 ## Development
 

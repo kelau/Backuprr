@@ -10,6 +10,7 @@ from .db import Database
 from .operations import restore_drill_due, run_maintenance, run_restore_drill
 from .queueing import enqueue_unbacked
 from .scanner import scan_all
+from .update_checker import check_for_updates
 
 
 def utcnow_dt() -> datetime:
@@ -18,6 +19,18 @@ def utcnow_dt() -> datetime:
 
 def iso_or_empty(value: Optional[datetime]) -> str:
     return value.isoformat() if value else ""
+
+
+def parse_iso(value: str) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
 
 
 def format_duration(seconds: Optional[float]) -> str:
@@ -66,6 +79,7 @@ class ScheduledTask:
         self._runs = 0
         self._running = False
         self._revision = 0
+        self._load_state()
 
     @property
     def interval_seconds(self) -> int:
@@ -79,8 +93,11 @@ class ScheduledTask:
             return
         self._thread = threading.Thread(target=self._run, name=f"backuprr-{self.kind}", daemon=True)
         self._thread.start()
-        self._schedule_next(0)
-        self.trigger()
+        with self._state_lock:
+            has_next_run = self._next_run_at is not None
+        if not has_next_run:
+            self._schedule_next(0)
+            self.trigger()
 
     def trigger(self) -> None:
         self._wake.set()
@@ -138,12 +155,47 @@ class ScheduledTask:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            self._wake.wait(timeout=self.interval_seconds)
+            with self._state_lock:
+                next_run_at = self._next_run_at
+            timeout = self.interval_seconds
+            if next_run_at:
+                timeout = max(0.0, (next_run_at - utcnow_dt()).total_seconds())
+            self._wake.wait(timeout=timeout)
+            manual = self._wake.is_set()
             self._wake.clear()
             if self._stop.is_set():
                 break
-            self.run_once()
-            self._schedule_next(self.interval_seconds)
+            if manual or not next_run_at or utcnow_dt() >= next_run_at:
+                self.run_once()
+                self._schedule_next(self.interval_seconds)
+
+    def _load_state(self) -> None:
+        state = self.db.worker_state(self.kind)
+        if not state:
+            return
+        with self._state_lock:
+            self._last_started_at = parse_iso(str(state["last_started_at"] or ""))
+            self._last_finished_at = parse_iso(str(state["last_finished_at"] or ""))
+            self._next_run_at = parse_iso(str(state["next_run_at"] or ""))
+            self._last_duration_seconds = state["last_duration_seconds"]
+            self._last_result = str(state["last_result"] or "")
+            self._last_error = str(state["last_error"] or "")
+            self._runs = int(state["runs"] or 0)
+            self._revision = int(state["revision"] or 0)
+
+    def _persist_state_locked(self) -> None:
+        self.db.save_worker_state(
+            self.kind,
+            self.name,
+            iso_or_empty(self._next_run_at),
+            iso_or_empty(self._last_started_at),
+            iso_or_empty(self._last_finished_at),
+            self._last_duration_seconds,
+            self._last_result,
+            self._last_error,
+            self._runs,
+            self._revision,
+        )
 
     def _mark_started(self) -> None:
         with self._state_lock:
@@ -152,6 +204,7 @@ class ScheduledTask:
             self._last_started_monotonic = time.perf_counter()
             self._last_error = ""
             self._revision += 1
+            self._persist_state_locked()
 
     def _mark_finished(self, result: str, error: str) -> None:
         finished = utcnow_dt()
@@ -165,11 +218,13 @@ class ScheduledTask:
             self._last_error = error
             self._next_run_at = utcnow_dt() + timedelta(seconds=self.interval_seconds)
             self._revision += 1
+            self._persist_state_locked()
 
     def _schedule_next(self, seconds: int) -> None:
         with self._state_lock:
             self._next_run_at = utcnow_dt() + timedelta(seconds=seconds)
             self._revision += 1
+            self._persist_state_locked()
 
 
 class CatalogMonitor(ScheduledTask):
@@ -215,15 +270,16 @@ class BackupMonitor(ScheduledTask):
     def execute(self) -> str:
         recovered = self.db.recover_stale_posting()
         recovered_mismatches = self.db.recover_queued_failed_mismatches()
+        recovered_failed = self.db.recover_retryable_failed()
         newly_queued = enqueue_unbacked(self.db, self.config)
         file_id = post_next(self.db, self.config)
         stats = self.db.stats()
         queued = int(stats.get("queue_queued", 0))
         posting = int(stats.get("queue_posting", 0))
         if file_id is None:
-            result = f"{recovered} stale recovered, {recovered_mismatches} queue mismatches recovered, {newly_queued} newly queued, {queued} queued, {posting} posting, no file posted"
+            result = f"{recovered} stale recovered, {recovered_mismatches} queue mismatches recovered, {recovered_failed} failed recovered, {newly_queued} newly queued, {queued} queued, {posting} posting, no file posted"
         else:
-            result = f"posted file id {file_id}, {recovered} stale recovered, {recovered_mismatches} queue mismatches recovered, {queued} queued, {posting} posting"
+            result = f"posted file id {file_id}, {recovered} stale recovered, {recovered_mismatches} queue mismatches recovered, {recovered_failed} failed recovered, {queued} queued, {posting} posting"
         self.db.log("debug", "monitor.backup", f"Automatic backup task completed: {result}")
         return result
 
@@ -244,7 +300,10 @@ class VerificationMonitor(ScheduledTask):
             return
         self._thread = threading.Thread(target=self._run, name=f"backuprr-{self.kind}", daemon=True)
         self._thread.start()
-        self._schedule_next(self.interval_seconds)
+        with self._state_lock:
+            has_next_run = self._next_run_at is not None
+        if not has_next_run:
+            self._schedule_next(self.interval_seconds)
 
     def verify_once(self, force: bool = False, file_ids: Optional[list[int]] = None) -> int:
         if force:
@@ -330,6 +389,28 @@ class RestoreDrillMonitor(ScheduledTask):
             return "restore drill not due"
         result = run_restore_drill(self.db, self.config)
         return f"{result.get('status')}: {result.get('message') or result.get('path') or ''}".strip()
+
+    def tasks(self):
+        return [self.task_info()]
+
+
+class UpdateCheckMonitor(ScheduledTask):
+    def __init__(self, db: Database, config: Config):
+        super().__init__(db, config, "GitHub update checker", "update_check")
+
+    @property
+    def interval_seconds(self) -> int:
+        return self.config.update_check_interval_seconds
+
+    def execute(self) -> str:
+        result = check_for_updates(self.db, self.config)
+        if result.get("status") == "disabled":
+            return "update checks disabled"
+        if result.get("status") == "error":
+            return f"update check failed: {result.get('error', '')}"
+        if result.get("update_available"):
+            return f"update available: {result.get('latest_version')}"
+        return f"up to date: {result.get('current_version')}"
 
     def tasks(self):
         return [self.task_info()]

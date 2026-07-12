@@ -5,8 +5,13 @@
   "verification_interval_days": 90,
   "scan_interval_seconds": 300,
   "backup_interval_seconds": 300,
+  "update_check_interval_seconds": 86400,
+  "update_check_enabled": true,
+  "update_github_repo": "kelau/Backuprr",
+  "update_check_timeout_seconds": 10,
   "file_stability_seconds": 300,
   "ui_theme": "harbor_light",
+  "external_api_keys": [],
   "log_destinations": [
     {
       "name": "home-loki",

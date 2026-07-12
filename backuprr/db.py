@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 9
 STALE_POSTING_SECONDS = 15 * 60
 
 
@@ -52,6 +52,15 @@ class Database:
         host_stats_columns = {row["name"] for row in conn.execute("PRAGMA table_info(host_stats)").fetchall()}
         if host_stats_columns and "article_size_bytes" not in host_stats_columns:
             conn.execute("ALTER TABLE host_stats ADD COLUMN article_size_bytes INTEGER")
+        file_columns = {row["name"] for row in conn.execute("PRAGMA table_info(files)").fetchall()}
+        if "backup_uncompressed_size" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN backup_uncompressed_size INTEGER NOT NULL DEFAULT 0")
+        if "backup_compressed_size" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN backup_compressed_size INTEGER NOT NULL DEFAULT 0")
+        if "backup_compressed" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN backup_compressed INTEGER NOT NULL DEFAULT 0")
+        if "backup_par2" not in file_columns:
+            conn.execute("ALTER TABLE files ADD COLUMN backup_par2 INTEGER NOT NULL DEFAULT 0")
         self._create_operational_tables(conn)
 
     def _create_operational_tables(self, conn: sqlite3.Connection) -> None:
@@ -141,6 +150,23 @@ class Database:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS worker_state (
+              kind TEXT PRIMARY KEY,
+              name TEXT NOT NULL DEFAULT '',
+              next_run_at TEXT NOT NULL DEFAULT '',
+              last_started_at TEXT NOT NULL DEFAULT '',
+              last_finished_at TEXT NOT NULL DEFAULT '',
+              last_duration_seconds REAL,
+              last_result TEXT NOT NULL DEFAULT '',
+              last_error TEXT NOT NULL DEFAULT '',
+              runs INTEGER NOT NULL DEFAULT 0,
+              revision INTEGER NOT NULL DEFAULT 0,
+              updated_at TEXT NOT NULL
+            )
+            """
+        )
 
     def get_meta(self, key: str) -> Optional[str]:
         with self.connect() as conn:
@@ -162,6 +188,58 @@ class Database:
 
     def is_paused(self, kind: str) -> bool:
         return self.get_meta(f"pause.{kind}") == "1"
+
+    def worker_state(self, kind: str) -> Optional[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM worker_state WHERE kind=?", (kind,)).fetchone()
+
+    def save_worker_state(
+        self,
+        kind: str,
+        name: str,
+        next_run_at: str,
+        last_started_at: str,
+        last_finished_at: str,
+        last_duration_seconds: Optional[float],
+        last_result: str,
+        last_error: str,
+        runs: int,
+        revision: int,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO worker_state(
+                  kind, name, next_run_at, last_started_at, last_finished_at,
+                  last_duration_seconds, last_result, last_error, runs, revision, updated_at
+                )
+                VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(kind) DO UPDATE SET
+                  name=excluded.name,
+                  next_run_at=excluded.next_run_at,
+                  last_started_at=excluded.last_started_at,
+                  last_finished_at=excluded.last_finished_at,
+                  last_duration_seconds=excluded.last_duration_seconds,
+                  last_result=excluded.last_result,
+                  last_error=excluded.last_error,
+                  runs=excluded.runs,
+                  revision=excluded.revision,
+                  updated_at=excluded.updated_at
+                """,
+                (
+                    kind,
+                    name,
+                    next_run_at,
+                    last_started_at,
+                    last_finished_at,
+                    last_duration_seconds,
+                    last_result,
+                    last_error,
+                    int(runs),
+                    int(revision),
+                    utcnow(),
+                ),
+            )
 
     def log(self, level: str, event_type: str, message: str, file_id: Optional[int] = None, data: str = "") -> None:
         event = {"ts": utcnow(), "level": level, "event_type": event_type, "message": message, "file_id": file_id, "data": data}
@@ -402,19 +480,57 @@ class Database:
             ).fetchone()
 
     def list_queue(self, include_done: bool = False, status: Optional[str] = None, limit: int = 200, offset: int = 0) -> List[sqlite3.Row]:
+        return self.list_queue_sorted(include_done, status, limit, offset)
+
+    def list_queue_sorted(
+        self,
+        include_done: bool = False,
+        status: Optional[str] = None,
+        limit: int = 200,
+        offset: int = 0,
+        sort_by: str = "",
+        sort_dir: str = "asc",
+    ) -> List[sqlite3.Row]:
         where_parts = []
         params: List[Any] = []
-        if status:
+        if status == "attention":
+            where_parts.append(
+                """
+                (q.status='failed'
+                 OR (q.status!='done' AND q.reason IN ('network-blocked', 'missing-chunks', 'file-changing')))
+                """
+            )
+        elif status:
             where_parts.append("q.status = ?")
             params.append(status)
         elif not include_done:
             where_parts.append("q.status NOT IN ('done', 'failed')")
             where_parts.append("f.state NOT IN ('backed_up', 'failed', 'unreadable')")
         where = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+        sort_columns = {
+            "file_id": "q.file_id",
+            "position": "q.position",
+            "priority": "q.priority",
+            "status": "q.status",
+            "reason": "q.reason",
+            "path": "f.path",
+            "relative_path": "f.relative_path",
+            "size": "f.size",
+            "progress": "posted_chunks",
+            "chunk_count": "posted_chunks",
+            "state": "f.state",
+            "updated_at": "q.updated_at",
+            "created_at": "q.created_at",
+        }
+        direction = "DESC" if str(sort_dir).lower() == "desc" else "ASC"
+        if sort_by in sort_columns:
+            order_by = f"{sort_columns[sort_by]} {direction}, q.id ASC"
+        else:
+            order_by = "q.updated_at ASC, q.id ASC" if status == "done" else "q.priority ASC, q.position ASC"
         with self.connect() as conn:
             return conn.execute(
                 f"""
-                SELECT q.*, f.path, f.size, f.state,
+                SELECT q.*, f.path, f.relative_path, f.size, f.state,
                        CASE WHEN q.status='posting' THEN q.progress_chunks ELSE COUNT(c.id) END AS posted_chunks,
                        CASE WHEN q.status='posting' THEN q.progress_bytes ELSE COALESCE(SUM(c.size), 0) END AS posted_bytes
                 FROM queue q
@@ -422,7 +538,7 @@ class Database:
                 LEFT JOIN chunks c ON c.file_id = f.id
                 {where}
                 GROUP BY q.id
-                ORDER BY q.priority ASC, q.position ASC
+                ORDER BY {order_by}
                 LIMIT ? OFFSET ?
                 """
                 ,
@@ -432,7 +548,14 @@ class Database:
     def queue_count(self, include_done: bool = False, status: Optional[str] = None) -> int:
         where_parts = []
         params: List[Any] = []
-        if status:
+        if status == "attention":
+            where_parts.append(
+                """
+                (q.status='failed'
+                 OR (q.status!='done' AND q.reason IN ('network-blocked', 'missing-chunks', 'file-changing')))
+                """
+            )
+        elif status:
             where_parts.append("q.status = ?")
             params.append(status)
         elif not include_done:
@@ -534,6 +657,35 @@ class Database:
                 )
             return len(rows)
 
+    def recover_retryable_failed(self) -> int:
+        now = utcnow()
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT q.file_id, f.path FROM queue q
+                JOIN files f ON f.id = q.file_id
+                WHERE q.status='failed'
+                  AND f.state='failed'
+                  AND f.id NOT IN (SELECT DISTINCT file_id FROM chunks)
+                """
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    """
+                    UPDATE queue
+                    SET status='queued', reason='failed-retry',
+                        progress_chunks=0, progress_bytes=0, updated_at=?
+                    WHERE file_id=?
+                    """,
+                    (now, row["file_id"]),
+                )
+                conn.execute("UPDATE files SET state='queued', updated_at=? WHERE id=?", (now, row["file_id"]))
+                conn.execute(
+                    "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
+                    (now, "warning", "queue.recover", f"Recovered failed queue item for retry: {row['path']}", row["file_id"], ""),
+                )
+            return len(rows)
+
     def set_queue_status(self, file_id: int, status: str) -> None:
         with self.connect() as conn:
             conn.execute("UPDATE queue SET status=?, updated_at=? WHERE file_id=?", (status, utcnow(), file_id))
@@ -589,6 +741,13 @@ class Database:
                 (chunks_done, bytes_done, host, run_id),
             )
 
+    def update_backup_run_totals(self, run_id: int, chunks_total: int, bytes_total: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE backup_runs SET chunks_total=?, bytes_total=? WHERE id=?",
+                (chunks_total, bytes_total, run_id),
+            )
+
     def finish_backup_run(self, run_id: int, status: str, error: str = "") -> None:
         with self.connect() as conn:
             conn.execute(
@@ -599,6 +758,24 @@ class Database:
     def backup_run_rows(self, limit: int = 50) -> List[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM backup_runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def set_file_backup_features(
+        self,
+        file_id: int,
+        uncompressed_size: int,
+        compressed_size: int,
+        compressed: bool,
+        par2: bool,
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE files
+                SET backup_uncompressed_size=?, backup_compressed_size=?, backup_compressed=?, backup_par2=?, updated_at=?
+                WHERE id=?
+                """,
+                (int(uncompressed_size), int(compressed_size), int(bool(compressed)), int(bool(par2)), utcnow(), file_id),
+            )
 
     def record_backup_manifest(self, file_id: int, backup_run_id: Optional[int], manifest: Dict[str, Any]) -> None:
         flags = ",".join(str(item) for item in manifest.get("flags", []))
@@ -1051,6 +1228,8 @@ class Database:
         search: str = "",
         include_deleted: bool = False,
         unbacked_only: bool = False,
+        sort_by: str = "relative_path",
+        sort_dir: str = "asc",
     ) -> List[sqlite3.Row]:
         clauses = []
         params: List[Any] = []
@@ -1062,6 +1241,22 @@ class Database:
             clauses.append("(f.path LIKE ? OR f.relative_path LIKE ?)")
             params.extend([f"%{search}%", f"%{search}%"])
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        sort_columns = {
+            "id": "f.id",
+            "path": "f.path",
+            "relative_path": "f.relative_path",
+            "name": "f.relative_path",
+            "size": "f.size",
+            "state": "f.state",
+            "verification": "f.last_verify_at",
+            "last_verify_at": "f.last_verify_at",
+            "last_backup_at": "f.last_backup_at",
+            "updated_at": "f.updated_at",
+            "chunk_count": "chunk_count",
+            "progress": "q.progress_chunks",
+        }
+        direction = "DESC" if str(sort_dir).lower() == "desc" else "ASC"
+        order_expr = sort_columns.get(sort_by, "f.relative_path")
         with self.connect() as conn:
             return conn.execute(
                 f"""
@@ -1078,7 +1273,7 @@ class Database:
                 LEFT JOIN queue q ON q.file_id = f.id
                 {where}
                 GROUP BY f.id
-                ORDER BY f.relative_path
+                ORDER BY {order_expr} {direction}, f.relative_path ASC
                 LIMIT ? OFFSET ?
                 """,
                 (*params, limit, offset),
@@ -1105,8 +1300,32 @@ class Database:
         with self.connect() as conn:
             return int(conn.execute(f"SELECT COUNT(*) FROM files {where}", params).fetchone()[0])
 
-    def verification_rows(self, limit: int = 200, offset: int = 0, verification_state: str = "", search: str = "") -> List[sqlite3.Row]:
+    def verification_rows(
+        self,
+        limit: int = 200,
+        offset: int = 0,
+        verification_state: str = "",
+        search: str = "",
+        sort_by: str = "",
+        sort_dir: str = "asc",
+    ) -> List[sqlite3.Row]:
         where, params = self._verification_state_clause(verification_state, search)
+        sort_columns = {
+            "relative_path": "relative_path",
+            "path": "path",
+            "progress": "last_chunk_verify_at",
+            "state": "state",
+            "chunk_count": "chunk_count",
+            "missing_chunks": "missing_chunks",
+            "last_verify_at": "last_verify_at",
+            "last_chunk_verify_at": "last_chunk_verify_at",
+            "verification_state": "verification_state",
+        }
+        direction = "DESC" if str(sort_dir).lower() == "desc" else "ASC"
+        if sort_by in sort_columns:
+            order_by = f"{sort_columns[sort_by]} {direction}, relative_path ASC"
+        else:
+            order_by = "last_verify_at IS NULL DESC, last_verify_at ASC, relative_path"
         with self.connect() as conn:
             return conn.execute(
                 f"""
@@ -1129,7 +1348,7 @@ class Database:
                 )
                 SELECT * FROM verification
                 {where}
-                ORDER BY last_verify_at IS NULL DESC, last_verify_at ASC, relative_path
+                ORDER BY {order_by}
                 LIMIT ? OFFSET ?
                 """,
                 (*params, limit, offset),
@@ -1179,11 +1398,23 @@ class Database:
         exclude_event_types: Optional[List[str]] = None,
         offset: int = 0,
         search: str = "",
+        sort_by: str = "id",
+        sort_dir: str = "desc",
     ) -> List[sqlite3.Row]:
         where, params = self._event_filters(levels, event_types, exclude_event_types, search)
+        sort_columns = {
+            "id": "id",
+            "ts": "ts",
+            "level": "level",
+            "event_type": "event_type",
+            "message": "message",
+            "file_id": "file_id",
+        }
+        direction = "DESC" if str(sort_dir).lower() == "desc" else "ASC"
+        order_expr = sort_columns.get(sort_by, "id")
         with self.connect() as conn:
             return conn.execute(
-                f"SELECT * FROM events {where} ORDER BY id DESC LIMIT ? OFFSET ?",
+                f"SELECT * FROM events {where} ORDER BY {order_expr} {direction}, id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
             ).fetchall()
 
@@ -1304,6 +1535,29 @@ class Database:
                 "files_bytes_backed_up": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state='backed_up'").fetchone()[0],
                 "files_bytes_queued": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state='queued'").fetchone()[0],
                 "files_bytes_posting": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state='posting'").fetchone()[0],
+                "files_compressed": conn.execute("SELECT COUNT(*) FROM files WHERE state != 'deleted' AND backup_compressed=1").fetchone()[0],
+                "files_par2": conn.execute("SELECT COUNT(*) FROM files WHERE state != 'deleted' AND backup_par2=1").fetchone()[0],
+                "files_compressible_backed_up": conn.execute(
+                    "SELECT COUNT(*) FROM files WHERE state='backed_up' AND backup_uncompressed_size > 0"
+                ).fetchone()[0],
+                "backup_uncompressed_bytes_total": conn.execute(
+                    "SELECT COALESCE(SUM(backup_uncompressed_size), 0) FROM files WHERE state != 'deleted' AND backup_uncompressed_size > 0"
+                ).fetchone()[0],
+                "backup_compressed_bytes_total": conn.execute(
+                    "SELECT COALESCE(SUM(backup_compressed_size), 0) FROM files WHERE state != 'deleted' AND backup_compressed_size > 0"
+                ).fetchone()[0],
+                "backup_par2_bytes_total": conn.execute(
+                    "SELECT COALESCE(SUM(backup_compressed_size), 0) FROM files WHERE state != 'deleted' AND backup_par2=1"
+                ).fetchone()[0],
+                "queue_attention_count": conn.execute(
+                    """
+                    SELECT COUNT(*) FROM queue
+                    WHERE status='failed'
+                       OR (status!='done' AND reason IN ('network-blocked', 'missing-chunks', 'file-changing'))
+                    """
+                ).fetchone()[0],
+                "queue_attention_failed": conn.execute("SELECT COUNT(*) FROM queue WHERE status='failed'").fetchone()[0],
+                "queue_attention_network_blocked": conn.execute("SELECT COUNT(*) FROM queue WHERE status!='done' AND reason='network-blocked'").fetchone()[0],
                 "chunks_total": conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
                 "chunks_verified": conn.execute("SELECT COUNT(*) FROM chunks WHERE status='verified'").fetchone()[0],
                 "chunks_missing": conn.execute("SELECT COUNT(*) FROM chunks WHERE status='missing'").fetchone()[0],
@@ -1339,7 +1593,11 @@ CREATE TABLE IF NOT EXISTS files (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   last_backup_at TEXT,
-  last_verify_at TEXT
+  last_verify_at TEXT,
+  backup_uncompressed_size INTEGER NOT NULL DEFAULT 0,
+  backup_compressed_size INTEGER NOT NULL DEFAULT 0,
+  backup_compressed INTEGER NOT NULL DEFAULT 0,
+  backup_par2 INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS queue (

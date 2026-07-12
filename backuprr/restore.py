@@ -1,6 +1,7 @@
 import email
 import hashlib
 import os
+import zlib
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
 
@@ -44,6 +45,7 @@ def restore_file(
     passphrase = config.encryption_passphrase()
     restored_bytes = 0
     total_chunks = len(chunks)
+    decompressor = zlib.decompressobj(wbits=31) if int(file_row["backup_compressed"] or 0) else None
     with UsenetClient(host) as client, target.open("wb") as output:
         if not client.conn:
             raise RuntimeError("NNTP connection not open")
@@ -53,10 +55,17 @@ def restore_file(
             payload = msg.get_payload(decode=True) or b""
             db.record_transfer_sample("download", len(payload))
             decoded = decode_chunk(payload, passphrase)
+            if decompressor:
+                decoded = decompressor.decompress(decoded)
             output.write(decoded)
             restored_bytes += len(decoded)
             if progress:
                 progress(index, total_chunks, restored_bytes)
+        if decompressor:
+            tail = decompressor.flush()
+            if tail:
+                output.write(tail)
+                restored_bytes += len(tail)
     if target.resolve() == Path(file_row["path"]).resolve():
         original_mtime_ns = int(file_row["mtime_ns"] or target.stat().st_mtime_ns)
         os.utime(target, ns=(original_mtime_ns, original_mtime_ns))
@@ -90,6 +99,7 @@ def restored_payloads(
         passphrase = config.encryption_passphrase()
         restored_bytes = 0
         total_chunks = len(chunks)
+        decompressor = zlib.decompressobj(wbits=31) if int(file_row["backup_compressed"] or 0) else None
         with UsenetClient(host) as client:
             if not client.conn:
                 raise RuntimeError("NNTP connection not open")
@@ -99,10 +109,17 @@ def restored_payloads(
                 payload = msg.get_payload(decode=True) or b""
                 db.record_transfer_sample("download", len(payload))
                 decoded = decode_chunk(payload, passphrase)
+                if decompressor:
+                    decoded = decompressor.decompress(decoded)
                 restored_bytes += len(decoded)
                 if progress:
                     progress(index, total_chunks, restored_bytes)
-                yield decoded
+                if decoded:
+                    yield decoded
+            if decompressor:
+                tail = decompressor.flush()
+                if tail:
+                    yield tail
 
     return file_row, iterator()
 
@@ -118,6 +135,7 @@ def restore_sample(db: Database, config: Config, source_path: str, max_bytes: in
     host = select_host(config, "read")
     passphrase = config.encryption_passphrase()
     restored = bytearray()
+    decompressor = zlib.decompressobj(wbits=31) if int(file_row["backup_compressed"] or 0) else None
     with UsenetClient(host) as client:
         if not client.conn:
             raise RuntimeError("NNTP connection not open")
@@ -126,9 +144,12 @@ def restore_sample(db: Database, config: Config, source_path: str, max_bytes: in
             msg = email.message_from_bytes(raw)
             payload = msg.get_payload(decode=True) or b""
             db.record_transfer_sample("download", len(payload))
-            restored.extend(decode_chunk(payload, passphrase))
+            decoded = decode_chunk(payload, passphrase)
+            restored.extend(decompressor.decompress(decoded) if decompressor else decoded)
             if len(restored) >= max_bytes:
                 break
+        if decompressor and len(restored) < max_bytes:
+            restored.extend(decompressor.flush())
     sample = bytes(restored[:max_bytes])
     db.log("info", "restore.sample", f"Restored {len(sample)} sample bytes for {source_path}", int(file_row["id"]))
     return sample

@@ -1,11 +1,12 @@
 import hashlib
 import math
 import os
+import platform
 import shutil
 import subprocess
 import tempfile
 import time
-import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -19,6 +20,29 @@ from .usenet import UsenetClient, obfuscated_subject, select_host
 
 
 NETWORK_BLOCKED_RETRY_SECONDS = 300
+COMPRESSED_EXTENSIONS = {
+    ".7z",
+    ".avi",
+    ".br",
+    ".bz2",
+    ".flac",
+    ".gz",
+    ".iso",
+    ".jpeg",
+    ".jpg",
+    ".m4v",
+    ".mkv",
+    ".mov",
+    ".mp3",
+    ".mp4",
+    ".ogg",
+    ".png",
+    ".rar",
+    ".webm",
+    ".xz",
+    ".zip",
+    ".zst",
+}
 
 
 class PostNetworkBlockedError(RuntimeError):
@@ -41,20 +65,96 @@ def iter_chunks(path: Path, size: int) -> Iterator[bytes]:
             yield block
 
 
-def prepare_payload(path: Path, config: Config) -> Path:
-    if not config.zip_subfolders and not config.par2.get("enabled"):
-        return path
+def file_is_already_compressed(path: Path) -> bool:
+    suffixes = [suffix.lower() for suffix in path.suffixes]
+    return any(suffix in COMPRESSED_EXTENSIONS for suffix in suffixes)
+
+
+def compression_enabled_for(path: Path, config: Config) -> bool:
+    return bool(getattr(config, "compress_files", False)) and not file_is_already_compressed(path)
+
+
+def chunk_buffered(parts: Iterable[bytes], size: int) -> Iterator[bytes]:
+    buffer = bytearray()
+    for part in parts:
+        if not part:
+            continue
+        buffer.extend(part)
+        while len(buffer) >= size:
+            yield bytes(buffer[:size])
+            del buffer[:size]
+    if buffer:
+        yield bytes(buffer)
+
+
+def iter_compressed_chunks(path: Path, size: int) -> Iterator[bytes]:
+    compressor = zlib.compressobj(level=6, wbits=31)
+
+    def parts() -> Iterator[bytes]:
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                yield compressor.compress(block)
+        yield compressor.flush()
+
+    yield from chunk_buffered(parts(), size)
+
+
+def create_compressed_payload(path: Path) -> Path:
     tempdir = Path(tempfile.mkdtemp(prefix="backuprr-"))
-    zip_path = tempdir / f"{path.name}.zip"
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.write(path, arcname=path.name)
+    gzip_path = tempdir / f"{path.name}.gz"
+    compressor = zlib.compressobj(level=6, wbits=31)
+    with path.open("rb") as source, gzip_path.open("wb") as target:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            target.write(compressor.compress(block))
+        target.write(compressor.flush())
+    return gzip_path
+
+
+def bundled_par2_candidates(config: Config) -> list[Path]:
+    names = ["par2.exe", "par2"] if platform.system().lower() == "windows" else ["par2", "par2cmdline"]
+    roots = [
+        Path(__file__).resolve().parent / "bin",
+        Path(__file__).resolve().parent.parent / "bin",
+        Path(getattr(config, "base_dir", Path.cwd())) / "bin",
+    ]
+    return [root / name for root in roots for name in names]
+
+
+def resolve_par2_command(command: str, config: Config) -> str | None:
+    raw = str(command or "par2").strip() or "par2"
+    candidate = Path(raw)
+    if candidate.is_absolute() or any(sep in raw for sep in ("/", "\\")):
+        return str(candidate) if candidate.exists() else None
+    found = shutil.which(raw)
+    if found:
+        return found
+    if raw == "par2":
+        for bundled in bundled_par2_candidates(config):
+            if bundled.exists():
+                return str(bundled)
+    return None
+
+
+def prepare_payload(path: Path, config: Config) -> Path:
+    if not config.par2.get("enabled"):
+        return path
+    payload = create_compressed_payload(path) if compression_enabled_for(path, config) else path
+    if payload == path:
+        tempdir = Path(tempfile.mkdtemp(prefix="backuprr-"))
+        copied_path = tempdir / path.name
+        shutil.copy2(path, copied_path)
+        payload = copied_path
     if config.par2.get("enabled"):
         command = config.par2.get("command", "par2")
         redundancy = str(config.par2.get("redundancy_percent", 10))
-        if shutil.which(command) is None:
-            raise RuntimeError(f"PAR2 command not found: {command}. Install PAR2 or disable PAR2 recovery files in Settings.")
-        subprocess.run([command, "create", f"-r{redundancy}", str(zip_path)], check=True, cwd=str(tempdir))
-    return zip_path
+        resolved_command = resolve_par2_command(command, config)
+        if resolved_command is None:
+            raise RuntimeError(
+                f"PAR2 command not found: {command}. Install PAR2, place a bundled par2 executable in backuprr/bin or ./bin, "
+                "or disable PAR2 recovery files in Settings."
+            )
+        subprocess.run([resolved_command, "create", f"-r{redundancy}", str(payload)], check=True, cwd=str(payload.parent))
+    return payload
 
 
 def cleanup_payload(payload: Path, original: Path) -> None:
@@ -145,17 +245,22 @@ def post_next(db: Database, config: Config) -> Optional[int]:
     db.update_file_state(file_id, "posting")
     payload = original
     run_id: Optional[int] = None
+    streaming_compressed = False
+    payload_size = int(original.stat().st_size)
+    uncompressed_size = int(original.stat().st_size)
     try:
-        payload = prepare_payload(original, config)
         article_size = max(1, int(config.article_size))
-        expected_chunks = max(1, math.ceil(payload.stat().st_size / article_size))
-        run_id = db.start_backup_run(file_id, str(original), expected_chunks, int(payload.stat().st_size), str(item["reason"] or ""))
+        streaming_compressed = compression_enabled_for(original, config) and not config.par2.get("enabled")
+        payload = original if streaming_compressed else prepare_payload(original, config)
+        payload_size = int(payload.stat().st_size)
+        expected_chunks = max(1, math.ceil(payload_size / article_size))
+        run_id = db.start_backup_run(file_id, str(original), expected_chunks, payload_size, str(item["reason"] or ""))
         can_reuse_chunks = payload == original and str(item["reason"] or "") in {
             "startup-posting-retry",
             "stale-posting-retry",
             "missing-chunks",
             "hourly-limit",
-        }
+        } and not streaming_compressed
         reusable_chunks = db.reusable_chunk_indexes(file_id, article_size) if can_reuse_chunks else {}
         reusable_chunks = {index: size for index, size in reusable_chunks.items() if 0 <= index < expected_chunks}
         posted_count = len(reusable_chunks)
@@ -198,12 +303,15 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         futures = []
         throttled_by_hourly_limit = False
         remaining_hourly_budget = 0
+        source_bytes_total = 0
         if hourly_limit > 0:
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0).isoformat()
             remaining_hourly_budget = max(0, hourly_limit - db.transfer_bytes_since("upload", cutoff))
         submitted_bytes = 0
         with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backuprr-post") as executor:
-            for chunk_index, chunk in enumerate(iter_chunks(payload, article_size)):
+            source_chunks = iter_compressed_chunks(original, article_size) if streaming_compressed else iter_chunks(payload, article_size)
+            for chunk_index, chunk in enumerate(source_chunks):
+                source_bytes_total += len(chunk)
                 if chunk_index in reusable_chunks:
                     continue
                 if hourly_limit > 0:
@@ -235,9 +343,14 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                 if getattr(config, "log_chunk_events", False):
                     db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
         final_chunks = db.chunk_count_for_file(file_id)
+        if streaming_compressed:
+            expected_chunks = max(1, final_chunks)
+            payload_size = source_bytes_total
+            if run_id is not None:
+                db.update_backup_run_totals(run_id, expected_chunks, payload_size)
         if throttled_by_hourly_limit and final_chunks < expected_chunks:
             if payload != original:
-                raise RuntimeError("Hourly post limit interrupted a temporary payload; increase the hourly limit or disable zip/par2 for resumable throttling")
+                raise RuntimeError("Hourly post limit interrupted a temporary payload; increase the hourly limit or disable compression/PAR2 for resumable throttling")
             db.set_queue_progress(file_id, final_chunks, posted_bytes)
             db.requeue_file(file_id, "hourly-limit")
             if run_id is not None:
@@ -269,10 +382,17 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         flags = []
         if config.encrypt_bodies:
             flags.append("encrypted")
-        if config.zip_subfolders:
-            flags.append("zip")
+        if streaming_compressed or (payload != original and compression_enabled_for(original, config)):
+            flags.append("compressed")
         if config.par2.get("enabled"):
             flags.append("par2")
+        db.set_file_backup_features(
+            file_id,
+            uncompressed_size,
+            payload_size,
+            "compressed" in flags,
+            "par2" in flags,
+        )
         db.record_backup_manifest(
             file_id,
             run_id,
@@ -282,7 +402,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                 "file_sha256": str(item["sha256"] or ""),
                 "article_size": article_size,
                 "chunk_count": final_chunks,
-                "bytes_total": int(payload.stat().st_size),
+                "bytes_total": payload_size,
                 "flags": flags,
                 "newsgroup": config.newsgroup,
                 "host_mode": "post",
