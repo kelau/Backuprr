@@ -98,6 +98,11 @@ The compose file stores config and the SQLite database in `./data` and mounts
 media at `/media` inside the container. Add endpoints in the Web UI using the
 container path, for example `/media/movies`, not the host path.
 
+For large catalog testing, bind a generated media tree into `/media` and keep
+the database on a persistent volume. Backuprr is designed to scan incrementally,
+avoid rehashing unchanged files, and spread verification work across files based
+on each file's last confirmed chunk state.
+
 For a direct `docker run` deployment:
 
 ```bash
@@ -136,6 +141,31 @@ services:
 Create `/opt/backuprr/data/config.json` first, or bind a directory containing
 your existing `config.json`. Set `"database": "/data/backuprr.sqlite3"` in that
 config so the catalog persists across container upgrades.
+
+## Updates
+
+Backuprr can check GitHub Releases once per day by default and stores the last
+result in the local database. The Status page shows whether the running version
+is current, whether a newer release is available, or whether the update check
+failed. The Tasks page includes the scheduled update checker and a manual
+`Check now` action.
+
+Configure the release source in Settings or `config.json`:
+
+```json
+{
+  "update_check_enabled": true,
+  "update_check_interval_seconds": 86400,
+  "update_github_repo": "kelau/Backuprr",
+  "update_check_timeout_seconds": 10
+}
+```
+
+The same check is available from the CLI:
+
+```bash
+backuprr --config config.json update-check
+```
 
 ## Configuration
 
