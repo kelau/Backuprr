@@ -128,6 +128,7 @@ class ScheduledTask:
                 "interval_seconds": self.interval_seconds,
                 "last_run": iso_or_empty(self._last_finished_at),
                 "last_run_duration": format_duration(duration_seconds),
+                "next_run_at": iso_or_empty(self._next_run_at),
                 "time_until_next_run": until_next,
                 "runs": self._runs,
                 "last_result": self._last_result,

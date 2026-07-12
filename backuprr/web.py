@@ -904,7 +904,7 @@ function labelize(value){
   cloud_backup:"Cloud Backup", restore_drill:"Restore Drill", backup_run_id:"Backup Run ID", app_version:"App Version",
   article_size:"Article Size", chunk_count:"Chunks", verified_chunks:"Verified", missing_chunks:"Missing",
   verification_state:"Verification", queue_status:"Queue Status", progress_chunks:"Progress Chunks", progress_bytes:"Progress Bytes",
-  started_at:"Started", finished_at:"Finished", checked_at:"Checked", last_run:"Last Run", last_error:"Last Error",
+  started_at:"Started", finished_at:"Finished", checked_at:"Checked", last_run:"Last Run", next_run_at:"Next Run At", last_error:"Last Error",
   interval_seconds:"Interval", time_until_next_run:"Next Run", last_run_duration:"Duration", bytes_total:"Total", bytes_done:"Done"
  };
  if(known[text]) return known[text];
@@ -934,6 +934,7 @@ function formatCell(col, value){
 function formatCellHtml(col, value, row={}){
  if(["size","size_bytes","files_bytes_total","files_bytes_backed_up","chunks_bytes_total","bytes_done","bytes_total","bytes_checked","article_size_bytes","max_article_size_bytes","estimated_bytes"].includes(col)) return esc(formatBytes(value));
  if(["ts","created_at","updated_at","last_backup_at","last_verify_at","last_chunk_verify_at","posted_at","verified_at","last_run","started_at","finished_at","checked_at"].includes(col)) return esc(formatDateTime(value));
+ if(col === "time_until_next_run") return nextRunSpan(row);
  if(["state","status","verification_state"].includes(col)) return statePill(value);
  if(col === "level") return levelPill(value);
  if(col === "kind") return iconText(kindIcon(value), labelize(value));
@@ -1126,6 +1127,7 @@ async function updateStatusPage(){
  document.getElementById("version").textContent = "v"+s.version;
  const panel = document.getElementById("statusPanel");
  if(panel) panel.innerHTML = statusDashboard(s, tasks, speed);
+ updateNextRunLabels();
 }
 async function updateFilesPage(){
  await refreshOperationProgress();
@@ -1286,6 +1288,7 @@ async function updateTasksPage(){
  const rows = await api("/api/tasks");
  const target = document.getElementById("taskRows");
  if(target) target.innerHTML = tasksTable(rows);
+ updateNextRunLabels();
 }
 function taskActionButtons(kind, refresh="updateTasksPage"){
  if(kind === "catalog") return `<button class="primary" onclick="post('/api/scan').then(${refresh})"><span class="ui-icon">&#128193;</span>Scan now</button>`;
@@ -1300,7 +1303,7 @@ function tasksTable(rows){
  rows.map(task => {
   const result = task.last_result ? `<tr class="task-detail"><td colspan="9"><b>Last Result</b>: ${esc(task.last_result)}</td></tr>` : "";
   const error = task.last_error ? `<tr class="task-detail"><td colspan="9" class="error"><b>Last Error</b>: ${esc(task.last_error)}</td></tr>` : "";
-  return `<tr><td>${esc(task.name)}</td><td>${esc(labelize(task.kind))}</td><td>${statePill(task.paused ? "paused" : task.status)}</td><td>${esc(task.interval_seconds)}</td><td>${esc(formatDateTime(task.last_run) || "not yet")}</td><td>${esc(task.last_run_duration || "-")}</td><td>${esc(task.time_until_next_run || "-")}</td><td>${esc(task.runs || 0)}</td><td><div class="task-row-actions">${taskActionButtons(task.kind)}</div></td></tr>${result}${error}`;
+  return `<tr><td>${esc(task.name)}</td><td>${esc(labelize(task.kind))}</td><td>${statePill(task.paused ? "paused" : task.status)}</td><td>${esc(task.interval_seconds)}</td><td>${esc(formatDateTime(task.last_run) || "not yet")}</td><td>${esc(task.last_run_duration || "-")}</td><td>${nextRunSpan(task)}</td><td>${esc(task.runs || 0)}</td><td><div class="task-row-actions">${taskActionButtons(task.kind)}</div></td></tr>${result}${error}`;
  }).join("")+
  "</tbody></table>";
 }
@@ -1373,12 +1376,12 @@ function statusDashboard(status, tasks, speed){
  const protectedPct = total ? Math.round((backed / total) * 100) : 0;
  const activeTask = tasks.find(task => task.status === "running");
  const nextTask = tasks
-  .filter(task => task.status !== "running" && task.time_until_next_run)
-  .sort((a,b) => secondsFromLabel(a.time_until_next_run) - secondsFromLabel(b.time_until_next_run))[0];
+  .filter(task => task.status !== "running" && (task.next_run_at || task.time_until_next_run))
+  .sort((a,b) => nextRunMillis(a) - nextRunMillis(b))[0];
  return `<div class="dashboard">
   <div class="hero-status">
    <h2><span class="ui-icon">${activeTask ? "&#9658;" : "&#10003;"}</span>${esc(activeTask ? `${activeTask.name} is running` : "Backuprr is standing by")}</h2>
-   <div class="muted">${esc(activeTask ? activeTask.last_result || "Working through the current task" : nextTask ? `Next: ${nextTask.name} in ${nextTask.time_until_next_run}` : "No scheduled task time reported")}</div>
+   <div class="muted">${activeTask ? esc(activeTask.last_result || "Working through the current task") : nextTask ? `Next: ${esc(nextTask.name)} in ${nextRunSpan(nextTask)}` : "No scheduled task time reported"}</div>
   <div class="progress-track"><div class="progress-fill" style="width:${protectedPct}%"></div></div>
   <div>${protectedPct}% backed up &middot; ${backed} of ${total} files protected (${formatBytes(backedBytes)} of ${formatBytes(totalBytes)}) &middot; ${queued + posting} waiting or posting (${formatBytes(queuedBytes + postingBytes)}) &middot; ${chunks} chunks posted (${formatBytes(chunkBytes)})</div>
    <div>${pushLabel()}</div>
@@ -1467,7 +1470,7 @@ function taskCard(task){
   <span class="badge ${running ? "running" : ""}"><span class="ui-icon">${task.paused ? "&#9208;" : stateIcon(task.status)}</span>${esc(task.paused ? "paused" : task.status)}</span>
   <div class="muted"><span class="ui-icon">&#9201;</span>Last run: ${esc(formatDateTime(task.last_run) || "not yet")}</div>
   <div><span class="ui-icon">&#9201;</span>Duration: ${esc(task.last_run_duration || "-")}</div>
-  <div><span class="ui-icon">&#9202;</span>Next run: ${esc(task.time_until_next_run || "-")}</div>
+  <div><span class="ui-icon">&#9202;</span>Next run: ${nextRunSpan(task)}</div>
   <div class="${task.last_error ? "error" : "muted"}">${esc(task.last_error || task.last_result || "")}</div>
   <div class="toolbar-options">${taskActionButtons(task.kind, "updateStatusPage")}</div>
  </div>`;
@@ -1619,12 +1622,45 @@ function formatDateTime(value){
  if(Number.isNaN(date.getTime())) return value;
  return new Intl.DateTimeFormat(undefined, { dateStyle:"medium", timeStyle:"medium" }).format(date);
 }
+function formatCountdownSeconds(seconds){
+ if(seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "-";
+ const total = Math.max(0, Math.round(Number(seconds)));
+ const hours = Math.floor(total / 3600);
+ const minutes = Math.floor((total % 3600) / 60);
+ const secs = total % 60;
+ if(hours) return `${hours}h ${minutes}m ${secs}s`;
+ if(minutes) return `${minutes}m ${secs}s`;
+ return `${secs}s`;
+}
+function countdownFromIso(value){
+ if(!value) return "-";
+ const target = new Date(value);
+ if(Number.isNaN(target.getTime())) return "-";
+ return formatCountdownSeconds((target.getTime() - Date.now()) / 1000);
+}
+function nextRunSpan(task){
+ const nextRunAt = task?.next_run_at || "";
+ return `<span class="next-run" data-next-run-at="${esc(nextRunAt)}">${esc(nextRunAt ? countdownFromIso(nextRunAt) : task?.time_until_next_run || "-")}</span>`;
+}
+function updateNextRunLabels(){
+ document.querySelectorAll(".next-run[data-next-run-at]").forEach(item => {
+  item.textContent = countdownFromIso(item.dataset.nextRunAt);
+ });
+}
+setInterval(updateNextRunLabels, 1000);
 function secondsFromLabel(label){
  const text = String(label || "");
  const h = Number((text.match(/(\d+)h/) || [0,0])[1]);
  const m = Number((text.match(/(\d+)m/) || [0,0])[1]);
  const s = Number((text.match(/(\d+)s/) || [0,0])[1]);
  return h * 3600 + m * 60 + s;
+}
+function nextRunMillis(task){
+ if(task?.next_run_at){
+  const target = new Date(task.next_run_at).getTime();
+  if(!Number.isNaN(target)) return target;
+ }
+ return Date.now() + secondsFromLabel(task?.time_until_next_run) * 1000;
 }
 async function updateLogPage(saveSelection=true){
  logLevelSelection = Array.from(document.querySelectorAll(".logLevel:checked")).map(input => input.value);
