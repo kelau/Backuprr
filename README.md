@@ -60,6 +60,11 @@ a CLI and an AJAX-enabled Web UI.
   limits, operation cancellation, incident mode, provider failover simulation,
   restore rehearsal, queue pause patterns, settings profile import/export, and
   a threat model page for deployment review.
+- Operator safety and UX controls: scoped external API keys, optional TOTP
+  step-up for admin actions, read-only mode, global health bar, command
+  palette, restore preflight warnings, backup readiness scoring, provider
+  capability cards, maintenance visibility, reduced-motion mode, and config
+  change history.
 - CLI commands matching the Web UI operations.
 
 ## Application flow

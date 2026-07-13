@@ -170,11 +170,14 @@ class Config:
     retention_policy_patterns: List[str] = field(default_factory=list)
     critical_verification_interval_days: int = 30
     external_api_keys: List[str] = field(default_factory=list)
+    external_api_key_scopes: Dict[str, List[str]] = field(default_factory=dict)
     api_rate_limit_per_minute: int = 120
     external_api_rate_limit_per_minute: int = 60
     web_ui_username: str = "admin"
     web_ui_password: str = ""
     web_ui_role: str = "admin"
+    web_ui_totp_secret_env: str = "BACKUPRR_TOTP_SECRET"
+    read_only_mode: bool = False
     config_secret_key_env: str = "BACKUPRR_CONFIG_SECRET"
     auto_vacuum_after_compaction_rows: int = 100000
     provider_retry_policy: Dict[str, Dict[str, int]] = field(default_factory=dict)
@@ -187,6 +190,7 @@ class Config:
     manifest_export_passphrase_env: str = "BACKUPRR_MANIFEST_EXPORT_SECRET"
     manifest_export_interval_seconds: int = 86400
     ui_theme: str = "harbor_light"
+    ui_reduced_motion: bool = False
     update_check_enabled: bool = True
     update_github_repo: str = "kelau/Backuprr"
     update_github_token_env: str = "GITHUB_TOKEN"
@@ -281,11 +285,14 @@ class Config:
             "retention_policy_patterns": self.retention_policy_patterns,
             "critical_verification_interval_days": self.critical_verification_interval_days,
             "external_api_keys": self.external_api_keys,
+            "external_api_key_scopes": self.external_api_key_scopes,
             "api_rate_limit_per_minute": self.api_rate_limit_per_minute,
             "external_api_rate_limit_per_minute": self.external_api_rate_limit_per_minute,
             "web_ui_username": self.web_ui_username,
             "web_ui_password": self.web_ui_password,
             "web_ui_role": self.web_ui_role,
+            "web_ui_totp_secret_env": self.web_ui_totp_secret_env,
+            "read_only_mode": self.read_only_mode,
             "config_secret_key_env": self.config_secret_key_env,
             "auto_vacuum_after_compaction_rows": self.auto_vacuum_after_compaction_rows,
             "provider_retry_policy": self.provider_retry_policy,
@@ -298,6 +305,7 @@ class Config:
             "manifest_export_passphrase_env": self.manifest_export_passphrase_env,
             "manifest_export_interval_seconds": self.manifest_export_interval_seconds,
             "ui_theme": self.ui_theme,
+            "ui_reduced_motion": self.ui_reduced_motion,
             "update_check_enabled": self.update_check_enabled,
             "update_github_repo": self.update_github_repo,
             "update_github_token_env": self.update_github_token_env,
@@ -319,8 +327,10 @@ class Config:
         data["log_destinations"] = [destination.public_dict() for destination in self.log_destinations]
         data["external_api_key_count"] = len(self.external_api_keys)
         data["external_api_keys"] = []
+        data["external_api_key_scopes"] = {key[:4] + "..." + key[-4:]: scopes for key, scopes in self.external_api_key_scopes.items()}
         data["has_web_ui_password"] = bool(self.web_ui_password)
         data["web_ui_password"] = ""
+        data["totp_enabled"] = bool(os.getenv(self.web_ui_totp_secret_env))
         return data
 
 
@@ -478,8 +488,26 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         keys = [str(item).strip() for item in data["external_api_keys"] if str(item).strip()]
         if keys:
             config.external_api_keys = keys
+            config.external_api_key_scopes = {
+                key: config.external_api_key_scopes.get(key, ["read", "backup", "verify"])
+                for key in keys
+            }
         elif data.get("clear_external_api_keys"):
             config.external_api_keys = []
+            config.external_api_key_scopes = {}
+    if "external_api_key_scopes" in data:
+        allowed_scopes = {"read", "backup", "scan", "verify", "restore", "admin"}
+        scopes: Dict[str, List[str]] = {}
+        for key, value in dict(data["external_api_key_scopes"] or {}).items():
+            if str(key) not in config.external_api_keys:
+                continue
+            values = [str(item).strip() for item in (value if isinstance(value, list) else str(value).split(",")) if str(item).strip()]
+            if not values:
+                values = ["read"]
+            if any(scope not in allowed_scopes for scope in values):
+                raise ValueError("external_api_key_scopes contains an unsupported scope")
+            scopes[str(key)] = sorted(set(values))
+        config.external_api_key_scopes = scopes
     if "api_rate_limit_per_minute" in data:
         limit = int(data["api_rate_limit_per_minute"] or 0)
         if limit < 0 or limit > 10000:
@@ -500,6 +528,10 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if role not in {"admin", "operator", "read_only"}:
             raise ValueError("web_ui_role must be admin, operator, or read_only")
         config.web_ui_role = role
+    if "web_ui_totp_secret_env" in data:
+        config.web_ui_totp_secret_env = str(data["web_ui_totp_secret_env"] or "BACKUPRR_TOTP_SECRET").strip() or "BACKUPRR_TOTP_SECRET"
+    if "read_only_mode" in data:
+        config.read_only_mode = bool(data["read_only_mode"])
     if data.get("web_ui_password"):
         config.web_ui_password = str(data["web_ui_password"])
     elif data.get("clear_web_ui_password"):
@@ -546,6 +578,8 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if theme not in {"harbor_light", "emerald_console", "slate_cinema", "graphite", "nordic_mint"}:
             raise ValueError("ui_theme is not a supported template")
         config.ui_theme = theme
+    if "ui_reduced_motion" in data:
+        config.ui_reduced_motion = bool(data["ui_reduced_motion"])
     if "update_check_enabled" in data:
         config.update_check_enabled = bool(data["update_check_enabled"])
     if "update_github_repo" in data:

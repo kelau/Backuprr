@@ -4,7 +4,9 @@ import copy
 import hmac
 import json
 import math
+import os
 import secrets
+import struct
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -24,7 +26,9 @@ from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBa
 from .operations import (
     audit_event,
     backup_manifest_export,
+    backup_readiness_report,
     check_usenet_hosts,
+    config_history_rows,
     db_growth_report,
     diagnostics_bundle,
     disaster_recovery_report,
@@ -35,13 +39,16 @@ from .operations import (
     prometheus_metrics,
     provider_failover_simulation,
     provider_confidence_report,
+    record_config_history,
     restore_confidence,
     restore_plan,
+    restore_preflight,
     restore_preview,
     run_restore_rehearsal,
     run_maintenance,
     run_restore_drill,
     setup_health_check,
+    maintenance_schedule_report,
     synthetic_catalog_plan,
     test_post_host_article_size,
     threat_model_report,
@@ -133,6 +140,26 @@ def hourly_post_budget(db: Database, config: Config) -> dict[str, Any]:
     }
 
 
+def totp_valid(secret: str, code: str, now: int | None = None) -> bool:
+    secret = str(secret or "").strip().replace(" ", "")
+    code = str(code or "").strip()
+    if not secret or not code.isdigit():
+        return False
+    try:
+        key = base64.b32decode(secret.upper(), casefold=True)
+    except Exception:
+        key = secret.encode("utf-8")
+    timestamp = int(now if now is not None else time.time())
+    for offset in (-1, 0, 1):
+        counter = int(timestamp // 30) + offset
+        digest = hmac.new(key, struct.pack(">Q", counter), "sha1").digest()
+        index = digest[-1] & 0x0F
+        value = struct.unpack(">I", digest[index : index + 4])[0] & 0x7FFFFFFF
+        if hmac.compare_digest(f"{value % 1_000_000:06d}", code):
+            return True
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     config: Config
     config_path: str
@@ -207,6 +234,8 @@ class Handler(BaseHTTPRequestHandler):
         return hmac.compare_digest(username, self.config.web_ui_username) and hmac.compare_digest(password, self.config.web_ui_password)
 
     def web_role_allows(self, action: str) -> bool:
+        if getattr(self.config, "read_only_mode", False) and action != "read":
+            return False
         role = getattr(self.config, "web_ui_role", "admin")
         if role == "admin":
             return True
@@ -215,9 +244,23 @@ class Handler(BaseHTTPRequestHandler):
         return action == "read"
 
     def require_role(self, action: str) -> bool:
+        if getattr(self.config, "read_only_mode", False) and action != "read":
+            if self.path.startswith("/api/settings") and getattr(self, "_allow_read_only_disable", False):
+                return True
+            self.forbidden("read-only mode is enabled")
+            return False
         if self.web_role_allows(action):
             return True
         self.forbidden(f"{getattr(self.config, 'web_ui_role', 'read_only')} role cannot perform {action} actions")
+        return False
+
+    def require_totp(self, action: str) -> bool:
+        secret = os.getenv(getattr(self.config, "web_ui_totp_secret_env", "BACKUPRR_TOTP_SECRET"))
+        if not secret or action != "admin":
+            return True
+        if totp_valid(secret, self.headers.get("X-Backuprr-TOTP", "")):
+            return True
+        self.forbidden("valid TOTP code is required for admin actions")
         return False
 
     def client_key(self, external: bool = False) -> str:
@@ -266,15 +309,39 @@ class Handler(BaseHTTPRequestHandler):
             supplied = query.get("internal_token", [""])[0]
         return bool(supplied) and secrets.compare_digest(supplied, INTERNAL_API_TOKEN)
 
-    def external_api_authorized(self) -> bool:
+    def external_api_key(self) -> str:
         configured = [str(key) for key in getattr(self.config, "external_api_keys", []) if str(key)]
         if not configured:
-            return False
+            return ""
         supplied = self.headers.get("X-API-Key", "")
         auth = self.headers.get("Authorization", "")
         if auth.lower().startswith("bearer "):
             supplied = auth.split(" ", 1)[1].strip()
-        return any(secrets.compare_digest(supplied, key) for key in configured)
+        for key in configured:
+            if secrets.compare_digest(supplied, key):
+                return key
+        return ""
+
+    def external_api_authorized(self) -> bool:
+        return bool(self.external_api_key())
+
+    def external_api_scope_allows(self, scope: str) -> bool:
+        key = self.external_api_key()
+        if not key:
+            return False
+        scopes = getattr(self.config, "external_api_key_scopes", {}).get(key, [])
+        return not scopes or "admin" in scopes or scope in scopes
+
+    def external_scope_for_path(self, suffix: str, method: str = "GET") -> str:
+        if method == "GET":
+            return "read"
+        if suffix == "/backup/run":
+            return "backup"
+        if suffix == "/scan":
+            return "scan"
+        if suffix == "/verify/start":
+            return "verify"
+        return "admin"
 
     def read_json(self) -> dict:
         length = int(self.headers.get("Content-Length", "0"))
@@ -505,6 +572,10 @@ class Handler(BaseHTTPRequestHandler):
             if not self.external_api_authorized():
                 self.unauthorized("external API key is required")
                 return
+            suffix = parsed.path.removeprefix("/external-api")
+            if not self.external_api_scope_allows(self.external_scope_for_path(suffix, "GET")):
+                self.forbidden("external API key scope does not allow this action")
+                return
             self.handle_external_get(parsed, query)
         elif parsed.path.startswith("/api/") and not self.internal_api_authorized(query):
             self.forbidden("internal API token is required")
@@ -567,6 +638,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(provider_failover_simulation(self.config, query.get("host", [""])[0]))
         elif parsed.path == "/api/threat-model":
             self.send_json(threat_model_report(self.db, self.config))
+        elif parsed.path == "/api/readiness":
+            self.send_json(backup_readiness_report(self.db, self.config))
+        elif parsed.path == "/api/maintenance/schedule":
+            self.send_json(maintenance_schedule_report(self.db, self.config))
+        elif parsed.path == "/api/config/history":
+            self.send_json({"rows": config_history_rows(self.db, int(query.get("limit", ["20"])[0]))})
         elif parsed.path == "/api/db-growth":
             self.send_json(db_growth_report(self.db, self.config))
         elif parsed.path == "/api/manifest/export":
@@ -676,6 +753,13 @@ class Handler(BaseHTTPRequestHandler):
                 if not self.external_api_authorized():
                     self.unauthorized("external API key is required")
                     return
+                suffix = parsed.path.removeprefix("/external-api")
+                if not self.external_api_scope_allows(self.external_scope_for_path(suffix, "POST")):
+                    self.forbidden("external API key scope does not allow this action")
+                    return
+                if getattr(self.config, "read_only_mode", False):
+                    self.forbidden("read-only mode is enabled")
+                    return
                 self.handle_external_post(parsed)
                 return
             if parsed.path.startswith("/api/") and not self.web_ui_authorized():
@@ -690,9 +774,17 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/") and not self.rate_limit_allows(external=False):
                 self.send_json({"error": "rate limit exceeded"}, 429)
                 return
+            data = self.read_json()
+            self._allow_read_only_disable = (
+                bool(getattr(self.config, "read_only_mode", False))
+                and parsed.path == "/api/settings"
+                and set(data.keys()) <= {"read_only_mode"}
+                and data.get("read_only_mode") is False
+            )
             if parsed.path.startswith("/api/") and not self.require_role(self.action_for_post_path(parsed.path)):
                 return
-            data = self.read_json()
+            if parsed.path.startswith("/api/") and not self.require_totp(self.action_for_post_path(parsed.path)):
+                return
             if parsed.path == "/api/scan":
                 self.send_json({"files": self.monitor.scan_once()})
             elif parsed.path == "/api/queue/enqueue-unbacked":
@@ -771,6 +863,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(restore_confidence(self.db, data["path"], self.config))
             elif parsed.path == "/api/restore/plan":
                 self.send_json(restore_plan(self.db, data["path"], data.get("dest") or ""))
+            elif parsed.path == "/api/restore/preflight":
+                self.send_json(restore_preflight(self.db, self.config, data["path"], data.get("dest") or ""))
             elif parsed.path == "/api/restore/preview":
                 self.send_json(restore_preview(self.db, [int(item) for item in data.get("file_ids", [])], data.get("dest") or ""))
             elif parsed.path == "/api/restore":
@@ -794,6 +888,7 @@ class Handler(BaseHTTPRequestHandler):
                 profile = dict(data.get("profile") or data)
                 update_config(self.config, profile)
                 self.config.save(self.config_path)
+                record_config_history(self.db, self.config.web_ui_username, sorted(profile.keys()))
                 self.db.log("info", "settings.profile", "Imported settings profile")
                 self.send_json({"ok": True, "settings": self.config.public_dict()})
             elif parsed.path == "/api/settings":
@@ -803,6 +898,7 @@ class Handler(BaseHTTPRequestHandler):
                 for endpoint in self.config.endpoints:
                     self.db.add_endpoint(endpoint)
                 self.db.log("info", "settings", "Updated configuration from Web UI")
+                record_config_history(self.db, self.config.web_ui_username, sorted(data.keys()))
                 audit_event(self.db, self.config, self.config.web_ui_username, "settings.update", {"keys": sorted(data.keys())})
                 self.monitor.trigger()
                 self.send_json({"ok": True, "settings": self.config.public_dict()})
@@ -1230,6 +1326,14 @@ pre { white-space:pre-wrap; background:var(--panel); border:1px solid var(--line
 .version-notice h3 { margin:0; font-size:15px; display:flex; align-items:center; gap:6px; }
 .version-notice ul { margin:0; padding-left:20px; color:var(--muted); }
 .version-notice .toolbar { margin:0; padding:0; background:transparent; border:0; box-shadow:none; justify-content:flex-end; }
+.health-bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:10px 20px; border-bottom:1px solid var(--line); background:var(--header-bg); position:sticky; top:0; z-index:20; }
+.health-chip { display:inline-flex; align-items:center; gap:5px; padding:5px 8px; border:1px solid var(--line); border-radius:999px; background:var(--panel); color:var(--muted); font-size:12px; font-weight:800; }
+.health-chip.warn { color:var(--warn); border-color:rgba(180,83,9,.35); }
+.health-chip.bad { color:var(--bad); border-color:rgba(220,38,38,.35); }
+.command-palette { position:fixed; inset:0; z-index:100; display:grid; place-items:start center; padding-top:12vh; background:rgba(0,0,0,.28); }
+.command-box { width:min(640px,calc(100vw - 32px)); background:var(--panel); border:1px solid var(--line); border-radius:6px; box-shadow:var(--shadow); padding:10px; }
+.command-list button { width:100%; justify-content:flex-start; text-align:left; margin-top:4px; }
+html[data-reduced-motion="true"] *, html[data-reduced-motion="true"] *:before, html[data-reduced-motion="true"] *:after { animation:none !important; transition:none !important; scroll-behavior:auto !important; }
 @media (max-width:1100px) { .tree-row.file-row, .tree-row.folder-row, .tree-header { grid-template-columns:24px 24px minmax(180px,1fr) minmax(150px,170px) minmax(78px,90px) minmax(96px,max-content); min-width:720px; } .tree-row.file-row > :nth-child(7), .tree-row.folder-row > :nth-child(7), .tree-header > :nth-child(7) { display:none; } .tree-actions { grid-column:auto; } }
 @media (max-width:860px) { .app-shell { display:block; } .sidebar { position:relative; top:auto; height:auto; overflow:visible; border-right:0; border-bottom:1px solid var(--line); } nav { display:grid; grid-template-columns:repeat(2,1fr); } .side-footer { display:none; } .toolbar-grid { grid-template-columns:1fr; } }
 </style>
@@ -1237,9 +1341,10 @@ pre { white-space:pre-wrap; background:var(--panel); border:1px solid var(--line
 <body>
 <main class="app-shell">
 <aside class="sidebar"><div class="brand"><span class="brand-mark" aria-hidden="true"></span><span class="brand-copy"><b>Backuprr</b><span>Usenet vault</span></span></div><nav id="nav"></nav><div class="side-footer"><span>Obfuscated media backup engine</span><span id="version" class="pill ok"></span></div></aside>
-<section id="content"></section>
+<div><div id="healthBar" class="health-bar"></div><section id="content"></section></div>
 </main>
 <div id="versionNotice"></div>
+<div id="commandPalette"></div>
 <script>
 const pages = ["Status","Files","Search","Log","Queue","Tasks","Verification","Statistics","Operations","Security","Settings","About"];
 const pageSlugs = {
@@ -1285,6 +1390,7 @@ let selectedFiles = new Set();
 let selectedFileData = new Map();
 let selectedVerificationFiles = new Set();
 let settingsDirty = false;
+let cachedTotpCode = "";
 const defaultTableSorts = {
  files:{ col:"relative_path", dir:"asc" },
  log:{ col:"id", dir:"desc" },
@@ -1298,6 +1404,8 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.82":["Added a dedicated read-only safety escape hatch and live reduced-motion toggle feedback."],
+ "0.2.81":["Added scoped external API keys, read-only safety mode, optional TOTP admin step-up, global health bar, command palette, readiness scoring, provider capability cards, restore preflight warnings, maintenance visibility, and config change history."],
  "0.2.80":["GitHub update checks can use a token environment variable for private repositories."],
  "0.2.79":["GitHub update checks now fall back to repository tags when no formal latest release exists."],
  "0.2.78":["Added threat model reporting, CSRF protection, API rate limits, operation cancellation, incident mode, restore rehearsal, failover simulation, settings profiles, queue pause patterns, and retention hints."],
@@ -1314,7 +1422,21 @@ const releaseNotes = {
  "0.2.67":["Completed queue now shows stored chunk count instead of progress."],
  "0.2.66":["Retryable failed queue items recover after settings fixes.","Completed network-blocked rows no longer need attention."]
 };
-const api = (url, opts={}) => fetch(url, {...opts, headers:{"Content-Type":"application/json","X-Backuprr-Internal-Token":internalApiToken,"X-Backuprr-CSRF":csrfToken, ...(opts.headers || {})}}).then(r => r.json());
+async function api(url, opts={}){
+ const headers = {"Content-Type":"application/json","X-Backuprr-Internal-Token":internalApiToken,"X-Backuprr-CSRF":csrfToken, ...(opts.headers || {})};
+ if(cachedTotpCode) headers["X-Backuprr-TOTP"] = cachedTotpCode;
+ let response = await fetch(url, {...opts, headers});
+ let data = await response.json();
+ if(response.status === 403 && String(data.error || "").includes("TOTP")){
+  cachedTotpCode = prompt("Admin action requires a 6-digit TOTP code") || "";
+  if(cachedTotpCode){
+   headers["X-Backuprr-TOTP"] = cachedTotpCode;
+   response = await fetch(url, {...opts, headers});
+   data = await response.json();
+  }
+ }
+ return data;
+}
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
 function jsString(v){ return JSON.stringify(String(v ?? "")).replace(/</g, "\\u003c"); }
@@ -1357,6 +1479,7 @@ function themeOptions(selected){
 function applyTheme(theme){
  const selected = themeTemplates.some(item => item.id === theme) ? theme : "harbor_light";
  document.documentElement.dataset.theme = selected;
+ document.documentElement.dataset.reducedMotion = settingsCache?.ui_reduced_motion ? "true" : "false";
  return selected;
 }
 async function loadSettings(){
@@ -1506,6 +1629,57 @@ function nav(){
  const title = document.getElementById("pageTitle");
  if(title) title.textContent = page;
 }
+async function updateHealthBar(){
+ const target = document.getElementById("healthBar");
+ if(!target) return;
+ try{
+  const [status, readiness] = await Promise.all([api("/api/status"), api("/api/readiness")]);
+  const stats = status.stats || {};
+  const paused = (status.paused_workers || []).length;
+  const attention = Number(stats.queue_attention_count || 0);
+  const missing = Number(stats.chunks_missing || 0);
+  const readOnly = settingsCache?.read_only_mode;
+  target.innerHTML = `
+   <span class="health-chip ${attention ? "warn" : ""}"><span class="ui-icon">&#128230;</span>${attention ? `${attention} need attention` : "Queue ok"}</span>
+   <span class="health-chip ${missing ? "bad" : ""}"><span class="ui-icon">&#10003;</span>${missing ? `${missing} missing chunks` : "Chunks ok"}</span>
+   <span class="health-chip ${paused ? "warn" : ""}"><span class="ui-icon">&#9208;</span>${paused ? `${paused} paused` : "Workers active"}</span>
+   <span class="health-chip"><span class="ui-icon">&#128737;</span>Readiness ${Number(readiness.score || 0)}%</span>
+   ${readOnly ? `<span class="health-chip warn"><span class="ui-icon">&#128274;</span>Read-only</span>` : ""}
+   <button onclick="openCommandPalette()" title="Command palette">Ctrl+K</button>`;
+ } catch {
+  target.innerHTML = `<span class="health-chip warn">Health unavailable</span>`;
+ }
+}
+function commandItems(){
+ return [
+  ["Status", () => navigatePage("Status")],
+  ["Files", () => navigatePage("Files")],
+  ["Queue", () => navigatePage("Queue")],
+  ["Operations", () => navigatePage("Operations")],
+  ["Settings", () => navigatePage("Settings")],
+  ["Backup now", () => post("/api/backup/run").then(updateHealthBar)],
+  ["Scan now", () => post("/api/scan").then(updateHealthBar)],
+  ["Verify chunks", () => post("/api/verify/start", {force:true}).then(updateHealthBar)],
+  ["Pause all workers", () => post("/api/worker/pause", {kind:"all"}).then(updateHealthBar)],
+  ["Resume all workers", () => post("/api/worker/resume", {kind:"all"}).then(updateHealthBar)]
+ ];
+}
+function openCommandPalette(){
+ const target = document.getElementById("commandPalette");
+ const items = commandItems();
+ target.innerHTML = `<div class="command-palette" onclick="closeCommandPalette()"><div class="command-box" onclick="event.stopPropagation()"><input id="commandSearch" placeholder="Run command or jump to page" oninput="filterCommandPalette()" autofocus><div id="commandList" class="command-list">${items.map(([label], index)=>`<button data-command-index="${index}" onclick="runCommand(${index})">${esc(label)}</button>`).join("")}</div></div></div>`;
+ setTimeout(()=>document.getElementById("commandSearch")?.focus(), 0);
+}
+function closeCommandPalette(){ document.getElementById("commandPalette").innerHTML = ""; }
+function filterCommandPalette(){
+ const q = document.getElementById("commandSearch")?.value.toLowerCase() || "";
+ document.querySelectorAll("[data-command-index]").forEach(button => button.style.display = button.textContent.toLowerCase().includes(q) ? "" : "none");
+}
+function runCommand(index){
+ const item = commandItems()[Number(index)];
+ closeCommandPalette();
+ if(item) item[1]();
+}
 function connectChanges(){
  if(eventSource) return;
  eventSource = new EventSource(`/api/events/stream?internal_token=${encodeURIComponent(internalApiToken)}`);
@@ -1531,6 +1705,8 @@ document.addEventListener("click", event => {
 });
 document.addEventListener("keydown", event => {
  if(event.key === "Escape") closeDropdowns();
+ if((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k"){ event.preventDefault(); openCommandPalette(); }
+ if(event.key === "Escape") closeCommandPalette();
 });
 window.addEventListener("popstate", () => {
  page = pageFromPath(location.pathname);
@@ -1577,6 +1753,7 @@ async function render(){
  if(!settingsCache) await loadSettings();
  else applyTheme(settingsCache.ui_theme);
  await updateVersionPill();
+ await updateHealthBar();
  const c = document.getElementById("content");
  if(page==="Status"){
   c.innerHTML = `<div id="statusPanel"></div>`;
@@ -1638,6 +1815,7 @@ async function render(){
  if(page==="About"){ c.innerHTML = aboutPage(); const s=await api("/api/status"); appVersion = s.version; updateVersionPillText(); maybeShowVersionNotice(appVersion); document.getElementById("aboutVersion").textContent=s.version; }
 }
 async function refreshCurrentLivePage(){
+ await updateHealthBar();
  if(page==="Status") await updateStatusPage();
  if(page==="Files") await updateFilesPage();
  if(page==="Queue") await updateQueuePage();
@@ -1664,16 +1842,20 @@ async function refreshPageForChanges(previous, token){
  if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged || transferChanged)) await updateStatisticsPage();
  if(page==="Operations" && (eventsChanged || tasksChanged || transferChanged)) await updateOperationsPage();
  if(page==="Security" && eventsChanged) await updateSecurityPage();
+ if(filesChanged || queueChanged || eventsChanged || tasksChanged || transferChanged) await updateHealthBar();
 }
 async function updateStatusPage(){
- const s = await api("/api/status");
- const tasks = await api("/api/tasks");
- const speed = await api("/api/speed?minutes=10&bucket=10");
+ const [s, tasks, speed, readiness] = await Promise.all([
+  api("/api/status"),
+  api("/api/tasks"),
+  api("/api/speed?minutes=10&bucket=10"),
+  api("/api/readiness")
+ ]);
  appVersion = s.version;
  updateVersionPillText();
  maybeShowVersionNotice(appVersion);
  const panel = document.getElementById("statusPanel");
- if(panel) panel.innerHTML = statusDashboard(s, tasks, speed);
+ if(panel) panel.innerHTML = statusDashboard(s, tasks, speed, readiness);
  updateNextRunLabels();
 }
 async function updateVersionPill(){
@@ -1938,7 +2120,7 @@ async function updateStatisticsPage(){
 }
 async function updateOperationsPage(){
  await refreshOperationProgress();
- const [tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts, failover] = await Promise.all([
+ const [tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts, failover, readiness, schedule, history] = await Promise.all([
   api("/api/tasks"),
   api("/api/dry-run"),
   api("/api/benchmark?files=50000&size=1073741824&folders=1000"),
@@ -1949,10 +2131,13 @@ async function updateOperationsPage(){
   api("/api/backup-runs?limit=20"),
   api("/api/setup-health"),
   api("/api/alerts"),
-  api("/api/provider-failover")
+  api("/api/provider-failover"),
+  api("/api/readiness"),
+  api("/api/maintenance/schedule"),
+  api("/api/config/history")
  ]);
  const target = document.getElementById("operationsPanel");
- if(target) target.innerHTML = operationsDashboard(tasks, plan, benchmark, recovery, health.hosts || [], maintenance || [], drills || [], runs || [], setup, alerts.alerts || [], failover);
+ if(target) target.innerHTML = operationsDashboard(tasks, plan, benchmark, recovery, health.hosts || [], maintenance || [], drills || [], runs || [], setup, alerts.alerts || [], failover, readiness, schedule, history.rows || []);
 }
 async function updateSecurityPage(){
  const [model, setup, recovery, settings] = await Promise.all([
@@ -1970,7 +2155,7 @@ function paginationControls(result, pageVar, updateFn, pageSizeVar="", label="")
  const pageSize = pageSizeVar ? `<label class="muted">Rows <select onchange="${pageSizeVar}=Number(this.value);${pageVar}=1;${updateFn}()">${[10,25,50,100,250].map(size=>`<option value="${size}" ${Number(result.page_size || 0)===size ? "selected" : ""}>${size}</option>`).join("")}</select></label>` : "";
  return `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);${updateFn}()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${esc(label || `${Number(result.total || 0)} rows`)}</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;${updateFn}()">Next</button>${pageSize}</div>`;
 }
-function statusDashboard(status, tasks, speed){
+function statusDashboard(status, tasks, speed, readiness={}){
  const stats = status.stats || {};
  const total = Number(stats.files_total || 0);
  const backed = Number(stats.files_backed_up || 0);
@@ -2014,6 +2199,7 @@ function statusDashboard(status, tasks, speed){
    ${setupHealthPanel(setup)}
    ${alertsPanel(alerts)}
    ${queueAttentionPanel(attention)}
+   ${readinessPanel(readiness)}
   ${updateCheckPanel(status.update_check || {})}
   <div class="stats">
    ${statCard("Files", total, "&#128196;")}
@@ -2074,6 +2260,16 @@ function setupHealthPanel(setup){
   <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
   <div class="muted">${pct}% complete${failed.length ? ` / ${failed.length} item${failed.length === 1 ? "" : "s"} to fix` : ""}</div>
   <div class="setup-checks">${setup.checks.map(check => `<div><span class="ui-icon">${check.ok ? "&#10003;" : "&#9888;"}</span><b>${esc(check.label)}</b><span class="muted">${esc(check.detail || "")}</span></div>`).join("")}</div>
+ </div>`;
+}
+function readinessPanel(readiness){
+ if(!readiness || readiness.score == null) return "";
+ const score = Number(readiness.score || 0);
+ return `<div class="chart-card">
+  <h3><span class="ui-icon">&#128737;</span>Backup readiness</h3>
+  <div class="thread-meter"><b>${score}%</b><span class="muted">${Number(readiness.files_backed_up || 0)} of ${Number(readiness.files_total || 0)} files backed up</span></div>
+  <div class="progress-track"><div class="progress-fill" style="width:${score}%"></div></div>
+  <div class="muted">${Number(readiness.chunks_verified || 0)} verified chunks / ${Number(readiness.queue_attention || 0)} queue attention / ${Number(readiness.chunks_missing || 0)} missing</div>
  </div>`;
 }
 function alertsPanel(alerts){
@@ -2295,7 +2491,7 @@ function statisticsDashboard(data){
   ${table(restoreDrills, ["file_id","path","status","checked_at","bytes_checked","message"])}
  </div>`;
 }
-function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts, failover){
+function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts, failover, readiness, schedule, history){
   return `<div class="dashboard">
    <div class="toolbar">
    <button class="danger" onclick="post('/api/worker/pause',{kind:'all'}).then(updateOperationsPage)"><span class="ui-icon">&#9208;</span>Pause all workers</button>
@@ -2313,6 +2509,8 @@ function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenan
    ${setupHealthPanel(setup)}
    ${alertsPanel(alerts || [])}
    ${operationProgressPanel()}
+   ${providerCapabilityPanel(health)}
+   ${readinessPanel(readiness)}
    <h2 class="section-title"><span class="ui-icon">&#9208;</span>Worker controls</h2>
   <div class="task-strip">${tasks.map(task => `<div class="task-card"><h3><span class="ui-icon">${kindIcon(task.kind)}</span>${esc(task.name)}</h3><div>${statePill(task.paused ? "paused" : task.status)}</div><div class="toolbar"><button onclick="post('/api/worker/pause',{kind:${jsString(task.kind)}}).then(updateOperationsPage)">Pause</button><button onclick="post('/api/worker/resume',{kind:${jsString(task.kind)}}).then(updateOperationsPage)">Resume</button></div></div>`).join("")}</div>
   <h2 class="section-title"><span class="ui-icon">&#128221;</span>Dry-run backup plan</h2>
@@ -2344,13 +2542,39 @@ function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenan
   ${failoverPanel(failover)}
   <h2 class="section-title"><span class="ui-icon">&#128225;</span>Provider health</h2>
   ${table(health, ["host_name","mode","status","article_size_bytes","latency_ms","checked_at","message"])}
+  <h2 class="section-title"><span class="ui-icon">&#128736;</span>Maintenance schedule</h2>
+  ${maintenanceSchedulePanel(schedule)}
   <h2 class="section-title"><span class="ui-icon">&#128230;</span>Recent backup sessions</h2>
   ${table(runs, ["id","file_id","status","reason","host","chunks_done","chunks_total","bytes_done","bytes_total","error"])}
   <h2 class="section-title"><span class="ui-icon">&#128736;</span>Maintenance history</h2>
   ${table(maintenance, ["kind","started_at","finished_at","result","details"])}
   <h2 class="section-title"><span class="ui-icon">&#8635;</span>Restore drill history</h2>
   ${table(drills, ["file_id","path","status","checked_at","bytes_checked","message"])}
+  <h2 class="section-title"><span class="ui-icon">&#128221;</span>Config change history</h2>
+  ${table(history || [], ["ts","actor","keys"])}
   </div>`;
+}
+function providerCapabilityPanel(health){
+ const postRows = (health || []).filter(row => row.mode === "post");
+ const maxArticle = Math.max(0, ...postRows.map(row => Number(row.article_size_bytes || 0)));
+ const failures = (health || []).filter(row => row.status === "failed").length;
+ return `<div class="chart-card">
+  <h3><span class="ui-icon">&#128225;</span>Provider capability</h3>
+  <div class="stats compact-stats">
+   ${statCard("Post hosts", postRows.length, "&#8679;")}
+   ${statCard("Max article", maxArticle ? formatBytes(maxArticle) : "Unknown", "&#129513;")}
+   ${statCard("Recent failures", failures, "&#9888;")}
+  </div>
+  <div class="muted">${maxArticle ? "Article size has been probed." : "Run Check hosts + article size to profile provider limits."}</div>
+ </div>`;
+}
+function maintenanceSchedulePanel(schedule){
+ if(!schedule) return "<p class='muted'>No maintenance schedule data.</p>";
+ return `<div class="stats">
+  ${statCard("Interval", formatCountdownSeconds(schedule.next_interval_seconds || 0), "&#9201;")}
+  ${statCard("Reclaim hint", formatBytes(schedule.estimated_reclaimable_hint_bytes || 0), "&#128190;")}
+  ${statCard("Runs shown", (schedule.last_runs || []).length, "&#128736;")}
+ </div><p class="muted">${esc(schedule.vacuum_note || "")}</p>${table(schedule.last_runs || [], ["kind","started_at","finished_at","result","details"])}`;
 }
 function showInlineJson(id, out){
  const target = document.getElementById(id);
@@ -2390,6 +2614,7 @@ function failoverPanel(report){
 }
 function securityDashboard(model, setup, recovery, settings){
  const mitigations = model.mitigations || [];
+ const secretRows = model.secret_health || [];
  return `<div class="dashboard">
   <div class="hero-status">
    <h2><span class="ui-icon">&#128737;</span>Security posture</h2>
@@ -2397,6 +2622,8 @@ function securityDashboard(model, setup, recovery, settings){
   </div>
   <div class="stats">
    ${statCard("Web auth", settings.has_web_ui_password ? "Enabled" : "Off", "&#128274;")}
+   ${statCard("TOTP", settings.totp_enabled ? "Enabled" : "Off", "&#128273;")}
+   ${statCard("Read-only", settings.read_only_mode ? "On" : "Off", "&#128274;")}
    ${statCard("External keys", Number(settings.external_api_key_count || 0), "&#128273;")}
    ${statCard("API rate limit", `${Number(settings.api_rate_limit_per_minute || 0) || "Off"}/min`, "&#9201;")}
    ${statCard("External limit", `${Number(settings.external_api_rate_limit_per_minute || 0) || "Off"}/min`, "&#9201;")}
@@ -2406,6 +2633,9 @@ function securityDashboard(model, setup, recovery, settings){
    <h3><span class="ui-icon">${item.status === "ok" ? "&#10003;" : "&#9888;"}</span>${esc(item.area)}</h3>
    <div class="muted">${esc(item.detail)}</div>
   </div>`).join("")}</div>
+  <h2 class="section-title"><span class="ui-icon">&#128273;</span>Secret health</h2>
+  ${table(secretRows, ["name","ok","detail"])}
+  ${!settings.has_web_ui_password ? `<div class="hero-status danger-zone"><h2><span class="ui-icon">&#9888;</span>Exposure warning</h2><div>Web UI password is disabled. Keep Backuprr bound to localhost or behind a trusted authenticated proxy.</div></div>` : ""}
   <h2 class="section-title"><span class="ui-icon">&#128221;</span>Assumptions</h2>
   <div class="chart-card">${(model.assumptions || []).map(item => `<div>${esc(item)}</div>`).join("")}</div>
   <h2 class="section-title"><span class="ui-icon">&#9888;</span>Not protected against</h2>
@@ -2895,8 +3125,9 @@ async function restoreSelectedFilesMode(mode, destValue=""){
   let restored = 0;
  setRestoreStatus(`Starting restore for ${selectedRows.length} files...`, "warn");
  for(const file of selectedRows){
-  const confidence = await post("/api/restore/confidence", { path:file.path });
-  if(confidence.warning && !confirm(`${file.relative_path || file.path}\n${confidence.warning}\nContinue restore?`)){
+  const preflight = await post("/api/restore/preflight", { path:file.path, dest:dest || "" });
+  const warning = preflight.issues?.length ? `${preflight.issues.join("\n")}\nSuggested quarantine: ${preflight.quarantine_path}` : preflight.warning;
+  if(warning && !confirm(`${file.relative_path || file.path}\n${warning}\nContinue restore?`)){
    setRestoreStatus(`Skipped ${file.relative_path || file.path}`, "warn", true);
    continue;
   }
@@ -2929,8 +3160,9 @@ async function restoreCatalogFileMode(fileId, mode, destValue=""){
  }
  closeDropdowns();
  setRestoreStatus(`Checking restore confidence for ${file.relative_path || file.path}...`, "warn");
- const confidence = await post("/api/restore/confidence", { path:file.path });
- if(confidence.warning && !confirm(`${confidence.warning}\nContinue restore?`)) return;
+ const preflight = await post("/api/restore/preflight", { path:file.path, dest:mode === "destination" ? destValue : "" });
+ const warning = preflight.issues?.length ? `${preflight.issues.join("\n")}\nSuggested quarantine: ${preflight.quarantine_path}` : preflight.warning;
+ if(warning && !confirm(`${warning}\nContinue restore?`)) return;
  const dest = mode === "destination" ? destValue : "";
  setRestoreStatus(`Starting restore for ${file.relative_path || file.path}...`, "warn");
  const out = await post("/api/restore/start", { path:file.path, dest:dest || null });
@@ -2979,6 +3211,7 @@ function settingsForm(s){
  </div><div class="toolbar-right"><button id="saveSettingsButton" class="primary" onclick="saveSettings()" disabled><span class="ui-icon">&#128190;</span>Save Settings</button><button id="resetSettingsButton" onclick="render()" disabled><span class="ui-icon">&#8635;</span>Reset</button></div></div>
  <div id="tabGeneral" class="tab-panel active"><h2 class="section-title"><span class="ui-icon">&#10003;</span>Basic</h2><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#127912;</span>UI template</span><select id="setUiTheme" onchange="applyTheme(this.value)">${themeOptions(s.ui_theme || "harbor_light")}</select></label>
+  <label><input id="setReducedMotion" type="checkbox" ${s.ui_reduced_motion?"checked":""} onchange="document.documentElement.dataset.reducedMotion=this.checked ? 'true' : 'false'"> <span class="ui-icon">&#128065;</span>Reduce motion</label>
   <label class="field"><span><span class="ui-icon">&#128101;</span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
   <label class="field"><span><span class="ui-icon">&#129513;</span>Article size</span><div class="range-field"><input id="setArticleSizeKib" type="range" min="100" max="5120" step="100" value="${esc(bytesToKib(s.article_size || 786432))}" oninput="setArticleSizeLabel.textContent=articleSizeLabel(this.value)"><span id="setArticleSizeLabel">${esc(articleSizeLabel(bytesToKib(s.article_size || 786432)))}</span></div></label>
   <label class="field"><span><span class="ui-icon">&#128225;</span>NNTP threads</span><div class="range-field"><input id="setNntpThreads" type="range" min="1" max="50" step="1" value="${esc(s.nntp_threads || 4)}" oninput="setNntpThreadsLabel.textContent=countLabel(this.value, 'threads')"><span id="setNntpThreadsLabel">${esc(countLabel(s.nntp_threads || 4, "threads"))}</span></div></label>
@@ -3047,6 +3280,9 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128274;</span>Web UI role</span><select id="setWebUiRole"><option value="admin" ${s.web_ui_role==="admin"?"selected":""}>Admin</option><option value="operator" ${s.web_ui_role==="operator"?"selected":""}>Operator</option><option value="read_only" ${s.web_ui_role==="read_only"?"selected":""}>Read Only</option></select></label>
   <label class="field"><span><span class="ui-icon">&#128273;</span>Web UI password</span><input id="setWebUiPassword" type="password" value="" autocomplete="new-password" placeholder="${s.has_web_ui_password ? "stored; leave blank to keep" : "optional"}"></label>
   <label><input id="clearWebUiPassword" type="checkbox"> <span class="ui-icon">&#128465;</span>Disable Web UI password</label>
+  <label><input id="setReadOnlyMode" type="checkbox" ${s.read_only_mode?"checked":""}> <span class="ui-icon">&#128274;</span>Read-only mode</label>
+  ${s.read_only_mode ? `<div class="chart-card full"><h3><span class="ui-icon">&#128274;</span>Read-only safety mode is on</h3><p class="muted">Most write actions are blocked until read-only mode is disabled with this dedicated control.</p><div class="toolbar"><button class="warn" onclick="disableReadOnlyMode()"><span class="ui-icon">&#128275;</span>Disable Read-only Mode</button></div></div>` : ""}
+  <label class="field"><span><span class="ui-icon">&#128273;</span>TOTP secret env</span><input id="setWebUiTotpSecretEnv" value="${esc(s.web_ui_totp_secret_env || "BACKUPRR_TOTP_SECRET")}"></label>
   <label class="field full"><span><span class="ui-icon">&#128274;</span>Config secret key environment variable</span><input id="setConfigSecretKeyEnv" value="${esc(s.config_secret_key_env || "BACKUPRR_CONFIG_SECRET")}"></label>
   <label><input id="setAuditMode" type="checkbox" ${s.audit_mode?"checked":""}> <span class="ui-icon">&#128221;</span>Enable signed audit events</label>
   <label class="field"><span><span class="ui-icon">&#128273;</span>Audit secret env</span><input id="setAuditSecretKeyEnv" value="${esc(s.audit_secret_key_env || "BACKUPRR_AUDIT_SECRET")}"></label>
@@ -3058,6 +3294,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128273;</span>Manifest export secret env</span><input id="setManifestExportPassphraseEnv" value="${esc(s.manifest_export_passphrase_env || "BACKUPRR_MANIFEST_EXPORT_SECRET")}"></label>
   <label class="field"><span><span class="ui-icon">&#9201;</span>Manifest export interval seconds</span><input id="setManifestExportInterval" type="number" min="3600" value="${esc(s.manifest_export_interval_seconds || 86400)}"></label>
   <label class="field full"><span><span class="ui-icon">&#128273;</span>Replace external API keys, one per line. Leave blank to keep existing keys.</span><textarea id="setExternalApiKeys" placeholder="Paste Home Assistant or automation API keys here"></textarea></label>
+ <label class="field full"><span><span class="ui-icon">&#128273;</span>External API key scopes JSON. Keys are full API keys, values are scopes: read, backup, scan, verify, restore, admin.</span><textarea id="setExternalApiKeyScopes">${esc(JSON.stringify(s.external_api_key_scopes || {}, null, 2))}</textarea></label>
  <label><input id="clearExternalApiKeys" type="checkbox"> <span class="ui-icon">&#128465;</span>Clear all stored external API keys</label>
   <div class="chart-card full"><h3><span class="ui-icon">&#128260;</span>Update checks</h3><p class="muted">Backuprr checks GitHub releases on the configured schedule and stores the latest result locally.</p><div class="toolbar"><button onclick="post('/api/update-check/run').then(out=>settingsOut.textContent=JSON.stringify(out,null,2))"><span class="ui-icon">&#128260;</span>Check Now</button></div></div>
   <label><input id="setUpdateCheckEnabled" type="checkbox" ${s.update_check_enabled === false ? "" : "checked"}> <span class="ui-icon">&#128260;</span>Enable GitHub update checks</label>
@@ -3285,6 +3522,7 @@ async function saveSettings(){
   usenet_retry_backoff_seconds: Number(setRetryBackoff.value),
   provider_retry_policy: JSON.parse(setProviderRetryPolicy.value || "{}"),
   ui_theme: setUiTheme.value,
+  ui_reduced_motion: setReducedMotion.checked,
   update_check_enabled: setUpdateCheckEnabled.checked,
   update_github_repo: setUpdateGithubRepo.value,
   update_github_token_env: setUpdateGithubTokenEnv.value,
@@ -3293,6 +3531,8 @@ async function saveSettings(){
   web_ui_role: setWebUiRole.value,
   web_ui_password: setWebUiPassword.value,
   clear_web_ui_password: !!document.getElementById("clearWebUiPassword")?.checked,
+  web_ui_totp_secret_env: setWebUiTotpSecretEnv.value,
+  read_only_mode: setReadOnlyMode.checked,
   config_secret_key_env: setConfigSecretKeyEnv.value,
   audit_mode: setAuditMode.checked,
   audit_secret_key_env: setAuditSecretKeyEnv.value,
@@ -3332,6 +3572,7 @@ async function saveSettings(){
   payload.external_api_keys = externalKeys;
   payload.clear_external_api_keys = !!document.getElementById("clearExternalApiKeys")?.checked;
  }
+ payload.external_api_key_scopes = JSON.parse(setExternalApiKeyScopes.value || "{}");
  let out;
  try{
   const validation = await post("/api/settings/validate", payload);
@@ -3349,6 +3590,14 @@ async function saveSettings(){
  if(out.ok){
   applyTheme(settingsCache.ui_theme);
   setSettingsDirty(false);
+ }
+}
+async function disableReadOnlyMode(){
+ const out = await post("/api/settings", { read_only_mode:false });
+ settingsOut.textContent = JSON.stringify(out, null, 2);
+ if(out.ok){
+  settingsCache = out.settings;
+  render();
  }
 }
 render();

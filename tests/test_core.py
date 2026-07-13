@@ -34,13 +34,17 @@ from backuprr.operations import (
     check_usenet_hosts,
     audit_event,
     backup_manifest_export,
+    backup_readiness_report,
     db_growth_report,
     diagnostics_bundle,
     disaster_recovery_report,
     dry_run_plan,
     file_integrity_receipt,
     provider_failover_simulation,
+    config_history_rows,
+    maintenance_schedule_report,
     notification_alerts,
+    record_config_history,
     retention_policy_for_path,
     threat_model_report,
     prometheus_metrics,
@@ -58,7 +62,7 @@ from backuprr.queueing import enqueue_unbacked, excluded_by_auto_queue_filter, p
 from backuprr.restore import restore_file, restore_sample, restored_payloads
 from backuprr.scanner import scan_all
 from backuprr.update_checker import check_for_updates, compare_versions, update_result
-from backuprr.web import Handler, ResponseZipWriter, hourly_post_budget, thread_usage_summary, throughput_summary
+from backuprr.web import Handler, ResponseZipWriter, hourly_post_budget, thread_usage_summary, throughput_summary, totp_valid
 
 
 class FakePostClient:
@@ -183,7 +187,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.80")
+        self.assertEqual(__version__, "0.2.82")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -266,6 +270,11 @@ class CoreTests(unittest.TestCase):
         result = check_for_updates(self.db, self.config, opener=lambda *_args, **_kwargs: self.fail("network should not be used"))
         self.assertEqual(result["status"], "disabled")
         self.assertEqual(update_result(self.db)["status"], "disabled")
+
+    def test_totp_validation_accepts_current_code(self):
+        secret = "JBSWY3DPEHPK3PXP"
+        self.assertTrue(totp_valid(secret, "996554", now=59))
+        self.assertFalse(totp_valid(secret, "000000", now=59))
 
     def test_response_zip_writer_supports_streamed_zip_downloads(self):
         buffer = io.BytesIO()
@@ -1612,6 +1621,7 @@ class CoreTests(unittest.TestCase):
                 "provider_retry_policy": {"network": {"attempts": 3, "backoff_seconds": 30}},
                 "queue_strategy": "folder-first",
                 "ui_theme": "nordic_mint",
+                "ui_reduced_motion": True,
                 "log_retention_days": 40,
                 "verbose_log_retention_days": 5,
                 "restore_drill_interval_days": 9,
@@ -1631,11 +1641,14 @@ class CoreTests(unittest.TestCase):
                 "retention_policy_patterns": ["critical:*.iso:14"],
                 "critical_verification_interval_days": 14,
                 "external_api_keys": ["ha-key", "automation-key"],
+                "external_api_key_scopes": {"ha-key": ["read", "backup"], "automation-key": ["read"]},
                 "api_rate_limit_per_minute": 240,
                 "external_api_rate_limit_per_minute": 80,
                 "web_ui_username": "operator",
                 "web_ui_password": "ui-secret",
                 "web_ui_role": "operator",
+                "web_ui_totp_secret_env": "BACKUPRR_TEST_TOTP",
+                "read_only_mode": True,
                 "config_secret_key_env": "BACKUPRR_TEST_CONFIG_SECRET",
                 "restore_sandbox_enabled": True,
                 "restore_sandbox_path": str(self.root / "sandbox"),
@@ -1700,6 +1713,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.provider_retry_policy["network"]["attempts"], 3)
         self.assertEqual(self.config.queue_strategy, "folder-first")
         self.assertEqual(self.config.ui_theme, "nordic_mint")
+        self.assertTrue(self.config.ui_reduced_motion)
         self.assertEqual(self.config.log_retention_days, 40)
         self.assertEqual(self.config.verbose_log_retention_days, 5)
         self.assertEqual(self.config.restore_drill_interval_days, 9)
@@ -1719,11 +1733,14 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.retention_policy_patterns, ["critical:*.iso:14"])
         self.assertEqual(self.config.critical_verification_interval_days, 14)
         self.assertEqual(self.config.external_api_keys, ["ha-key", "automation-key"])
+        self.assertEqual(self.config.external_api_key_scopes["ha-key"], ["backup", "read"])
         self.assertEqual(self.config.api_rate_limit_per_minute, 240)
         self.assertEqual(self.config.external_api_rate_limit_per_minute, 80)
         self.assertEqual(self.config.web_ui_username, "operator")
         self.assertEqual(self.config.web_ui_password, "ui-secret")
         self.assertEqual(self.config.web_ui_role, "operator")
+        self.assertEqual(self.config.web_ui_totp_secret_env, "BACKUPRR_TEST_TOTP")
+        self.assertTrue(self.config.read_only_mode)
         self.assertEqual(self.config.config_secret_key_env, "BACKUPRR_TEST_CONFIG_SECRET")
         self.assertTrue(self.config.restore_sandbox_enabled)
         self.assertEqual(self.config.restore_sandbox_path, str(self.root / "sandbox"))
@@ -1852,6 +1869,25 @@ class CoreTests(unittest.TestCase):
         self.config.audit_mode = True
         audit_event(self.db, self.config, "tester", "unit.action", {"file_id": file_id})
         self.assertEqual(len(self.db.list_events(["info"], event_types=["audit"])), 1)
+
+    def test_readiness_maintenance_and_config_history_reports(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 3, "abc", "[hidden]")
+        readiness = backup_readiness_report(self.db, self.config)
+        self.assertIn("score", readiness)
+        schedule = maintenance_schedule_report(self.db, self.config)
+        self.assertIn("estimated_reclaimable_hint_bytes", schedule)
+        record_config_history(self.db, "tester", ["read_only_mode", "web_ui_role"])
+        history = config_history_rows(self.db)
+        self.assertEqual(history[0]["actor"], "tester")
+        self.assertIn("read_only_mode", history[0]["keys"])
 
     def test_log_forwarding_payloads_match_platform(self):
         event = {

@@ -21,6 +21,7 @@ from .usenet import UsenetClient
 ARTICLE_TEST_MIN_BYTES = 100 * 1024
 ARTICLE_TEST_MAX_BYTES = 5 * 1024 * 1024
 ARTICLE_TEST_STEP_BYTES = 100 * 1024
+CONFIG_HISTORY_KEY = "config_history"
 
 
 def dry_run_plan(db: Database, config: Config) -> Dict[str, Any]:
@@ -134,6 +135,7 @@ def setup_health_check(db: Database, config: Config) -> Dict[str, Any]:
         {"id": "provider-tested", "label": "Provider health checked", "ok": bool(host_rows), "detail": "run Check hosts + article size" if not host_rows else f"{len(host_rows)} recent check(s)"},
         {"id": "external-api", "label": "External API key configured", "ok": bool(config.external_api_keys), "detail": f"{len(config.external_api_keys)} key(s)"},
         {"id": "web-auth", "label": "Web UI password enabled", "ok": bool(config.web_ui_password), "detail": "optional but recommended on LAN/container deployments"},
+        {"id": "read-only", "label": "Read-only mode disabled", "ok": not bool(getattr(config, "read_only_mode", False)), "detail": "read-only mode is active" if getattr(config, "read_only_mode", False) else "writes enabled"},
         {"id": "cloud-backup", "label": "Config/database cloud backup configured", "ok": bool(config.cloud_backups), "detail": f"{len(config.cloud_backups)} target(s)"},
         {"id": "recovery", "label": "Disaster recovery readiness", "ok": bool(recovery["ok"]), "detail": "; ".join(recovery["issues"]) if recovery["issues"] else "ready"},
     ]
@@ -154,7 +156,25 @@ def notification_alerts(db: Database, config: Config) -> List[Dict[str, Any]]:
         alerts.append({"level": "info", "title": "No config/database cloud backup", "detail": "add a cloud target so the catalog can be recovered after host loss"})
     if not config.web_ui_password:
         alerts.append({"level": "info", "title": "Web UI password disabled", "detail": "enable Web UI auth before exposing the app beyond localhost"})
+    if getattr(config, "read_only_mode", False):
+        alerts.append({"level": "warning", "title": "Read-only mode enabled", "detail": "posting, restore-to-origin, queue changes, and settings writes are disabled"})
     return alerts
+
+
+def secret_health_report(config: Config) -> List[Dict[str, Any]]:
+    key_env = getattr(config, "config_secret_key_env", "BACKUPRR_CONFIG_SECRET")
+    rows = [
+        {"name": "Config secret protection", "ok": bool(os.getenv(key_env)), "detail": f"{key_env} {'is set' if os.getenv(key_env) else 'is not set'}"},
+        {"name": "Web UI password", "ok": bool(config.web_ui_password), "detail": "configured" if config.web_ui_password else "not configured"},
+        {"name": "TOTP admin step-up", "ok": bool(os.getenv(getattr(config, "web_ui_totp_secret_env", "BACKUPRR_TOTP_SECRET"))), "detail": getattr(config, "web_ui_totp_secret_env", "BACKUPRR_TOTP_SECRET")},
+        {"name": "External API keys", "ok": bool(config.external_api_keys), "detail": f"{len(config.external_api_keys)} key(s)"},
+        {"name": "Manifest export encryption", "ok": (not config.manifest_export_encrypt) or bool(os.getenv(config.manifest_export_passphrase_env)), "detail": config.manifest_export_passphrase_env},
+    ]
+    if config.encrypt_bodies:
+        rows.append({"name": "Body encryption passphrase", "ok": bool(os.getenv(config.encryption_passphrase_env)), "detail": config.encryption_passphrase_env})
+    provider_passwords = sum(1 for host in config.usenet_hosts if host.password)
+    rows.append({"name": "Provider credentials", "ok": provider_passwords > 0, "detail": f"{provider_passwords} stored credential(s)"})
+    return rows
 
 
 def diagnostics_bundle(db: Database, config: Config) -> Dict[str, Any]:
@@ -253,8 +273,10 @@ def provider_failover_simulation(config: Config, failed_host: str = "") -> Dict[
 def threat_model_report(db: Database, config: Config) -> Dict[str, Any]:
     """Return the deployment assumptions and mitigations Backuprr can currently see."""
     stats = db.stats()
+    secrets = secret_health_report(config)
     mitigations = [
         {"area": "Web UI", "status": "ok" if config.web_ui_password else "warning", "detail": "Basic Auth enabled" if config.web_ui_password else "No Web UI password configured"},
+        {"area": "TOTP", "status": "ok" if os.getenv(getattr(config, "web_ui_totp_secret_env", "BACKUPRR_TOTP_SECRET")) else "warning", "detail": "Admin actions require TOTP" if os.getenv(getattr(config, "web_ui_totp_secret_env", "BACKUPRR_TOTP_SECRET")) else "TOTP env not configured"},
         {"area": "Internal API", "status": "ok", "detail": "Browser AJAX calls require an in-memory token and CSRF token"},
         {"area": "External API", "status": "ok" if config.external_api_keys else "warning", "detail": f"{len(config.external_api_keys)} API key(s) configured"},
         {"area": "Secrets", "status": "ok" if os.getenv(config.config_secret_key_env) else "warning", "detail": f"Config secret env {config.config_secret_key_env} {'is set' if os.getenv(config.config_secret_key_env) else 'is not set'}"},
@@ -273,8 +295,85 @@ def threat_model_report(db: Database, config: Config) -> Dict[str, Any]:
             "Exposure of the Web UI through an unauthenticated reverse proxy.",
         ],
         "mitigations": mitigations,
+        "secret_health": secrets,
         "recommendations": [item["detail"] for item in mitigations if item["status"] != "ok"],
     }
+
+
+def backup_readiness_report(db: Database, config: Config) -> Dict[str, Any]:
+    stats = db.stats()
+    total = max(1, int(stats.get("files_total", 0) or 0))
+    backed = int(stats.get("files_backed_up", 0) or 0)
+    missing = int(stats.get("chunks_missing", 0) or 0)
+    attention = int(stats.get("queue_attention_count", 0) or 0)
+    verified_chunks = int(stats.get("chunks_verified", 0) or 0)
+    chunks = max(1, int(stats.get("chunks_total", 0) or 0))
+    score = int((backed / total) * 55) + int((verified_chunks / chunks) * 25)
+    if config.par2.get("enabled"):
+        score += 10
+    if config.cloud_backups:
+        score += 5
+    if config.restore_sandbox_enabled:
+        score += 5
+    score -= min(40, missing * 5 + attention * 3)
+    folders = []
+    for row in db.folder_rollups(25):
+        item = dict(row)
+        files = max(1, int(item.get("files") or 0))
+        folder_score = int((int(item.get("backed_up_files") or 0) / files) * 60) + int((int(item.get("verified_files") or 0) / files) * 25)
+        folder_score += min(10, int(item.get("par2_files") or 0))
+        folder_score -= min(30, int(item.get("attention_files") or 0) * 5)
+        folders.append({**item, "readiness_score": max(0, min(100, folder_score))})
+    return {
+        "score": max(0, min(100, score)),
+        "files_total": int(stats.get("files_total", 0) or 0),
+        "files_backed_up": backed,
+        "chunks_total": int(stats.get("chunks_total", 0) or 0),
+        "chunks_verified": verified_chunks,
+        "chunks_missing": missing,
+        "queue_attention": attention,
+        "folders": folders,
+    }
+
+
+def maintenance_schedule_report(db: Database, config: Config) -> Dict[str, Any]:
+    rows = db.maintenance_rows(10)
+    tables = db.table_stats()
+    reclaimable_hint = sum(int(dict(row).get("estimated_bytes") or 0) for row in tables if str(dict(row).get("table")) in {"events", "transfer_samples", "chunks"})
+    return {
+        "last_runs": [dict(row) for row in rows],
+        "next_interval_seconds": int(config.maintenance_interval_seconds or 0),
+        "estimated_reclaimable_hint_bytes": reclaimable_hint,
+        "vacuum_note": "Vacuum after large chunk compaction or log pruning to return space to the filesystem.",
+    }
+
+
+def config_history_rows(db: Database, limit: int = 20) -> List[Dict[str, Any]]:
+    try:
+        rows = json.loads(db.get_meta(CONFIG_HISTORY_KEY) or "[]")
+    except json.JSONDecodeError:
+        rows = []
+    return list(rows)[-limit:][::-1]
+
+
+def record_config_history(db: Database, actor: str, keys: List[str]) -> None:
+    rows = config_history_rows(db, 200)[::-1]
+    rows.append({"ts": utcnow(), "actor": actor, "keys": sorted(set(keys))})
+    db.set_meta(CONFIG_HISTORY_KEY, json.dumps(rows[-200:], sort_keys=True))
+
+
+def restore_preflight(db: Database, config: Config, source_path: str, dest: str = "") -> Dict[str, Any]:
+    plan = restore_plan(db, source_path, dest)
+    issues = []
+    if not plan["restorable"]:
+        issues.append("file is not currently considered restorable")
+    if plan["will_overwrite"] and not config.restore_sandbox_enabled:
+        issues.append("restore would overwrite an existing file without restore sandbox enabled")
+    if getattr(config, "read_only_mode", False) and not dest:
+        issues.append("read-only mode blocks restore-to-origin")
+    quarantine_recommended = bool(issues or plan["missing_chunks"])
+    quarantine_path = str(Path(config.restore_sandbox_path or (Path(plan["path"]).parent / ".backuprr-quarantine")) / Path(plan["path"]).name)
+    return {**plan, "issues": issues, "quarantine_recommended": quarantine_recommended, "quarantine_path": quarantine_path}
 
 
 def db_growth_report(db: Database, config: Config) -> Dict[str, Any]:
