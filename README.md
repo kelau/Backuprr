@@ -311,6 +311,10 @@ Integrations such as Home Assistant should use `/external-api/*` with either
 `X-API-Key: <key>` or `Authorization: Bearer <key>`. Configure keys in Settings
 or in `config.json` under `external_api_keys`.
 
+For private GitHub repositories, update checks need a token in the app process
+environment. Set the configured token environment variable, defaulting to
+`GITHUB_TOKEN`, or `GH_TOKEN` before starting Backuprr.
+
 Available integration endpoints:
 
 - `GET /external-api/status`

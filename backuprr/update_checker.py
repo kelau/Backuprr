@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict
@@ -50,6 +51,27 @@ def latest_release_url(config: Config) -> str:
     return f"https://api.github.com/repos/{repo}/releases/latest"
 
 
+def latest_tags_url(config: Config) -> str:
+    repo = str(config.update_github_repo or "").strip().strip("/")
+    return f"https://api.github.com/repos/{repo}/tags?per_page=1"
+
+
+def github_token(config: Config) -> str:
+    env_name = str(getattr(config, "update_github_token_env", "GITHUB_TOKEN") or "GITHUB_TOKEN").strip()
+    return os.getenv(env_name) or os.getenv("GH_TOKEN") or ""
+
+
+def github_json(url: str, current: str, timeout: int, config: Config, opener=urlopen) -> Dict[str, Any] | list[Any]:
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": f"Backuprr/{current}"}
+    token = github_token(config)
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+        headers["X-GitHub-Api-Version"] = "2022-11-28"
+    request = Request(url, headers=headers)
+    with opener(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
 def check_for_updates(db: Database, config: Config, opener=urlopen) -> Dict[str, Any]:
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     current = __version__
@@ -59,9 +81,22 @@ def check_for_updates(db: Database, config: Config, opener=urlopen) -> Dict[str,
         return result
     url = latest_release_url(config)
     try:
-        request = Request(url, headers={"Accept": "application/vnd.github+json", "User-Agent": f"Backuprr/{current}"})
-        with opener(request, timeout=int(config.update_check_timeout_seconds)) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        timeout = int(config.update_check_timeout_seconds)
+        source_kind = "release"
+        try:
+            payload = github_json(url, current, timeout, config, opener)
+        except HTTPError as exc:
+            if exc.code != 404:
+                raise
+            tag_url = latest_tags_url(config)
+            tags = github_json(tag_url, current, timeout, config, opener)
+            if not isinstance(tags, list) or not tags:
+                raise ValueError("GitHub returned no releases or tags for the configured repository") from exc
+            payload = tags[0]
+            url = tag_url
+            source_kind = "tag"
+        if not isinstance(payload, dict):
+            raise ValueError("GitHub response did not include a release object")
         latest = normalize_version(str(payload.get("tag_name") or payload.get("name") or ""))
         if not latest:
             raise ValueError("GitHub response did not include a release tag")
@@ -77,10 +112,14 @@ def check_for_updates(db: Database, config: Config, opener=urlopen) -> Dict[str,
             "published_at": payload.get("published_at") or "",
             "body": payload.get("body") or "",
             "source": url,
+            "source_kind": source_kind,
         }
         db.log("info" if available else "debug", "update.check", f"Update check completed: latest={latest}, current={current}, available={available}")
     except (HTTPError, URLError, OSError, TimeoutError, ValueError, json.JSONDecodeError) as exc:
-        result = {"status": "error", "checked_at": now, "current_version": current, "error": str(exc), "source": url}
+        error = str(exc)
+        if isinstance(exc, HTTPError) and exc.code == 404 and not github_token(config):
+            error = f"{exc}. If the repository is private, set {getattr(config, 'update_github_token_env', 'GITHUB_TOKEN')} or GH_TOKEN for update checks."
+        result = {"status": "error", "checked_at": now, "current_version": current, "error": error, "source": url}
         db.log("warning", "update.check", f"Update check failed: {exc}")
     save_update_result(db, result)
     return result

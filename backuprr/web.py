@@ -1298,6 +1298,8 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.80":["GitHub update checks can use a token environment variable for private repositories."],
+ "0.2.79":["GitHub update checks now fall back to repository tags when no formal latest release exists."],
  "0.2.78":["Added threat model reporting, CSRF protection, API rate limits, operation cancellation, incident mode, restore rehearsal, failover simulation, settings profiles, queue pause patterns, and retention hints."],
  "0.2.77":["Added role-gated web actions, manifest export, provider confidence, restore sandbox mode, integrity receipts, retry policy controls, signed audit events, safer bulk previews, and database growth reporting."],
  "0.2.76":["Added setup health checks, alerts, diagnostics export, optional Web UI Basic Auth, opt-in config secret protection, folder rollups, dry-run warnings, and restore drill rotation improvements."],
@@ -3060,6 +3062,7 @@ function settingsForm(s){
   <div class="chart-card full"><h3><span class="ui-icon">&#128260;</span>Update checks</h3><p class="muted">Backuprr checks GitHub releases on the configured schedule and stores the latest result locally.</p><div class="toolbar"><button onclick="post('/api/update-check/run').then(out=>settingsOut.textContent=JSON.stringify(out,null,2))"><span class="ui-icon">&#128260;</span>Check Now</button></div></div>
   <label><input id="setUpdateCheckEnabled" type="checkbox" ${s.update_check_enabled === false ? "" : "checked"}> <span class="ui-icon">&#128260;</span>Enable GitHub update checks</label>
   <label class="field"><span><span class="ui-icon">&#128279;</span>GitHub repository</span><input id="setUpdateGithubRepo" value="${esc(s.update_github_repo || "kelau/Backuprr")}" placeholder="owner/repo"></label>
+  <label class="field"><span><span class="ui-icon">&#128273;</span>GitHub token env</span><input id="setUpdateGithubTokenEnv" value="${esc(s.update_github_token_env || "GITHUB_TOKEN")}" placeholder="GITHUB_TOKEN"></label>
   <label class="field"><span><span class="ui-icon">&#9201;</span>Update check timeout seconds</span><input id="setUpdateCheckTimeout" type="number" min="1" max="60" value="${esc(s.update_check_timeout_seconds || 10)}"></label>
   <div class="chart-card full"><h3><span class="ui-icon">&#128230;</span>Settings profiles</h3><p class="muted">Export a redacted settings profile or import one to quickly clone safe defaults between installs.</p><div class="toolbar"><button onclick="downloadSettingsProfile()"><span class="ui-icon">&#8681;</span>Export profile</button><button onclick="document.getElementById('settingsProfileImport').click()"><span class="ui-icon">&#8679;</span>Import profile</button><input id="settingsProfileImport" type="file" accept="application/json" class="hidden" onchange="importSettingsProfile(this.files[0])"></div></div>
  </div></div>
@@ -3284,6 +3287,7 @@ async function saveSettings(){
   ui_theme: setUiTheme.value,
   update_check_enabled: setUpdateCheckEnabled.checked,
   update_github_repo: setUpdateGithubRepo.value,
+  update_github_token_env: setUpdateGithubTokenEnv.value,
   update_check_timeout_seconds: Number(setUpdateCheckTimeout.value),
   web_ui_username: setWebUiUsername.value,
   web_ui_role: setWebUiRole.value,

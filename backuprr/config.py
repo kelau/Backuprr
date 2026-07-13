@@ -189,6 +189,7 @@ class Config:
     ui_theme: str = "harbor_light"
     update_check_enabled: bool = True
     update_github_repo: str = "kelau/Backuprr"
+    update_github_token_env: str = "GITHUB_TOKEN"
     update_check_timeout_seconds: int = 10
     usenet_hosts: List[UsenetHost] = field(default_factory=list)
     cloud_backups: List[CloudBackupTarget] = field(default_factory=list)
@@ -299,6 +300,7 @@ class Config:
             "ui_theme": self.ui_theme,
             "update_check_enabled": self.update_check_enabled,
             "update_github_repo": self.update_github_repo,
+            "update_github_token_env": self.update_github_token_env,
             "update_check_timeout_seconds": self.update_check_timeout_seconds,
             "usenet_hosts": [host.__dict__ for host in self.usenet_hosts],
             "cloud_backups": [target.__dict__ for target in self.cloud_backups],
@@ -551,6 +553,8 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", repo):
             raise ValueError("update_github_repo must be in owner/repo format")
         config.update_github_repo = repo
+    if "update_github_token_env" in data:
+        config.update_github_token_env = str(data["update_github_token_env"] or "GITHUB_TOKEN").strip() or "GITHUB_TOKEN"
     if "update_check_timeout_seconds" in data:
         timeout = int(data["update_check_timeout_seconds"])
         if timeout < 1 or timeout > 60:

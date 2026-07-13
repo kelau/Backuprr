@@ -9,6 +9,7 @@ import zipfile
 import zlib
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from backuprr import __version__
 from backuprr.backup import (
@@ -182,7 +183,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.78")
+        self.assertEqual(__version__, "0.2.80")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -228,6 +229,37 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(update_result(self.db)["latest_version"], "9.9.9")
         self.assertEqual(requests[0][1], self.config.update_check_timeout_seconds)
         self.assertIn("/repos/kelau/Backuprr/releases/latest", requests[0][0].full_url)
+
+    def test_update_checker_falls_back_to_tags_when_latest_release_missing(self):
+        urls = []
+
+        def fake_opener(request, timeout):
+            urls.append(request.full_url)
+            if request.full_url.endswith("/releases/latest"):
+                raise HTTPError(request.full_url, 404, "Not Found", hdrs=None, fp=None)
+            return FakeGitHubResponse([{"name": "v9.8.7", "commit": {"sha": "abc123"}}])
+
+        result = check_for_updates(self.db, self.config, opener=fake_opener)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["latest_version"], "9.8.7")
+        self.assertEqual(result["source_kind"], "tag")
+        self.assertTrue(urls[1].endswith("/tags?per_page=1"))
+
+    def test_update_checker_sends_token_from_configured_environment(self):
+        seen_auth = []
+        os.environ["BACKUPRR_TEST_GITHUB_TOKEN"] = "private-token"
+        self.config.update_github_token_env = "BACKUPRR_TEST_GITHUB_TOKEN"
+
+        def fake_opener(request, timeout):
+            seen_auth.append(request.headers.get("Authorization"))
+            return FakeGitHubResponse({"tag_name": "v9.9.9", "html_url": "https://example.test/release"})
+
+        try:
+            result = check_for_updates(self.db, self.config, opener=fake_opener)
+        finally:
+            os.environ.pop("BACKUPRR_TEST_GITHUB_TOKEN", None)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(seen_auth, ["Bearer private-token"])
 
     def test_update_checker_can_be_disabled(self):
         self.config.update_check_enabled = False
@@ -1592,6 +1624,7 @@ class CoreTests(unittest.TestCase):
                 "compression_min_gain_percent": 12,
                 "update_check_enabled": True,
                 "update_github_repo": "example/Backuprr",
+                "update_github_token_env": "BACKUPRR_TEST_GITHUB_TOKEN",
                 "update_check_timeout_seconds": 12,
                 "auto_queue_exclude_patterns": ["*.sample", ".tmp"],
                 "queue_pause_patterns": ["*.iso"],
@@ -1679,6 +1712,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.compression_min_gain_percent, 12)
         self.assertTrue(self.config.update_check_enabled)
         self.assertEqual(self.config.update_github_repo, "example/Backuprr")
+        self.assertEqual(self.config.update_github_token_env, "BACKUPRR_TEST_GITHUB_TOKEN")
         self.assertEqual(self.config.update_check_timeout_seconds, 12)
         self.assertEqual(self.config.auto_queue_exclude_patterns, ["*.sample", ".tmp"])
         self.assertEqual(self.config.queue_pause_patterns, ["*.iso"])
