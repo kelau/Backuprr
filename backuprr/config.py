@@ -117,6 +117,7 @@ class Config:
     log_web_access: bool = False
     log_chunk_events: bool = False
     compact_chunk_metadata: bool = True
+    compact_chunk_rows: bool = True
     transfer_sample_bucket_seconds: int = 60
     compression_sample_bytes: int = 2 * 1024 * 1024
     compression_min_gain_percent: int = 5
@@ -201,6 +202,7 @@ class Config:
             "log_web_access": self.log_web_access,
             "log_chunk_events": self.log_chunk_events,
             "compact_chunk_metadata": self.compact_chunk_metadata,
+            "compact_chunk_rows": self.compact_chunk_rows,
             "transfer_sample_bucket_seconds": self.transfer_sample_bucket_seconds,
             "compression_sample_bytes": self.compression_sample_bytes,
             "compression_min_gain_percent": self.compression_min_gain_percent,
@@ -348,6 +350,8 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         config.log_chunk_events = bool(data["log_chunk_events"])
     if "compact_chunk_metadata" in data:
         config.compact_chunk_metadata = bool(data["compact_chunk_metadata"])
+    if "compact_chunk_rows" in data:
+        config.compact_chunk_rows = bool(data["compact_chunk_rows"])
     if "transfer_sample_bucket_seconds" in data:
         seconds = int(data["transfer_sample_bucket_seconds"])
         if seconds < 1 or seconds > 3600:

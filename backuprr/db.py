@@ -1,12 +1,13 @@
 import json
 import sqlite3
+import gzip
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 STALE_POSTING_SECONDS = 15 * 60
 
 
@@ -56,6 +57,9 @@ class Database:
         chunk_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
         if "article_size" not in chunk_columns:
             conn.execute("ALTER TABLE chunks ADD COLUMN article_size INTEGER")
+        manifest_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunk_manifests)").fetchall()}
+        if manifest_columns and "missing_count" not in manifest_columns:
+            conn.execute("ALTER TABLE chunk_manifests ADD COLUMN missing_count INTEGER NOT NULL DEFAULT 0")
         host_stats_columns = {row["name"] for row in conn.execute("PRAGMA table_info(host_stats)").fetchall()}
         if host_stats_columns and "article_size_bytes" not in host_stats_columns:
             conn.execute("ALTER TABLE host_stats ADD COLUMN article_size_bytes INTEGER")
@@ -542,11 +546,12 @@ class Database:
             return conn.execute(
                 f"""
                 SELECT q.*, f.path, f.relative_path, f.size, f.state,
-                       CASE WHEN q.status='posting' THEN q.progress_chunks ELSE COUNT(c.id) END AS posted_chunks,
-                       CASE WHEN q.status='posting' THEN q.progress_bytes ELSE COALESCE(SUM(c.size), 0) END AS posted_bytes
+                       CASE WHEN q.status='posting' THEN q.progress_chunks ELSE COUNT(c.id) + COALESCE(cm.chunk_count, 0) END AS posted_chunks,
+                       CASE WHEN q.status='posting' THEN q.progress_bytes ELSE COALESCE(SUM(c.size), 0) + COALESCE(cm.bytes_total, 0) END AS posted_bytes
                 FROM queue q
                 JOIN files f ON f.id = q.file_id
                 LEFT JOIN chunks c ON c.file_id = f.id
+                LEFT JOIN chunk_manifests cm ON cm.file_id = f.id
                 {where}
                 GROUP BY q.id
                 ORDER BY {order_by}
@@ -1036,6 +1041,82 @@ class Database:
                     (now[:16] + ":00+00:00", "upload", int(size)),
                 )
 
+    def _manifest_blob(self, chunks: Iterable[Dict[str, Any]]) -> bytes:
+        persisted = []
+        for chunk in chunks:
+            persisted.append(
+                {
+                    "chunk_index": int(chunk["chunk_index"]),
+                    "message_id": chunk["message_id"],
+                    "size": int(chunk["size"]),
+                    "sha256": chunk.get("sha256", ""),
+                    "subject": chunk.get("subject", ""),
+                    "status": chunk.get("status", "posted"),
+                    "posted_at": chunk.get("posted_at"),
+                    "article_size": chunk.get("article_size"),
+                    "verified_at": chunk.get("verified_at"),
+                }
+            )
+        payload = json.dumps(persisted, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        return gzip.compress(payload, compresslevel=6)
+
+    def _manifest_entries(self, row: sqlite3.Row) -> List[Dict[str, Any]]:
+        entries = json.loads(gzip.decompress(row["manifest_blob"]).decode("utf-8"))
+        file_id = int(row["file_id"])
+        for entry in entries:
+            entry["file_id"] = file_id
+            entry["id"] = f"manifest:{file_id}:{int(entry['chunk_index'])}"
+        return entries
+
+    def compact_chunks_to_manifest(self, file_id: int) -> int:
+        now = utcnow()
+        with self.connect() as conn:
+            rows = conn.execute("SELECT * FROM chunks WHERE file_id=? ORDER BY chunk_index", (file_id,)).fetchall()
+            if not rows:
+                return 0
+            entries = [
+                {
+                    "chunk_index": int(row["chunk_index"]),
+                    "message_id": row["message_id"],
+                    "size": int(row["size"]),
+                    "sha256": row["sha256"],
+                    "subject": row["subject"],
+                    "status": row["status"],
+                    "posted_at": row["posted_at"],
+                    "article_size": row["article_size"],
+                    "verified_at": row["verified_at"],
+                }
+                for row in rows
+            ]
+            chunk_count = len(entries)
+            bytes_total = sum(int(entry["size"]) for entry in entries)
+            verified_count = sum(1 for entry in entries if entry["status"] == "verified")
+            missing_count = sum(1 for entry in entries if entry["status"] == "missing")
+            article_size = next((entry["article_size"] for entry in entries if entry.get("article_size")), None)
+            conn.execute(
+                """
+                INSERT INTO chunk_manifests(file_id, chunk_count, bytes_total, article_size, verified_count, missing_count, manifest_blob, created_at, updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(file_id) DO UPDATE SET
+                  chunk_count=excluded.chunk_count,
+                  bytes_total=excluded.bytes_total,
+                  article_size=excluded.article_size,
+                  verified_count=excluded.verified_count,
+                  missing_count=excluded.missing_count,
+                  manifest_blob=excluded.manifest_blob,
+                  updated_at=excluded.updated_at
+                """,
+                (file_id, chunk_count, bytes_total, article_size, verified_count, missing_count, self._manifest_blob(entries), now, now),
+            )
+            conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
+            conn.execute("UPDATE files SET updated_at=? WHERE id=?", (now, file_id))
+            return chunk_count
+
+    def chunk_manifest_entries_for_file(self, file_id: int) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM chunk_manifests WHERE file_id=?", (file_id,)).fetchone()
+            return [] if row is None else self._manifest_entries(row)
+
     def reusable_chunk_indexes(self, file_id: int, article_size: int) -> Dict[int, int]:
         with self.connect() as conn:
             rows = conn.execute(
@@ -1050,13 +1131,18 @@ class Database:
 
     def chunk_count_for_file(self, file_id: int) -> int:
         with self.connect() as conn:
-            return int(conn.execute("SELECT COUNT(*) FROM chunks WHERE file_id=?", (file_id,)).fetchone()[0])
+            live = int(conn.execute("SELECT COUNT(*) FROM chunks WHERE file_id=?", (file_id,)).fetchone()[0])
+            if live:
+                return live
+            row = conn.execute("SELECT chunk_count FROM chunk_manifests WHERE file_id=?", (file_id,)).fetchone()
+            return 0 if row is None else int(row["chunk_count"])
 
     def replace_chunks(self, file_id: int, chunks: Iterable[Dict[str, Any]]) -> int:
         now = utcnow()
         chunk_rows = list(chunks)
         with self.connect() as conn:
             conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
+            conn.execute("DELETE FROM chunk_manifests WHERE file_id=?", (file_id,))
             conn.executemany(
                 """
                 INSERT INTO chunks(file_id, chunk_index, message_id, size, sha256, subject, status, posted_at, article_size)
@@ -1084,7 +1170,8 @@ class Database:
     def clear_chunks(self, file_id: int) -> int:
         with self.connect() as conn:
             cur = conn.execute("DELETE FROM chunks WHERE file_id=?", (file_id,))
-            return cur.rowcount
+            manifest = conn.execute("DELETE FROM chunk_manifests WHERE file_id=?", (file_id,))
+            return cur.rowcount + manifest.rowcount
 
     def trim_chunks(self, file_id: int, expected_chunks: int) -> int:
         with self.connect() as conn:
@@ -1140,7 +1227,7 @@ class Database:
 
     def chunks_due_for_verification(self, older_than: str) -> List[sqlite3.Row]:
         with self.connect() as conn:
-            return conn.execute(
+            live = conn.execute(
                 """
                 SELECT c.*, f.path FROM chunks c
                 JOIN files f ON f.id = c.file_id
@@ -1150,6 +1237,26 @@ class Database:
                 """,
                 (older_than,),
             ).fetchall()
+            compact_files = conn.execute(
+                """
+                SELECT cm.*, f.path FROM chunk_manifests cm
+                JOIN files f ON f.id = cm.file_id
+                WHERE cm.missing_count = 0
+                  AND EXISTS (
+                    SELECT 1 FROM files ff
+                    WHERE ff.id=cm.file_id AND (ff.last_verify_at IS NULL OR ff.last_verify_at <= ?)
+                  )
+                ORDER BY f.last_verify_at IS NULL DESC, f.last_verify_at ASC
+                """,
+                (older_than,),
+            ).fetchall()
+        manifest_chunks: List[Dict[str, Any]] = []
+        for row in compact_files:
+            for entry in self._manifest_entries(row):
+                if entry.get("status") != "missing":
+                    entry["path"] = row["path"]
+                    manifest_chunks.append(entry)
+        return list(live) + manifest_chunks
 
     def chunks_due_for_file_verification(self, older_than: str, file_limit: int) -> List[sqlite3.Row]:
         with self.connect() as conn:
@@ -1161,9 +1268,10 @@ class Database:
                            f.relative_path,
                            COALESCE(f.last_verify_at, f.last_backup_at, MIN(c.posted_at), f.updated_at, f.created_at) AS due_basis
                     FROM files f
-                    JOIN chunks c ON c.file_id = f.id
+                    LEFT JOIN chunks c ON c.file_id = f.id
+                    LEFT JOIN chunk_manifests cm ON cm.file_id = f.id
                     WHERE f.state != 'deleted'
-                      AND c.status != 'missing'
+                      AND (c.status != 'missing' OR (cm.file_id IS NOT NULL AND cm.missing_count=0))
                     GROUP BY f.id
                 )
                 WHERE due_basis IS NOT NULL
@@ -1181,7 +1289,7 @@ class Database:
             return []
         placeholders = ",".join("?" for _ in ids)
         with self.connect() as conn:
-            return conn.execute(
+            live = conn.execute(
                 f"""
                 SELECT c.*, f.path FROM chunks c
                 JOIN files f ON f.id = c.file_id
@@ -1191,10 +1299,59 @@ class Database:
                 """,
                 ids,
             ).fetchall()
+            compact_rows = conn.execute(
+                f"""
+                SELECT cm.*, f.path FROM chunk_manifests cm
+                JOIN files f ON f.id = cm.file_id
+                WHERE cm.file_id IN ({placeholders})
+                  AND cm.missing_count=0
+                ORDER BY cm.file_id
+                """,
+                ids,
+            ).fetchall()
+        manifest_chunks: List[Dict[str, Any]] = []
+        for row in compact_rows:
+            for entry in self._manifest_entries(row):
+                if entry.get("status") != "missing":
+                    entry["path"] = row["path"]
+                    manifest_chunks.append(entry)
+        return list(live) + manifest_chunks
 
-    def mark_chunk_verified(self, chunk_id: int, exists: bool) -> None:
+    def mark_chunk_verified(self, chunk_id: Any, exists: bool) -> None:
         status = "verified" if exists else "missing"
         missing_file_id: Optional[int] = None
+        if isinstance(chunk_id, str) and chunk_id.startswith("manifest:"):
+            _, file_text, index_text = chunk_id.split(":", 2)
+            file_id = int(file_text)
+            chunk_index = int(index_text)
+            now = utcnow()
+            with self.connect() as conn:
+                row = conn.execute("SELECT * FROM chunk_manifests WHERE file_id=?", (file_id,)).fetchone()
+                if row is None:
+                    return
+                entries = self._manifest_entries(row)
+                for entry in entries:
+                    if int(entry["chunk_index"]) == chunk_index:
+                        entry["status"] = status
+                        entry["verified_at"] = now
+                verified_count = sum(1 for entry in entries if entry["status"] == "verified")
+                missing_count = sum(1 for entry in entries if entry["status"] == "missing")
+                conn.execute(
+                    """
+                    UPDATE chunk_manifests
+                    SET verified_count=?, missing_count=?, manifest_blob=?, updated_at=?
+                    WHERE file_id=?
+                    """,
+                    (verified_count, missing_count, self._manifest_blob(entries), now, file_id),
+                )
+                if not exists:
+                    conn.execute("UPDATE files SET state='missing_chunks', updated_at=? WHERE id=?", (now, file_id))
+                    missing_file_id = file_id
+                elif missing_count == 0 and verified_count == len(entries):
+                    conn.execute("UPDATE files SET last_verify_at=?, updated_at=? WHERE id=?", (now, now, file_id))
+            if missing_file_id is not None:
+                self.queue_file(missing_file_id, priority=10, reason="missing-chunks")
+            return
         with self.connect() as conn:
             now = utcnow()
             row = conn.execute("SELECT file_id FROM chunks WHERE id=?", (chunk_id,)).fetchone()
@@ -1213,14 +1370,14 @@ class Database:
             self.queue_file(missing_file_id, priority=10, reason="missing-chunks")
 
     def list_rows(self, table: str, limit: int = 200) -> List[sqlite3.Row]:
-        allowed = {"files", "events", "queue", "chunks", "endpoints", "backup_runs", "backup_manifests", "host_stats", "maintenance_runs", "restore_drills"}
+        allowed = {"files", "events", "queue", "chunks", "chunk_manifests", "endpoints", "backup_runs", "backup_manifests", "host_stats", "maintenance_runs", "restore_drills"}
         if table not in allowed:
             raise ValueError(f"Unsupported table: {table}")
         with self.connect() as conn:
             return conn.execute(f"SELECT * FROM {table} ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
 
     def table_stats(self) -> List[Dict[str, Any]]:
-        tables = ["files", "chunks", "queue", "events", "backup_runs", "backup_manifests", "host_stats", "maintenance_runs", "restore_drills", "transfer_samples"]
+        tables = ["files", "chunks", "chunk_manifests", "queue", "events", "backup_runs", "backup_manifests", "host_stats", "maintenance_runs", "restore_drills", "transfer_samples"]
         with self.connect() as conn:
             page_size = int(conn.execute("PRAGMA page_size").fetchone()[0])
             page_count = int(conn.execute("PRAGMA page_count").fetchone()[0])
@@ -1239,7 +1396,10 @@ class Database:
                 """
                 SELECT COUNT(*) FROM files
                 WHERE state='backed_up'
-                  AND id IN (SELECT DISTINCT file_id FROM chunks WHERE status != 'missing')
+                  AND (
+                    id IN (SELECT DISTINCT file_id FROM chunks WHERE status != 'missing')
+                    OR id IN (SELECT file_id FROM chunk_manifests WHERE missing_count=0)
+                  )
                   AND (last_verify_at IS NULL OR last_verify_at <= ?)
                 """,
                 (cutoff,),
@@ -1292,15 +1452,16 @@ class Database:
             return conn.execute(
                 f"""
                 SELECT f.*,
-                       COUNT(c.id) AS chunk_count,
-                       SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END) AS verified_chunks,
-                       SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) AS missing_chunks,
-                       COALESCE(SUM(c.size), 0) AS chunk_bytes,
+                       COUNT(c.id) + COALESCE(cm.chunk_count, 0) AS chunk_count,
+                       COALESCE(SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END), 0) + COALESCE(cm.verified_count, 0) AS verified_chunks,
+                       COALESCE(SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END), 0) + COALESCE(cm.missing_count, 0) AS missing_chunks,
+                       COALESCE(SUM(c.size), 0) + COALESCE(cm.bytes_total, 0) AS chunk_bytes,
                        q.status AS queue_status,
                        q.progress_chunks AS progress_chunks,
                        q.progress_bytes AS progress_bytes
                 FROM files f
                 LEFT JOIN chunks c ON c.file_id = f.id
+                LEFT JOIN chunk_manifests cm ON cm.file_id = f.id
                 LEFT JOIN queue q ON q.file_id = f.id
                 {where}
                 GROUP BY f.id
@@ -1362,18 +1523,19 @@ class Database:
                 f"""
                 WITH verification AS (
                 SELECT f.id, f.path, f.relative_path, f.state, f.last_verify_at,
-                       COUNT(c.id) AS chunk_count,
-                       SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END) AS verified_chunks,
-                       SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) AS missing_chunks,
-                       MAX(c.verified_at) AS last_chunk_verify_at,
+                       COUNT(c.id) + COALESCE(cm.chunk_count, 0) AS chunk_count,
+                       COALESCE(SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END), 0) + COALESCE(cm.verified_count, 0) AS verified_chunks,
+                       COALESCE(SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END), 0) + COALESCE(cm.missing_count, 0) AS missing_chunks,
+                       MAX(COALESCE(c.verified_at, cm.updated_at)) AS last_chunk_verify_at,
                        CASE
-                         WHEN SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) > 0 THEN 'missing'
-                         WHEN COUNT(c.id) = 0 THEN 'no_chunks'
-                         WHEN f.last_verify_at IS NULL AND SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END) = 0 THEN 'unverified'
+                         WHEN COALESCE(SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END), 0) + COALESCE(cm.missing_count, 0) > 0 THEN 'missing'
+                         WHEN COUNT(c.id) + COALESCE(cm.chunk_count, 0) = 0 THEN 'no_chunks'
+                         WHEN f.last_verify_at IS NULL AND COALESCE(SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END), 0) + COALESCE(cm.verified_count, 0) = 0 THEN 'unverified'
                          ELSE 'verified'
                        END AS verification_state
                 FROM files f
                 LEFT JOIN chunks c ON c.file_id = f.id
+                LEFT JOIN chunk_manifests cm ON cm.file_id = f.id
                 WHERE f.state != 'deleted'
                 GROUP BY f.id
                 )
@@ -1393,13 +1555,14 @@ class Database:
                 WITH verification AS (
                 SELECT f.id, f.path, f.relative_path,
                        CASE
-                         WHEN SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END) > 0 THEN 'missing'
-                         WHEN COUNT(c.id) = 0 THEN 'no_chunks'
-                         WHEN f.last_verify_at IS NULL AND SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END) = 0 THEN 'unverified'
+                         WHEN COALESCE(SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END), 0) + COALESCE(cm.missing_count, 0) > 0 THEN 'missing'
+                         WHEN COUNT(c.id) + COALESCE(cm.chunk_count, 0) = 0 THEN 'no_chunks'
+                         WHEN f.last_verify_at IS NULL AND COALESCE(SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END), 0) + COALESCE(cm.verified_count, 0) = 0 THEN 'unverified'
                          ELSE 'verified'
                        END AS verification_state
                 FROM files f
                 LEFT JOIN chunks c ON c.file_id = f.id
+                LEFT JOIN chunk_manifests cm ON cm.file_id = f.id
                 WHERE f.state != 'deleted'
                 GROUP BY f.id
                 )
@@ -1504,7 +1667,7 @@ class Database:
                   (SELECT COALESCE(MAX(updated_at), '') FROM queue) AS queue_updated,
                   (SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type != 'web.access') AS event_id,
                   (SELECT COALESCE(MAX(id), 0) FROM transfer_samples) AS transfer_id,
-                  (SELECT COUNT(*) FROM chunks) AS chunks_total,
+                  ((SELECT COUNT(*) FROM chunks) + (SELECT COALESCE(SUM(chunk_count), 0) FROM chunk_manifests)) AS chunks_total,
                   (SELECT COUNT(*) FROM files WHERE state != 'deleted') AS files_total,
                   (SELECT COUNT(*) FROM queue) AS queue_total
                 """
@@ -1533,10 +1696,7 @@ class Database:
                 "SELECT ts, direction, size FROM transfer_samples WHERE ts >= ?",
                 (start.isoformat(),),
             ).fetchall()
-            verified = conn.execute(
-                "SELECT verified_at, size FROM chunks WHERE verified_at IS NOT NULL AND verified_at >= ?",
-                (start.isoformat(),),
-            ).fetchall()
+            verified = conn.execute("SELECT verified_at, size FROM chunks WHERE verified_at IS NOT NULL AND verified_at >= ?", (start.isoformat(),)).fetchall()
         for row in transfers:
             key = self._bucket_key(row["ts"], bucket_seconds)
             buckets.setdefault(key, {"ts": key, "upload_bps": 0.0, "download_bps": 0.0})
@@ -1589,10 +1749,10 @@ class Database:
                 ).fetchone()[0],
                 "queue_attention_failed": conn.execute("SELECT COUNT(*) FROM queue WHERE status='failed'").fetchone()[0],
                 "queue_attention_network_blocked": conn.execute("SELECT COUNT(*) FROM queue WHERE status!='done' AND reason='network-blocked'").fetchone()[0],
-                "chunks_total": conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0],
-                "chunks_verified": conn.execute("SELECT COUNT(*) FROM chunks WHERE status='verified'").fetchone()[0],
-                "chunks_missing": conn.execute("SELECT COUNT(*) FROM chunks WHERE status='missing'").fetchone()[0],
-                "chunks_bytes_total": conn.execute("SELECT COALESCE(SUM(size), 0) FROM chunks").fetchone()[0],
+                "chunks_total": conn.execute("SELECT (SELECT COUNT(*) FROM chunks) + (SELECT COALESCE(SUM(chunk_count), 0) FROM chunk_manifests)").fetchone()[0],
+                "chunks_verified": conn.execute("SELECT (SELECT COUNT(*) FROM chunks WHERE status='verified') + (SELECT COALESCE(SUM(verified_count), 0) FROM chunk_manifests)").fetchone()[0],
+                "chunks_missing": conn.execute("SELECT (SELECT COUNT(*) FROM chunks WHERE status='missing') + (SELECT COALESCE(SUM(missing_count), 0) FROM chunk_manifests)").fetchone()[0],
+                "chunks_bytes_total": conn.execute("SELECT (SELECT COALESCE(SUM(size), 0) FROM chunks) + (SELECT COALESCE(SUM(bytes_total), 0) FROM chunk_manifests)").fetchone()[0],
                 "backup_runs_total": conn.execute("SELECT COUNT(*) FROM backup_runs").fetchone()[0],
                 "backup_runs_failed": conn.execute("SELECT COUNT(*) FROM backup_runs WHERE status='failed'").fetchone()[0],
                 "restore_drills_total": conn.execute("SELECT COUNT(*) FROM restore_drills").fetchone()[0],
@@ -1663,6 +1823,18 @@ CREATE TABLE IF NOT EXISTS chunks (
   article_size INTEGER,
   verified_at TEXT,
   UNIQUE(file_id, chunk_index)
+);
+
+CREATE TABLE IF NOT EXISTS chunk_manifests (
+  file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  chunk_count INTEGER NOT NULL,
+  bytes_total INTEGER NOT NULL,
+  article_size INTEGER,
+  verified_count INTEGER NOT NULL DEFAULT 0,
+  missing_count INTEGER NOT NULL DEFAULT 0,
+  manifest_blob BLOB NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS events (

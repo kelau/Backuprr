@@ -169,7 +169,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.74")
+        self.assertEqual(__version__, "0.2.75")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -251,6 +251,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("backup_runs", tables)
         self.assertIn("backup_manifests", tables)
         self.assertIn("host_stats", tables)
+        self.assertIn("chunk_manifests", tables)
         self.assertIn("maintenance_runs", tables)
         self.assertIn("restore_drills", tables)
         self.assertIn("schema_migrations", tables)
@@ -775,8 +776,12 @@ class CoreTests(unittest.TestCase):
         with patch("backuprr.backup.UsenetClient", FakePostClient):
             self.assertIsNotNone(post_next(self.db, self.config))
         with self.db.connect() as conn:
-            chunks = conn.execute("SELECT * FROM chunks ORDER BY chunk_index").fetchall()
+            live_chunks = conn.execute("SELECT * FROM chunks ORDER BY chunk_index").fetchall()
+            compact = conn.execute("SELECT chunk_count, bytes_total FROM chunk_manifests").fetchone()
             file_row = conn.execute("SELECT state FROM files LIMIT 1").fetchone()
+        chunks = self.db.chunks_for_file_ids([1])
+        self.assertEqual(len(live_chunks), 0)
+        self.assertEqual(compact["chunk_count"], 2)
         self.assertEqual(len(chunks), 2)
         self.assertEqual(file_row["state"], "backed_up")
         self.assertEqual(chunks[0]["subject"], "")
@@ -789,6 +794,26 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(manifests[0]["article_size"], 8)
         self.assertEqual(manifests[0]["chunk_count"], 2)
         self.assertEqual(self.db.list_events(["debug"], event_types=["post.chunk"]), [])
+
+    def test_completed_post_compacts_chunks_but_preserves_restore_catalog(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with patch("backuprr.backup.UsenetClient", FakePostClient):
+            self.assertIsNotNone(post_next(self.db, self.config))
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            live = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_id=?", (file_id,)).fetchone()[0]
+            compact = conn.execute("SELECT chunk_count, bytes_total FROM chunk_manifests WHERE file_id=?", (file_id,)).fetchone()
+        self.assertEqual(live, 0)
+        self.assertEqual(compact["chunk_count"], 2)
+        self.assertEqual(self.db.chunk_count_for_file(file_id), 2)
+        entries = self.db.chunks_for_file_ids([file_id])
+        self.assertEqual([entry["chunk_index"] for entry in entries], [0, 1])
+        self.assertTrue(str(entries[0]["id"]).startswith(f"manifest:{file_id}:"))
 
     def test_compressed_chunks_round_trip_and_skip_known_compressed_extensions(self):
         media = self.root / "media"
@@ -843,6 +868,7 @@ class CoreTests(unittest.TestCase):
         (media / "movie.mkv").write_bytes(b"0123456789abcdef")
         self.config.log_chunk_events = True
         self.config.compact_chunk_metadata = False
+        self.config.compact_chunk_rows = False
         self.db.add_endpoint(str(media))
         scan_all(self.db)
         enqueue_unbacked(self.db)
@@ -970,8 +996,7 @@ class CoreTests(unittest.TestCase):
         self.db.add_chunk(file_id, 0, "<old@example.test>", 3, "abc", "[old]")
         with patch("backuprr.backup.UsenetClient", FakePostClient):
             self.assertIsNotNone(post_next(self.db, self.config))
-        with self.db.connect() as conn:
-            chunks = conn.execute("SELECT message_id FROM chunks WHERE file_id=? ORDER BY chunk_index", (file_id,)).fetchall()
+        chunks = self.db.chunks_for_file_ids([file_id])
         self.assertTrue(chunks)
         self.assertNotEqual(chunks[0]["message_id"], "<old@example.test>")
 
@@ -991,8 +1016,8 @@ class CoreTests(unittest.TestCase):
         with patch("backuprr.backup.UsenetClient", CountingPostClient):
             self.assertIsNotNone(post_next(self.db, self.config))
         with self.db.connect() as conn:
-            chunks = conn.execute("SELECT chunk_index, message_id FROM chunks WHERE file_id=? ORDER BY chunk_index", (file_id,)).fetchall()
             queue_row = conn.execute("SELECT progress_chunks FROM queue WHERE file_id=?", (file_id,)).fetchone()
+        chunks = self.db.chunks_for_file_ids([file_id])
         self.assertEqual(len(CountingPostClient.posts), 1)
         self.assertEqual([row["chunk_index"] for row in chunks], [0, 1])
         self.assertEqual(chunks[0]["message_id"], "<old-existing@example.test>")
@@ -1015,11 +1040,8 @@ class CoreTests(unittest.TestCase):
         with patch("backuprr.backup.UsenetClient", CountingPostClient):
             self.assertIsNotNone(post_next(self.db, self.config))
         with self.db.connect() as conn:
-            chunks = conn.execute(
-                "SELECT chunk_index, message_id, article_size FROM chunks WHERE file_id=? ORDER BY chunk_index",
-                (file_id,),
-            ).fetchall()
             queue_row = conn.execute("SELECT progress_chunks FROM queue WHERE file_id=?", (file_id,)).fetchone()
+        chunks = self.db.chunks_for_file_ids([file_id])
         self.assertEqual(len(CountingPostClient.posts), 4)
         self.assertEqual([row["chunk_index"] for row in chunks], [0, 1, 2, 3])
         self.assertNotEqual(chunks[0]["message_id"], "<old-existing@example.test>")
@@ -1892,6 +1914,32 @@ class CoreTests(unittest.TestCase):
             verified = conn.execute("SELECT file_id FROM chunks WHERE status='verified'").fetchall()
         self.assertEqual([row["file_id"] for row in verified], [rows[0]["id"]])
 
+    def test_verify_selected_file_chunks_updates_compacted_manifest(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"movie")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<one@example.test>", 3, "abc", "[one]")
+        self.db.add_chunk(file_id, 1, "<two@example.test>", 3, "def", "[two]")
+        self.assertEqual(self.db.compact_chunks_to_manifest(file_id), 2)
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        progress = []
+        with patch("backuprr.backup.UsenetClient", FakeReadClient):
+            self.assertEqual(verify_file_chunks(self.db, self.config, [file_id], progress=lambda done, total: progress.append((done, total))), 2)
+        self.assertEqual(progress, [(1, 2), (2, 2)])
+        with self.db.connect() as conn:
+            compact = conn.execute("SELECT verified_count, missing_count FROM chunk_manifests WHERE file_id=?", (file_id,)).fetchone()
+            file_row = conn.execute("SELECT last_verify_at FROM files WHERE id=?", (file_id,)).fetchone()
+            live = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_id=?", (file_id,)).fetchone()[0]
+        self.assertEqual(live, 0)
+        self.assertEqual(compact["verified_count"], 2)
+        self.assertEqual(compact["missing_count"], 0)
+        self.assertIsNotNone(file_row["last_verify_at"])
+
     def test_automatic_verification_uses_per_file_due_dates_and_batch_limit(self):
         media = self.root / "media"
         media.mkdir()
@@ -1941,6 +1989,23 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(restore_file(self.db, self.config, str(path), str(target), progress=lambda done, total, bytes_done: progress.append((done, total, bytes_done))), target)
         self.assertEqual(target.read_bytes(), b"restored payload")
         self.assertEqual(progress, [(1, 1, len(b"restored payload"))])
+
+    def test_restore_file_reads_compacted_manifest_chunks(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"placeholder")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
+        self.assertEqual(self.db.compact_chunks_to_manifest(file_id), 1)
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        target = self.root / "restore" / "movie.mkv"
+        with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
+            self.assertEqual(restore_file(self.db, self.config, str(path), str(target)), target)
+        self.assertEqual(target.read_bytes(), b"restored payload")
 
     def test_restored_payloads_reports_download_progress(self):
         media = self.root / "media"

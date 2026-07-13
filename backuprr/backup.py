@@ -442,6 +442,9 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                 "created_at": utcnow(),
             },
         )
+        if getattr(config, "compact_chunk_rows", True):
+            compacted = db.compact_chunks_to_manifest(file_id)
+            db.log("debug", "post.compact", f"Compacted {compacted} chunk rows into manifest for {original}", file_id)
         db.log("info", "post", f"Posted backup for {original}", file_id)
         return file_id
     except PostNetworkBlockedError as exc:
@@ -473,7 +476,7 @@ def verify_chunks(db: Database, config: Config, chunks: Iterable[Any], progress:
     def verify_chunk(chunk) -> tuple[int, int, str, bool]:
         with UsenetClient(host) as client:
             exists = client.article_exists(chunk["message_id"])
-        return int(chunk["id"]), int(chunk["file_id"]), chunk["message_id"], exists
+        return chunk["id"], int(chunk["file_id"]), chunk["message_id"], exists
 
     count = 0
     max_workers = max(1, int(config.nntp_threads))

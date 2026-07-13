@@ -46,6 +46,9 @@ a CLI and an AJAX-enabled Web UI.
 - Volume controls for large catalogs: web access logs and successful per-chunk
   logs are disabled by default, transfer samples are bucketed, and new chunk
   rows omit debug-only subject/body-hash metadata unless explicitly enabled.
+- Safety-first chunk row compaction: in-progress posts keep durable per-chunk
+  rows for restart recovery, while completed files can compact those rows into
+  a compressed per-file manifest to shrink the database at multi-TB scale.
 - CLI commands matching the Web UI operations.
 
 ## Application flow

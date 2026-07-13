@@ -80,7 +80,7 @@ def restore_source(db: Database, source_path: str) -> tuple[Any, list[Any]]:
         file_row = conn.execute("SELECT * FROM files WHERE path=? OR relative_path=?", (source_path, source_path)).fetchone()
         if not file_row:
             raise FileNotFoundError(f"No cataloged file matches {source_path}")
-        chunks = conn.execute("SELECT * FROM chunks WHERE file_id=? ORDER BY chunk_index", (file_row["id"],)).fetchall()
+    chunks = db.chunks_for_file_ids([int(file_row["id"])])
     if not chunks:
         raise RuntimeError(f"No Usenet chunks recorded for {source_path}")
     return file_row, chunks
@@ -129,7 +129,7 @@ def restore_sample(db: Database, config: Config, source_path: str, max_bytes: in
         file_row = conn.execute("SELECT * FROM files WHERE path=? OR relative_path=?", (source_path, source_path)).fetchone()
         if not file_row:
             raise FileNotFoundError(f"No cataloged file matches {source_path}")
-        chunks = conn.execute("SELECT * FROM chunks WHERE file_id=? ORDER BY chunk_index LIMIT 2", (file_row["id"],)).fetchall()
+    chunks = db.chunks_for_file_ids([int(file_row["id"])])[:2]
     if not chunks:
         raise RuntimeError(f"No Usenet chunks recorded for {source_path}")
     host = select_host(config, "read")
@@ -164,7 +164,10 @@ def restore_folder(db: Database, config: Config, folder_path: str, dest: Optiona
         rows = conn.execute(
             """
             SELECT path, relative_path FROM files
-            WHERE id IN (SELECT DISTINCT file_id FROM chunks)
+            WHERE (
+                id IN (SELECT DISTINCT file_id FROM chunks)
+                OR id IN (SELECT file_id FROM chunk_manifests)
+            )
               AND (path LIKE ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?)
             ORDER BY relative_path
             """,

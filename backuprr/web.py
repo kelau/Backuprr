@@ -242,8 +242,7 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchone()
             if not row:
                 raise FileNotFoundError(f"No cataloged file matches {source_path}")
-            total = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_id=?", (row["id"],)).fetchone()[0]
-        operation_id = self.create_operation("restore", int(row["id"]), str(row["relative_path"] or row["path"]), total)
+        operation_id = self.create_operation("restore", int(row["id"]), str(row["relative_path"] or row["path"]), self.db.chunk_count_for_file(int(row["id"])))
 
         def worker() -> None:
             try:
@@ -266,9 +265,13 @@ class Handler(BaseHTTPRequestHandler):
         with self.db.connect() as conn:
             rows = conn.execute(
                 """
-                SELECT id, path, relative_path, (SELECT COUNT(*) FROM chunks WHERE file_id=files.id) AS chunk_count
+                SELECT id, path, relative_path,
+                       ((SELECT COUNT(*) FROM chunks WHERE file_id=files.id) + COALESCE((SELECT chunk_count FROM chunk_manifests WHERE file_id=files.id), 0)) AS chunk_count
                 FROM files
-                WHERE id IN (SELECT DISTINCT file_id FROM chunks)
+                WHERE (
+                    id IN (SELECT DISTINCT file_id FROM chunks)
+                    OR id IN (SELECT file_id FROM chunk_manifests)
+                )
                   AND (path LIKE ? OR relative_path = ? OR relative_path LIKE ? OR relative_path = ? OR relative_path LIKE ?)
                 ORDER BY relative_path
                 """,
@@ -1081,6 +1084,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.75":["Completed backup chunk rows can now compact into a per-file manifest after success, keeping in-flight posts resumable while reducing database volume at scale."],
  "0.2.74":["Added scale benchmark planning, disaster recovery readiness checks, Prometheus metrics, container health checks, smarter compression sampling, queue strategies, and worker safety pause controls."],
  "0.2.73":["Added daily GitHub release update checks with Status, Tasks, Settings, API, and CLI support."],
  "0.2.72":["Table sort preferences now persist per browser using cookies.","Backuprr now shows a first-use/update notice with recent feature highlights."],
@@ -2606,6 +2610,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#9881;</span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
   <label class="field"><span><span class="ui-icon">&#128737;</span>PAR2 redundancy</span><div class="range-field"><input id="setPar2Redundancy" type="range" min="1" max="50" step="1" value="${esc(s.par2?.redundancy_percent ?? 10)}" oninput="setPar2RedundancyLabel.textContent=this.value + '%'"><span id="setPar2RedundancyLabel">${esc(s.par2?.redundancy_percent ?? 10)}%</span></div></label>
   <label><input id="setCompactChunkMetadata" type="checkbox" ${s.compact_chunk_metadata === false ? "" : "checked"}> <span class="ui-icon">&#128451;</span>Compact stored chunk metadata</label>
+  <label><input id="setCompactChunkRows" type="checkbox" ${s.compact_chunk_rows === false ? "" : "checked"}> <span class="ui-icon">&#129513;</span>Compact completed chunk rows</label>
   <label class="field"><span><span class="ui-icon">&#8635;</span>Restore drill interval days</span><input id="setRestoreDrillDays" type="number" min="1" max="3650" value="${esc(s.restore_drill_interval_days || 30)}"></label>
   <label class="field"><span><span class="ui-icon">&#128207;</span>Restore drill sample bytes</span><input id="setRestoreDrillBytes" type="number" min="1" value="${esc(s.restore_drill_sample_bytes || 1048576)}"></label>
  </div></div>
@@ -2838,6 +2843,7 @@ async function saveSettings(){
   log_web_access: setLogWebAccess.checked,
   log_chunk_events: setLogChunkEvents.checked,
   compact_chunk_metadata: setCompactChunkMetadata.checked,
+  compact_chunk_rows: setCompactChunkRows.checked,
   compression_sample_bytes: Number(setCompressionSampleBytes.value),
   compression_min_gain_percent: Number(setCompressionMinGainPercent.value),
   restore_drill_interval_days: Number(setRestoreDrillDays.value),

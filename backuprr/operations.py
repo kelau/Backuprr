@@ -230,14 +230,13 @@ def restore_confidence(db: Database, source_path: str) -> Dict[str, Any]:
             raise FileNotFoundError(f"No cataloged file matches {source_path}")
         chunks = conn.execute(
             """
-            SELECT COUNT(*) AS total,
-                   SUM(CASE WHEN status='missing' THEN 1 ELSE 0 END) AS missing,
-                   SUM(CASE WHEN status='verified' THEN 1 ELSE 0 END) AS verified,
-                   MAX(verified_at) AS last_verified
-            FROM chunks
-            WHERE file_id=?
+            SELECT
+              (SELECT COUNT(*) FROM chunks WHERE file_id=?) + COALESCE((SELECT chunk_count FROM chunk_manifests WHERE file_id=?), 0) AS total,
+              COALESCE((SELECT SUM(CASE WHEN status='missing' THEN 1 ELSE 0 END) FROM chunks WHERE file_id=?), 0) + COALESCE((SELECT missing_count FROM chunk_manifests WHERE file_id=?), 0) AS missing,
+              COALESCE((SELECT SUM(CASE WHEN status='verified' THEN 1 ELSE 0 END) FROM chunks WHERE file_id=?), 0) + COALESCE((SELECT verified_count FROM chunk_manifests WHERE file_id=?), 0) AS verified,
+              COALESCE((SELECT MAX(verified_at) FROM chunks WHERE file_id=?), (SELECT updated_at FROM chunk_manifests WHERE file_id=?)) AS last_verified
             """,
-            (row["id"],),
+            (row["id"], row["id"], row["id"], row["id"], row["id"], row["id"], row["id"], row["id"]),
         ).fetchone()
     total = int(chunks["total"] or 0)
     missing = int(chunks["missing"] or 0)

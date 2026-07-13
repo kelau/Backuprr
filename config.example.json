@@ -14,6 +14,7 @@
   "auto_pause_provider_failures": 10,
   "compression_sample_bytes": 2097152,
   "compression_min_gain_percent": 5,
+  "compact_chunk_rows": true,
   "file_stability_seconds": 300,
   "ui_theme": "harbor_light",
   "external_api_keys": [],
