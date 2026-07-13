@@ -19,6 +19,7 @@ ARTICLE_TEST_STEP_BYTES = 100 * 1024
 
 
 def dry_run_plan(db: Database, config: Config) -> Dict[str, Any]:
+    """Estimate the next backup wave without touching files or the provider."""
     stats = db.stats()
     queued_bytes = int(stats.get("files_bytes_queued", 0)) + int(stats.get("files_bytes_posting", 0))
     unprotected_bytes = max(0, int(stats.get("files_bytes_total", 0)) - int(stats.get("files_bytes_backed_up", 0)))
@@ -36,6 +37,15 @@ def dry_run_plan(db: Database, config: Config) -> Dict[str, Any]:
         "chunks": int(stats.get("chunks_total", 0)) + article_count,
         "backup_manifests": int(stats.get("backup_runs_total", 0)) + int(stats.get("files_total", 0)),
     }
+    warnings = []
+    if target_bytes and not config.usenet_hosts:
+        warnings.append("no Usenet hosts configured")
+    if target_bytes and hourly_limit and estimated_days and estimated_days > 7:
+        warnings.append("current hourly posting limit will stretch this backup over more than a week")
+    if article_count > 1_000_000:
+        warnings.append("article count is very high; test provider max article size and consider larger articles")
+    if par2_percent and not (config.par2 or {}).get("command"):
+        warnings.append("PAR2 is enabled without a command")
     return {
         "files_total": int(stats.get("files_total", 0)),
         "files_unprotected": int(stats.get("files_total", 0)) - int(stats.get("files_backed_up", 0)),
@@ -52,6 +62,7 @@ def dry_run_plan(db: Database, config: Config) -> Dict[str, Any]:
         "hourly_limit_bytes": hourly_limit,
         "estimated_hours_at_limit": estimated_hours,
         "estimated_days_at_limit": estimated_days,
+        "warnings": warnings,
     }
 
 
@@ -76,6 +87,7 @@ def synthetic_catalog_plan(file_count: int, average_file_size: int, article_size
 
 
 def disaster_recovery_report(db: Database, config: Config) -> Dict[str, Any]:
+    """Summarize whether the app can be rebuilt and controlled after host loss."""
     db_path = config.db_path()
     config_path = Path(config.source_path) if config.source_path else None
     stats = db.stats()
@@ -101,6 +113,64 @@ def disaster_recovery_report(db: Database, config: Config) -> Dict[str, Any]:
         "external_api_key_count": len(config.external_api_keys),
         "files_total": int(stats.get("files_total", 0)),
         "chunks_total": int(stats.get("chunks_total", 0)),
+    }
+
+
+def setup_health_check(db: Database, config: Config) -> Dict[str, Any]:
+    """Build the user-facing first-run checklist from catalog, provider, and safety state."""
+    stats = db.stats()
+    host_rows = db.host_health_rows(10)
+    recovery = disaster_recovery_report(db, config)
+    checks = [
+        {"id": "endpoints", "label": "Media endpoints configured", "ok": bool(config.endpoints), "detail": f"{len(config.endpoints)} endpoint(s)"},
+        {"id": "catalog", "label": "Catalog has files", "ok": int(stats.get("files_total", 0)) > 0, "detail": f"{int(stats.get('files_total', 0))} active file(s)"},
+        {"id": "post-host", "label": "Post host configured", "ok": bool(config.hosts_for_mode("post")), "detail": f"{len(config.hosts_for_mode('post'))} post host(s)"},
+        {"id": "read-host", "label": "Read host configured", "ok": bool(config.hosts_for_mode("read")), "detail": f"{len(config.hosts_for_mode('read'))} read host(s)"},
+        {"id": "provider-tested", "label": "Provider health checked", "ok": bool(host_rows), "detail": "run Check hosts + article size" if not host_rows else f"{len(host_rows)} recent check(s)"},
+        {"id": "external-api", "label": "External API key configured", "ok": bool(config.external_api_keys), "detail": f"{len(config.external_api_keys)} key(s)"},
+        {"id": "web-auth", "label": "Web UI password enabled", "ok": bool(config.web_ui_password), "detail": "optional but recommended on LAN/container deployments"},
+        {"id": "cloud-backup", "label": "Config/database cloud backup configured", "ok": bool(config.cloud_backups), "detail": f"{len(config.cloud_backups)} target(s)"},
+        {"id": "recovery", "label": "Disaster recovery readiness", "ok": bool(recovery["ok"]), "detail": "; ".join(recovery["issues"]) if recovery["issues"] else "ready"},
+    ]
+    return {"ok": all(item["ok"] for item in checks), "checks": checks}
+
+
+def notification_alerts(db: Database, config: Config) -> List[Dict[str, Any]]:
+    """Return high-signal conditions suitable for Status cards or external notifiers."""
+    stats = db.stats()
+    alerts: List[Dict[str, Any]] = []
+    if int(stats.get("queue_attention_count", 0)):
+        alerts.append({"level": "warning", "title": "Queue needs attention", "detail": f"{stats.get('queue_attention_count')} queue item(s) are failed or blocked"})
+    if int(stats.get("chunks_missing", 0)):
+        alerts.append({"level": "error", "title": "Missing Usenet chunks", "detail": f"{stats.get('chunks_missing')} chunk(s) are marked missing"})
+    if int(stats.get("restore_drills_failed", 0)):
+        alerts.append({"level": "warning", "title": "Restore drill failures", "detail": f"{stats.get('restore_drills_failed')} failed restore drill(s) recorded"})
+    if not config.cloud_backups:
+        alerts.append({"level": "info", "title": "No config/database cloud backup", "detail": "add a cloud target so the catalog can be recovered after host loss"})
+    if not config.web_ui_password:
+        alerts.append({"level": "info", "title": "Web UI password disabled", "detail": "enable Web UI auth before exposing the app beyond localhost"})
+    return alerts
+
+
+def diagnostics_bundle(db: Database, config: Config) -> Dict[str, Any]:
+    """Create a redacted support bundle that is safe to download or attach to bug reports."""
+    cfg = config.public_dict()
+    for host in cfg.get("usenet_hosts", []):
+        host["username"] = "***" if host.get("username") else ""
+    return {
+        "generated_at": utcnow(),
+        "config": cfg,
+        "status": {
+            "stats": db.stats(),
+            "setup": setup_health_check(db, config),
+            "disaster_recovery": disaster_recovery_report(db, config),
+            "alerts": notification_alerts(db, config),
+        },
+        "tasks": [dict(row) for row in db.worker_state_rows()],
+        "tables": db.table_stats(),
+        "provider_profiles": [dict(row) for row in db.provider_profiles()],
+        "host_health": [dict(row) for row in db.host_health_rows(20)],
+        "recent_events": [dict(row) for row in db.list_events(limit=100, exclude_event_types=["web.access"])],
     }
 
 
@@ -211,6 +281,7 @@ def post_article_size_probe(host, newsgroup: str, size: int) -> None:
 
 
 def run_maintenance(db: Database, config: Config, vacuum: bool = False) -> Dict[str, Any]:
+    """Run bounded local cleanup; VACUUM is explicit because it can be expensive."""
     started = utcnow()
     pruned = db.prune_events(config.log_retention_days, config.verbose_log_retention_days)
     compacted_samples = db.compact_transfer_samples()
@@ -224,6 +295,7 @@ def run_maintenance(db: Database, config: Config, vacuum: bool = False) -> Dict[
 
 
 def restore_confidence(db: Database, source_path: str) -> Dict[str, Any]:
+    """Score whether a file is likely restorable from currently cataloged chunk data."""
     with db.connect() as conn:
         row = conn.execute("SELECT * FROM files WHERE path=? OR relative_path=?", (source_path, source_path)).fetchone()
         if not row:

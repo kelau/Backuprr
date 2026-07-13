@@ -30,13 +30,16 @@ from backuprr.log_forwarding import build_payload
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
 from backuprr.operations import (
     check_usenet_hosts,
+    diagnostics_bundle,
     disaster_recovery_report,
     dry_run_plan,
+    notification_alerts,
     prometheus_metrics,
     restore_confidence,
     restore_plan,
     run_maintenance,
     run_restore_drill,
+    setup_health_check,
     synthetic_catalog_plan,
     test_post_host_article_size,
 )
@@ -169,7 +172,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.75")
+        self.assertEqual(__version__, "0.2.76")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -1540,6 +1543,7 @@ class CoreTests(unittest.TestCase):
                 "backup_interval_seconds": 20,
                 "cloud_backup_interval_seconds": 55,
                 "maintenance_interval_seconds": 66,
+                "auto_vacuum_after_compaction_rows": 1234,
                 "restore_drill_task_interval_seconds": 77,
                 "update_check_interval_seconds": 86400,
                 "file_stability_seconds": 88,
@@ -1566,6 +1570,9 @@ class CoreTests(unittest.TestCase):
                 "update_check_timeout_seconds": 12,
                 "auto_queue_exclude_patterns": ["*.sample", ".tmp"],
                 "external_api_keys": ["ha-key", "automation-key"],
+                "web_ui_username": "operator",
+                "web_ui_password": "ui-secret",
+                "config_secret_key_env": "BACKUPRR_TEST_CONFIG_SECRET",
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
                 "encryption_passphrase_env": "BACKUPRR_SECRET",
@@ -1608,6 +1615,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.backup_interval_seconds, 20)
         self.assertEqual(self.config.cloud_backup_interval_seconds, 55)
         self.assertEqual(self.config.maintenance_interval_seconds, 66)
+        self.assertEqual(self.config.auto_vacuum_after_compaction_rows, 1234)
         self.assertEqual(self.config.restore_drill_task_interval_seconds, 77)
         self.assertEqual(self.config.update_check_interval_seconds, 86400)
         self.assertEqual(self.config.file_stability_seconds, 88)
@@ -1634,6 +1642,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.update_check_timeout_seconds, 12)
         self.assertEqual(self.config.auto_queue_exclude_patterns, ["*.sample", ".tmp"])
         self.assertEqual(self.config.external_api_keys, ["ha-key", "automation-key"])
+        self.assertEqual(self.config.web_ui_username, "operator")
+        self.assertEqual(self.config.web_ui_password, "ui-secret")
+        self.assertEqual(self.config.config_secret_key_env, "BACKUPRR_TEST_CONFIG_SECRET")
         self.assertTrue(self.config.zip_subfolders)
         self.assertTrue(self.config.compress_files)
         self.assertTrue(self.config.encrypt_bodies)
@@ -1672,6 +1683,48 @@ class CoreTests(unittest.TestCase):
         public = self.config.public_dict()["log_destinations"][0]
         self.assertEqual(public["api_key"], "")
         self.assertTrue(public["has_api_key"])
+
+    def test_config_save_protects_secrets_when_key_env_is_set(self):
+        config_path = self.root / "protected.json"
+        os.environ["BACKUPRR_TEST_CONFIG_SECRET"] = "local-test-key"
+        self.config.config_secret_key_env = "BACKUPRR_TEST_CONFIG_SECRET"
+        self.config.usenet_hosts = [UsenetHost(name="post", mode="post", host="example.test", port=563, password="provider-secret")]
+        self.config.external_api_keys = ["external-secret"]
+        self.config.web_ui_password = "ui-secret"
+        try:
+            self.config.save(str(config_path))
+            raw = config_path.read_text(encoding="utf-8")
+            self.assertIn("enc:v1:", raw)
+            self.assertNotIn("provider-secret", raw)
+            self.assertNotIn("external-secret", raw)
+            loaded = Config.load(str(config_path))
+        finally:
+            os.environ.pop("BACKUPRR_TEST_CONFIG_SECRET", None)
+        self.assertEqual(loaded.usenet_hosts[0].password, "provider-secret")
+        self.assertEqual(loaded.external_api_keys, ["external-secret"])
+        self.assertEqual(loaded.web_ui_password, "ui-secret")
+
+    def test_setup_health_alerts_and_diagnostics_are_redacted(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"abc")
+        self.config.endpoints = [str(media)]
+        self.config.external_api_keys = ["ha-key"]
+        self.config.web_ui_password = "ui-secret"
+        self.config.usenet_hosts = [
+            UsenetHost(name="read", mode="read", host="news.example.test", port=563, username="user", password="secret"),
+            UsenetHost(name="post", mode="post", host="post.example.test", port=563),
+        ]
+        scan_all(self.db)
+        setup = setup_health_check(self.db, self.config)
+        self.assertFalse(setup["ok"])
+        self.assertTrue(any(check["id"] == "cloud-backup" for check in setup["checks"]))
+        alerts = notification_alerts(self.db, self.config)
+        self.assertTrue(any(alert["title"] == "No config/database cloud backup" for alert in alerts))
+        bundle = diagnostics_bundle(self.db, self.config)
+        self.assertEqual(bundle["config"]["usenet_hosts"][0]["username"], "***")
+        self.assertEqual(bundle["config"]["usenet_hosts"][0]["password"], "")
+        self.assertIn("tables", bundle)
 
     def test_log_forwarding_payloads_match_platform(self):
         event = {

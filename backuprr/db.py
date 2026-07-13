@@ -936,10 +936,17 @@ class Database:
                 """
                 SELECT f.*
                 FROM files f
-                JOIN chunks c ON c.file_id = f.id
+                LEFT JOIN chunks c ON c.file_id = f.id
+                LEFT JOIN chunk_manifests cm ON cm.file_id = f.id
+                LEFT JOIN restore_drills rd ON rd.file_id = f.id
                 WHERE f.state='backed_up'
+                  AND (c.file_id IS NOT NULL OR cm.file_id IS NOT NULL)
                 GROUP BY f.id
-                ORDER BY COALESCE(f.last_verify_at, f.last_backup_at, f.updated_at) ASC
+                ORDER BY MAX(rd.checked_at) IS NOT NULL ASC,
+                         COALESCE(MAX(rd.checked_at), f.last_verify_at, f.last_backup_at, f.updated_at) ASC,
+                         f.backup_compressed DESC,
+                         f.backup_par2 DESC,
+                         f.size DESC
                 LIMIT 1
                 """
             ).fetchone()
@@ -1491,6 +1498,35 @@ class Database:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as conn:
             return int(conn.execute(f"SELECT COUNT(*) FROM files {where}", params).fetchone()[0])
+
+    def folder_rollups(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Aggregate file safety metadata by top-level folder for large-library triage."""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                  CASE
+                    WHEN instr(replace(relative_path, '\\', '/'), '/') > 0
+                    THEN substr(replace(relative_path, '\\', '/'), 1, instr(replace(relative_path, '\\', '/'), '/') - 1)
+                    ELSE ''
+                  END AS folder,
+                  COUNT(*) AS files,
+                  COALESCE(SUM(size), 0) AS bytes_total,
+                  SUM(CASE WHEN state='backed_up' THEN 1 ELSE 0 END) AS backed_up_files,
+                  COALESCE(SUM(CASE WHEN state='backed_up' THEN size ELSE 0 END), 0) AS backed_up_bytes,
+                  SUM(CASE WHEN backup_compressed=1 THEN 1 ELSE 0 END) AS compressed_files,
+                  SUM(CASE WHEN backup_par2=1 THEN 1 ELSE 0 END) AS par2_files,
+                  SUM(CASE WHEN last_verify_at IS NOT NULL THEN 1 ELSE 0 END) AS verified_files,
+                  SUM(CASE WHEN state IN ('failed','missing_chunks','unreadable') THEN 1 ELSE 0 END) AS attention_files
+                FROM files
+                WHERE state != 'deleted'
+                GROUP BY folder
+                ORDER BY attention_files DESC, bytes_total DESC, folder ASC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def verification_rows(
         self,

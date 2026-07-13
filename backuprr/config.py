@@ -1,9 +1,52 @@
+import base64
+import hashlib
+import hmac
 import json
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+
+SECRET_PREFIX = "enc:v1:"
+
+
+def _secret_stream(key: str, length: int) -> bytes:
+    """Build a deterministic byte stream for opt-in config secret protection."""
+    seed = hashlib.sha256(key.encode("utf-8")).digest()
+    output = bytearray()
+    counter = 0
+    while len(output) < length:
+        output.extend(hashlib.sha256(seed + counter.to_bytes(4, "big")).digest())
+        counter += 1
+    return bytes(output[:length])
+
+
+def protect_secret(value: str, key: str) -> str:
+    """Store secrets as authenticated protected values when a secret key is configured."""
+    if not value or value.startswith(SECRET_PREFIX):
+        return value
+    raw = value.encode("utf-8")
+    encrypted = bytes(left ^ right for left, right in zip(raw, _secret_stream(key, len(raw))))
+    mac = hmac.new(key.encode("utf-8"), encrypted, hashlib.sha256).digest()[:12]
+    return SECRET_PREFIX + base64.urlsafe_b64encode(mac + encrypted).decode("ascii")
+
+
+def unprotect_secret(value: str, key: str) -> str:
+    if not value or not value.startswith(SECRET_PREFIX):
+        return value
+    payload = base64.urlsafe_b64decode(value[len(SECRET_PREFIX) :].encode("ascii"))
+    mac, encrypted = payload[:12], payload[12:]
+    expected = hmac.new(key.encode("utf-8"), encrypted, hashlib.sha256).digest()[:12]
+    if not hmac.compare_digest(mac, expected):
+        raise ValueError("protected config secret could not be authenticated")
+    raw = bytes(left ^ right for left, right in zip(encrypted, _secret_stream(key, len(encrypted))))
+    return raw.decode("utf-8")
+
+
+def _secret_key_from_env(env_name: str) -> str:
+    return os.getenv(env_name) or os.getenv("BACKUPRR_CONFIG_SECRET") or ""
 
 
 @dataclass
@@ -124,6 +167,10 @@ class Config:
     queue_strategy: str = "older-first"
     auto_queue_exclude_patterns: List[str] = field(default_factory=list)
     external_api_keys: List[str] = field(default_factory=list)
+    web_ui_username: str = "admin"
+    web_ui_password: str = ""
+    config_secret_key_env: str = "BACKUPRR_CONFIG_SECRET"
+    auto_vacuum_after_compaction_rows: int = 100000
     ui_theme: str = "harbor_light"
     update_check_enabled: bool = True
     update_github_repo: str = "kelau/Backuprr"
@@ -146,6 +193,9 @@ class Config:
         data: Dict[str, Any] = {}
         if config_path.exists():
             data = json.loads(config_path.read_text(encoding="utf-8-sig"))
+        key = _secret_key_from_env(str(data.get("config_secret_key_env") or "BACKUPRR_CONFIG_SECRET"))
+        if key:
+            _unprotect_config_data(data, key)
         legacy_zip_subfolders = bool(data.get("zip_subfolders")) and "compress_files" not in data
         hosts = [UsenetHost.from_dict(item) for item in data.pop("usenet_hosts", [])]
         cloud_backups = [CloudBackupTarget.from_dict(item) for item in data.pop("cloud_backups", [])]
@@ -162,6 +212,9 @@ class Config:
 
     def save(self, path: str) -> None:
         data = self.to_dict()
+        key = _secret_key_from_env(self.config_secret_key_env)
+        if key:
+            _protect_config_data(data, key)
         Path(path).write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
     def db_path(self) -> Path:
@@ -209,6 +262,10 @@ class Config:
             "queue_strategy": self.queue_strategy,
             "auto_queue_exclude_patterns": self.auto_queue_exclude_patterns,
             "external_api_keys": self.external_api_keys,
+            "web_ui_username": self.web_ui_username,
+            "web_ui_password": self.web_ui_password,
+            "config_secret_key_env": self.config_secret_key_env,
+            "auto_vacuum_after_compaction_rows": self.auto_vacuum_after_compaction_rows,
             "ui_theme": self.ui_theme,
             "update_check_enabled": self.update_check_enabled,
             "update_github_repo": self.update_github_repo,
@@ -230,6 +287,8 @@ class Config:
         data["log_destinations"] = [destination.public_dict() for destination in self.log_destinations]
         data["external_api_key_count"] = len(self.external_api_keys)
         data["external_api_keys"] = []
+        data["has_web_ui_password"] = bool(self.web_ui_password)
+        data["web_ui_password"] = ""
         return data
 
 
@@ -380,6 +439,22 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
             config.external_api_keys = keys
         elif data.get("clear_external_api_keys"):
             config.external_api_keys = []
+    if "web_ui_username" in data:
+        username = str(data["web_ui_username"]).strip()
+        if not username:
+            raise ValueError("web_ui_username cannot be blank")
+        config.web_ui_username = username
+    if data.get("web_ui_password"):
+        config.web_ui_password = str(data["web_ui_password"])
+    elif data.get("clear_web_ui_password"):
+        config.web_ui_password = ""
+    if "config_secret_key_env" in data:
+        config.config_secret_key_env = str(data["config_secret_key_env"]).strip() or "BACKUPRR_CONFIG_SECRET"
+    if "auto_vacuum_after_compaction_rows" in data:
+        threshold = int(data["auto_vacuum_after_compaction_rows"] or 0)
+        if threshold < 0:
+            raise ValueError("auto_vacuum_after_compaction_rows cannot be negative")
+        config.auto_vacuum_after_compaction_rows = threshold
     if "ui_theme" in data:
         theme = str(data["ui_theme"]).strip()
         if theme not in {"harbor_light", "emerald_console", "slate_cinema", "graphite", "nordic_mint"}:
@@ -489,3 +564,33 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if par2["redundancy_percent"] < 1 or par2["redundancy_percent"] > 50:
             raise ValueError("PAR2 redundancy percent must be between 1 and 50")
         config.par2 = par2
+
+
+def _protect_config_data(data: Dict[str, Any], key: str) -> None:
+    for host in data.get("usenet_hosts", []):
+        if host.get("password"):
+            host["password"] = protect_secret(str(host["password"]), key)
+    for destination in data.get("log_destinations", []):
+        if destination.get("api_key"):
+            destination["api_key"] = protect_secret(str(destination["api_key"]), key)
+        if destination.get("password"):
+            destination["password"] = protect_secret(str(destination["password"]), key)
+    if data.get("external_api_keys"):
+        data["external_api_keys"] = [protect_secret(str(item), key) for item in data["external_api_keys"]]
+    if data.get("web_ui_password"):
+        data["web_ui_password"] = protect_secret(str(data["web_ui_password"]), key)
+
+
+def _unprotect_config_data(data: Dict[str, Any], key: str) -> None:
+    for host in data.get("usenet_hosts", []):
+        if host.get("password"):
+            host["password"] = unprotect_secret(str(host["password"]), key)
+    for destination in data.get("log_destinations", []):
+        if destination.get("api_key"):
+            destination["api_key"] = unprotect_secret(str(destination["api_key"]), key)
+        if destination.get("password"):
+            destination["password"] = unprotect_secret(str(destination["password"]), key)
+    if data.get("external_api_keys"):
+        data["external_api_keys"] = [unprotect_secret(str(item), key) for item in data["external_api_keys"]]
+    if data.get("web_ui_password"):
+        data["web_ui_password"] = unprotect_secret(str(data["web_ui_password"]), key)

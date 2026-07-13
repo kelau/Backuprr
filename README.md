@@ -39,6 +39,10 @@ a CLI and an AJAX-enabled Web UI.
   drill history for production troubleshooting.
 - Daily GitHub release checks with Status/Tasks visibility and manual run
   controls.
+- Setup health checks, preflight warnings, alert cards, and a redacted
+  diagnostics export for easier troubleshooting.
+- Optional Web UI Basic Auth plus opt-in config secret protection using
+  `BACKUPRR_CONFIG_SECRET` or a configured key environment variable.
 - Chunk-level hourly throttling, resumable posts, and retry/failover across
   configured post hosts.
 - Safety backpressure can pause the backup worker after provider, auth, or tool
@@ -191,6 +195,10 @@ direct provider username/password used for NNTP authentication:
   "verification_task_interval_seconds": 3600,
   "verification_files_per_run": 1,
   "scan_interval_seconds": 300,
+  "web_ui_username": "admin",
+  "web_ui_password": "",
+  "config_secret_key_env": "BACKUPRR_CONFIG_SECRET",
+  "auto_vacuum_after_compaction_rows": 100000,
   "backup_interval_seconds": 300,
   "update_check_interval_seconds": 86400,
   "update_check_enabled": true,

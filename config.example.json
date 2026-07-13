@@ -15,9 +15,13 @@
   "compression_sample_bytes": 2097152,
   "compression_min_gain_percent": 5,
   "compact_chunk_rows": true,
+  "auto_vacuum_after_compaction_rows": 100000,
   "file_stability_seconds": 300,
   "ui_theme": "harbor_light",
   "external_api_keys": [],
+  "web_ui_username": "admin",
+  "web_ui_password": "",
+  "config_secret_key_env": "BACKUPRR_CONFIG_SECRET",
   "log_destinations": [
     {
       "name": "home-loki",

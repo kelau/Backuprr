@@ -1,4 +1,6 @@
 import itertools
+import base64
+import hmac
 import json
 import math
 import secrets
@@ -20,13 +22,16 @@ from .log_forwarding import LogForwarder
 from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, MaintenanceMonitor, RestoreDrillMonitor, UpdateCheckMonitor
 from .operations import (
     check_usenet_hosts,
+    diagnostics_bundle,
     disaster_recovery_report,
     dry_run_plan,
+    notification_alerts,
     prometheus_metrics,
     restore_confidence,
     restore_plan,
     run_maintenance,
     run_restore_drill,
+    setup_health_check,
     synthetic_catalog_plan,
     test_post_host_article_size,
 )
@@ -37,6 +42,21 @@ from .update_checker import check_for_updates, update_result
 
 def rowdicts(rows):
     return [dict(row) for row in rows]
+
+
+def queue_reason_detail(reason: str, status: str = "") -> str:
+    """Translate internal queue reason codes into UI-safe next-action guidance."""
+    details = {
+        "network-blocked": "The OS or sandbox blocked NNTP socket access; restart/elevate the web process and retry.",
+        "missing-chunks": "Verification found missing articles; the file is queued for another backup run.",
+        "file-changing": "The file is still changing or locked; Backuprr will retry after the stability window.",
+        "hourly-limit": "The hourly posting limit paused this file; it will continue when budget is available.",
+        "startup-posting-retry": "Posting was interrupted by restart; existing chunks will be reused where safe.",
+        "manual": "Manually queued by the user.",
+    }
+    if status == "failed":
+        return details.get(reason, "Posting failed; check the Log page for the provider/tool error and then retry.")
+    return details.get(reason, "")
 
 
 def mbps_from_bps(value: float) -> float:
@@ -144,10 +164,32 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
 
     def unauthorized(self, message: str = "unauthorized") -> None:
+        if self.config.web_ui_password:
+            self.send_response(401)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("WWW-Authenticate", 'Basic realm="Backuprr"')
+            self.send_security_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": message}).encode("utf-8"))
+            return
         self.send_json({"error": message}, 401)
 
     def forbidden(self, message: str = "forbidden") -> None:
         self.send_json({"error": message}, 403)
+
+    def web_ui_authorized(self) -> bool:
+        """Optional Basic Auth for browser pages and the internal AJAX API."""
+        if not self.config.web_ui_password:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if not auth.lower().startswith("basic "):
+            return False
+        try:
+            decoded = base64.b64decode(auth.split(" ", 1)[1]).decode("utf-8")
+            username, password = decoded.split(":", 1)
+        except Exception:
+            return False
+        return hmac.compare_digest(username, self.config.web_ui_username) and hmac.compare_digest(password, self.config.web_ui_password)
 
     def internal_api_authorized(self, query: dict[str, list[str]] | None = None) -> bool:
         supplied = self.headers.get("X-Backuprr-Internal-Token", "")
@@ -352,6 +394,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "version": __version__, "database": self.config.db_path().exists()})
         elif parsed.path == "/metrics":
             self.send_text(prometheus_metrics(self.db, self.config), "text/plain; version=0.0.4; charset=utf-8")
+        elif (parsed.path in PAGE_ROUTES or parsed.path.startswith("/api/")) and not self.web_ui_authorized():
+            self.unauthorized("web UI authentication is required")
         elif parsed.path in PAGE_ROUTES:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -407,8 +451,15 @@ class Handler(BaseHTTPRequestHandler):
                     "verification_backlog": self.db.verification_backlog_summary(self.config.verification_interval_days),
                     "maintenance": rowdicts(self.db.maintenance_rows(20)),
                     "restore_drills": rowdicts(self.db.restore_drill_rows(20)),
+                    "folder_rollups": self.db.folder_rollups(100),
                 }
             )
+        elif parsed.path == "/api/setup-health":
+            self.send_json(setup_health_check(self.db, self.config))
+        elif parsed.path == "/api/alerts":
+            self.send_json({"alerts": notification_alerts(self.db, self.config)})
+        elif parsed.path == "/api/diagnostics":
+            self.send_json(diagnostics_bundle(self.db, self.config))
         elif parsed.path == "/api/dry-run":
             self.send_json(dry_run_plan(self.db, self.config))
         elif parsed.path == "/api/benchmark":
@@ -508,6 +559,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.unauthorized("external API key is required")
                     return
                 self.handle_external_post(parsed)
+                return
+            if parsed.path.startswith("/api/") and not self.web_ui_authorized():
+                self.unauthorized("web UI authentication is required")
                 return
             if parsed.path.startswith("/api/") and not self.internal_api_authorized():
                 self.forbidden("internal API token is required")
@@ -627,6 +681,8 @@ class Handler(BaseHTTPRequestHandler):
             "update_check_interval_seconds": self.config.update_check_interval_seconds,
             "update_check": update_result(self.db),
             "paused_workers": self.db.paused_kinds(),
+            "setup_health": setup_health_check(self.db, self.config),
+            "alerts": notification_alerts(self.db, self.config),
         }
 
     def handle_external_get(self, parsed: Any, query: dict[str, list[str]]) -> None:
@@ -682,6 +738,7 @@ class Handler(BaseHTTPRequestHandler):
             return payload
         payload["progress_percent"] = min(100, int((posted / expected) * 100))
         payload["progress"] = f"{posted}/{expected} chunks ({payload['progress_percent']}%)"
+        payload["reason_detail"] = queue_reason_detail(payload.get("reason", ""), payload.get("status", ""))
         return payload
 
     def stream_restore_download(self, source_path: str) -> None:
@@ -932,6 +989,8 @@ tr:hover td { background:var(--row-hover); }
 .chart-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
 .chart-card { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px; box-shadow:var(--shadow); }
 .chart-card h3 { margin:0 0 10px; font-size:14px; }
+.setup-checks { display:grid; gap:6px; margin-top:10px; }
+.setup-checks div { display:grid; grid-template-columns:auto minmax(160px, .8fr) 1fr; gap:8px; align-items:center; }
 .flowchart { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; align-items:stretch; margin-top:14px; }
 .flow-node { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px; display:grid; gap:6px; box-shadow:var(--shadow); position:relative; }
 .flow-node b { font-size:14px; }
@@ -1084,6 +1143,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.76":["Added setup health checks, alerts, diagnostics export, optional Web UI Basic Auth, opt-in config secret protection, folder rollups, dry-run warnings, and restore drill rotation improvements."],
  "0.2.75":["Completed backup chunk rows can now compact into a per-file manifest after success, keeping in-flight posts resumable while reducing database volume at scale."],
  "0.2.74":["Added scale benchmark planning, disaster recovery readiness checks, Prometheus metrics, container health checks, smarter compression sampling, queue strategies, and worker safety pause controls."],
  "0.2.73":["Added daily GitHub release update checks with Status, Tasks, Settings, API, and CLI support."],
@@ -1712,7 +1772,7 @@ async function updateStatisticsPage(){
  if(target) target.innerHTML = statisticsDashboard(data);
 }
 async function updateOperationsPage(){
- const [tasks, plan, benchmark, recovery, health, maintenance, drills, runs] = await Promise.all([
+ const [tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts] = await Promise.all([
   api("/api/tasks"),
   api("/api/dry-run"),
   api("/api/benchmark?files=50000&size=1073741824&folders=1000"),
@@ -1720,10 +1780,12 @@ async function updateOperationsPage(){
   api("/api/health"),
   api("/api/maintenance"),
   api("/api/restore-drills"),
-  api("/api/backup-runs?limit=20")
+  api("/api/backup-runs?limit=20"),
+  api("/api/setup-health"),
+  api("/api/alerts")
  ]);
  const target = document.getElementById("operationsPanel");
- if(target) target.innerHTML = operationsDashboard(tasks, plan, benchmark, recovery, health.hosts || [], maintenance || [], drills || [], runs || []);
+ if(target) target.innerHTML = operationsDashboard(tasks, plan, benchmark, recovery, health.hosts || [], maintenance || [], drills || [], runs || [], setup, alerts.alerts || []);
 }
 function paginationControls(result, pageVar, updateFn, pageSizeVar="", label=""){
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || 1)));
@@ -1753,9 +1815,11 @@ function statusDashboard(status, tasks, speed){
  const hourlyPostBudget = status.hourly_post_budget || {};
  const nntpThreads = status.nntp_threads || {};
  const compression = compressionSummary(stats);
- const par2 = par2Summary(stats);
- const attention = queueAttentionSummary(stats);
- const protectedPct = total ? Math.round((backed / total) * 100) : 0;
+  const par2 = par2Summary(stats);
+  const attention = queueAttentionSummary(stats);
+  const setup = status.setup_health || {};
+  const alerts = status.alerts || [];
+  const protectedPct = total ? Math.round((backed / total) * 100) : 0;
  const activeTask = tasks.find(task => task.status === "running");
  const nextTask = tasks
   .filter(task => task.status !== "running" && (task.next_run_at || task.time_until_next_run))
@@ -1768,8 +1832,10 @@ function statusDashboard(status, tasks, speed){
   <div>${protectedPct}% backed up &middot; ${backed} of ${total} files protected (${formatBytes(backedBytes)} of ${formatBytes(totalBytes)}) &middot; ${queued + posting} waiting or posting (${formatBytes(queuedBytes + postingBytes)}) &middot; ${chunks} chunks posted (${formatBytes(chunkBytes)})</div>
    <div>${pushLabel()}</div>
   </div>
-  <div class="task-strip">${tasks.map(taskCard).join("")}</div>
-  ${queueAttentionPanel(attention)}
+   <div class="task-strip">${tasks.map(taskCard).join("")}</div>
+   ${setupHealthPanel(setup)}
+   ${alertsPanel(alerts)}
+   ${queueAttentionPanel(attention)}
   ${updateCheckPanel(status.update_check || {})}
   <div class="stats">
    ${statCard("Files", total, "&#128196;")}
@@ -1809,6 +1875,24 @@ function statusDashboard(status, tasks, speed){
     ["unchecked", Math.max(0, chunks - verifiedChunks - missingChunks), "warn"]
    ])}
   </div>
+ </div>`;
+}
+function setupHealthPanel(setup){
+ if(!setup || !Array.isArray(setup.checks)) return "";
+ const failed = setup.checks.filter(check => !check.ok);
+ const pct = setup.checks.length ? Math.round(((setup.checks.length - failed.length) / setup.checks.length) * 100) : 100;
+ return `<div class="chart-card">
+  <h3><span class="ui-icon">${failed.length ? "&#9888;" : "&#10003;"}</span>Setup health</h3>
+  <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+  <div class="muted">${pct}% complete${failed.length ? ` / ${failed.length} item${failed.length === 1 ? "" : "s"} to fix` : ""}</div>
+  <div class="setup-checks">${setup.checks.map(check => `<div><span class="ui-icon">${check.ok ? "&#10003;" : "&#9888;"}</span><b>${esc(check.label)}</b><span class="muted">${esc(check.detail || "")}</span></div>`).join("")}</div>
+ </div>`;
+}
+function alertsPanel(alerts){
+ if(!alerts.length) return "";
+ return `<div class="hero-status danger-zone">
+  <h2><span class="ui-icon">&#128276;</span>Notifications</h2>
+  ${alerts.map(alert => `<div><b>${esc(alert.title)}</b> <span class="muted">${esc(alert.detail)}</span></div>`).join("")}
  </div>`;
 }
 function queueAttentionSummary(stats){
@@ -1973,8 +2057,9 @@ function statisticsDashboard(data){
  const providerProfiles = data.provider_profiles || [];
  const dbTables = data.db_tables || [];
  const verificationBacklog = data.verification_backlog || {};
- const maintenance = data.maintenance || [];
- const restoreDrills = data.restore_drills || [];
+  const maintenance = data.maintenance || [];
+  const restoreDrills = data.restore_drills || [];
+  const folderRollups = data.folder_rollups || [];
  const eventCounts = {};
  for(const event of events){ eventCounts[event.event_type] = (eventCounts[event.event_type] || 0) + 1; }
  const eventRows = Object.entries(eventCounts).sort((a,b)=>b[1]-a[1]).slice(0, 10).map(([label, value]) => [label, value, "ok"]);
@@ -1998,9 +2083,11 @@ function statisticsDashboard(data){
   ${table(backupRuns, ["id","file_id","status","reason","host","started_at","finished_at","chunks_done","chunks_total","bytes_done","bytes_total","error"])}
   <h2 class="section-title"><span class="ui-icon">&#128221;</span>Backup manifests</h2>
   ${table(backupManifests, ["id","file_id","backup_run_id","app_version","article_size","chunk_count","bytes_total","flags","created_at"])}
-  <h2 class="section-title"><span class="ui-icon">&#128202;</span>Database tables</h2>
-  ${table(dbTables, ["table","rows","estimated_bytes"])}
-  <h2 class="section-title"><span class="ui-icon">&#128225;</span>Provider profiles</h2>
+   <h2 class="section-title"><span class="ui-icon">&#128202;</span>Database tables</h2>
+   ${table(dbTables, ["table","rows","estimated_bytes"])}
+   <h2 class="section-title"><span class="ui-icon">&#128193;</span>Folder rollups</h2>
+   ${table(folderRollups, ["folder","files","bytes_total","backed_up_files","backed_up_bytes","verified_files","compressed_files","par2_files","attention_files"])}
+   <h2 class="section-title"><span class="ui-icon">&#128225;</span>Provider profiles</h2>
   ${table(providerProfiles, ["host_name","mode","checks","failures","max_article_size_bytes","avg_latency_ms","last_checked_at"])}
   <h2 class="section-title"><span class="ui-icon">&#128225;</span>Host health</h2>
   ${table(hostHealth, ["host_name","mode","status","article_size_bytes","latency_ms","checked_at","message"])}
@@ -2010,18 +2097,21 @@ function statisticsDashboard(data){
   ${table(restoreDrills, ["file_id","path","status","checked_at","bytes_checked","message"])}
  </div>`;
 }
-function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenance, drills, runs){
- return `<div class="dashboard">
-  <div class="toolbar">
+function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts){
+  return `<div class="dashboard">
+   <div class="toolbar">
    <button class="danger" onclick="post('/api/worker/pause',{kind:'all'}).then(updateOperationsPage)"><span class="ui-icon">&#9208;</span>Pause all workers</button>
    <button onclick="post('/api/worker/resume',{kind:'all'}).then(updateOperationsPage)"><span class="ui-icon">&#9658;</span>Resume all workers</button>
    <button class="primary" onclick="post('/api/health/check').then(updateOperationsPage)"><span class="ui-icon">&#128225;</span>Check hosts + article size</button>
    <button onclick="post('/api/maintenance/run', { vacuum:false }).then(updateOperationsPage)"><span class="ui-icon">&#128736;</span>Prune logs</button>
-   <button onclick="post('/api/maintenance/run', { vacuum:true }).then(updateOperationsPage)"><span class="ui-icon">&#128190;</span>Vacuum database</button>
-   <button onclick="post('/api/restore-drill/run').then(updateOperationsPage)"><span class="ui-icon">&#8635;</span>Run restore drill</button>
-   ${pushLabel()}
-  </div>
-  <h2 class="section-title"><span class="ui-icon">&#9208;</span>Worker controls</h2>
+    <button onclick="post('/api/maintenance/run', { vacuum:true }).then(updateOperationsPage)"><span class="ui-icon">&#128190;</span>Vacuum database</button>
+    <button onclick="post('/api/restore-drill/run').then(updateOperationsPage)"><span class="ui-icon">&#8635;</span>Run restore drill</button>
+    <button onclick="downloadDiagnostics()"><span class="ui-icon">&#128221;</span>Export diagnostics</button>
+    ${pushLabel()}
+   </div>
+   ${setupHealthPanel(setup)}
+   ${alertsPanel(alerts || [])}
+   <h2 class="section-title"><span class="ui-icon">&#9208;</span>Worker controls</h2>
   <div class="task-strip">${tasks.map(task => `<div class="task-card"><h3><span class="ui-icon">${kindIcon(task.kind)}</span>${esc(task.name)}</h3><div>${statePill(task.paused ? "paused" : task.status)}</div><div class="toolbar"><button onclick="post('/api/worker/pause',{kind:${jsString(task.kind)}}).then(updateOperationsPage)">Pause</button><button onclick="post('/api/worker/resume',{kind:${jsString(task.kind)}}).then(updateOperationsPage)">Resume</button></div></div>`).join("")}</div>
   <h2 class="section-title"><span class="ui-icon">&#128221;</span>Dry-run backup plan</h2>
   <div class="stats">
@@ -2032,7 +2122,8 @@ function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenan
    ${statCard("Estimated DB chunks", plan.estimated_chunk_rows || 0, "&#128202;")}
    ${statCard("PAR2 overhead", formatBytes(plan.estimated_par2_overhead_bytes || 0), "&#128737;")}
    ${statCard("Estimated time", plan.estimated_days_at_limit == null ? "No limit" : `${plan.estimated_days_at_limit} days`, "&#9201;")}
-  </div>
+   </div>
+   ${(plan.warnings || []).length ? `<div class="hero-status danger-zone"><h2><span class="ui-icon">&#9888;</span>Preflight warnings</h2>${plan.warnings.map(warning => `<div>${esc(warning)}</div>`).join("")}</div>` : ""}
   <h2 class="section-title"><span class="ui-icon">&#128300;</span>Scale benchmark model</h2>
   <div class="stats">
    ${statCard("Model files", benchmark.files || 0, "&#128196;")}
@@ -2055,7 +2146,19 @@ function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenan
   ${table(maintenance, ["kind","started_at","finished_at","result","details"])}
   <h2 class="section-title"><span class="ui-icon">&#8635;</span>Restore drill history</h2>
   ${table(drills, ["file_id","path","status","checked_at","bytes_checked","message"])}
- </div>`;
+  </div>`;
+}
+async function downloadDiagnostics(){
+ const data = await api("/api/diagnostics");
+ const blob = new Blob([JSON.stringify(data, null, 2)], {type:"application/json"});
+ const url = URL.createObjectURL(blob);
+ const link = document.createElement("a");
+ link.href = url;
+ link.download = `backuprr-diagnostics-${new Date().toISOString().replace(/[:.]/g,"-")}.json`;
+ document.body.appendChild(link);
+ link.click();
+ link.remove();
+ URL.revokeObjectURL(url);
 }
 function speedChart(title, rows){
  const width = 520, height = 170, pad = 28;
@@ -2596,6 +2699,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128230;</span>Backup task interval seconds</span><input id="setBackupInterval" type="number" min="1" value="${esc(s.backup_interval_seconds || 300)}"></label>
   <label class="field"><span><span class="ui-icon">&#9729;</span>Cloud backup interval seconds</span><input id="setCloudBackupInterval" type="number" min="1" value="${esc(s.cloud_backup_interval_seconds || 3600)}"></label>
   <label class="field"><span><span class="ui-icon">&#128736;</span>Maintenance interval seconds</span><input id="setMaintenanceInterval" type="number" min="1" value="${esc(s.maintenance_interval_seconds || 86400)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128190;</span>Auto-vacuum after compacted chunk rows</span><input id="setAutoVacuumAfterCompactionRows" type="number" min="0" value="${esc(s.auto_vacuum_after_compaction_rows ?? 100000)}"></label>
   <label class="field"><span><span class="ui-icon">&#8635;</span>Restore drill task interval seconds</span><input id="setRestoreDrillTaskInterval" type="number" min="1" value="${esc(s.restore_drill_task_interval_seconds || 86400)}"></label>
   <label class="field"><span><span class="ui-icon">&#128260;</span>Update check interval seconds</span><input id="setUpdateCheckInterval" type="number" min="3600" value="${esc(s.update_check_interval_seconds || 86400)}"></label>
   <label class="field"><span><span class="ui-icon">&#9202;</span>File stability seconds before posting</span><input id="setFileStabilitySeconds" type="number" min="0" max="86400" value="${esc(s.file_stability_seconds ?? 300)}"></label>
@@ -2632,6 +2736,11 @@ function settingsForm(s){
  </div></div>
  <div id="tabSecurity" class="tab-panel"><div class="form-grid">
   <div class="chart-card full"><h3><span class="ui-icon">&#128273;</span>External API</h3><p class="muted">Use <code>/external-api/status</code>, <code>/external-api/files</code>, <code>/external-api/queue</code>, and <code>/external-api/tasks</code> with <code>X-API-Key</code> or <code>Authorization: Bearer ...</code>. Stored keys: ${Number(s.external_api_key_count || 0)}.</p></div>
+  <div class="chart-card full"><h3><span class="ui-icon">&#128274;</span>Web UI Auth</h3><p class="muted">Optional Basic Auth protects browser pages and internal AJAX endpoints. Leave the password blank to keep the current value.</p></div>
+  <label class="field"><span><span class="ui-icon">&#128100;</span>Web UI username</span><input id="setWebUiUsername" value="${esc(s.web_ui_username || "admin")}"></label>
+  <label class="field"><span><span class="ui-icon">&#128273;</span>Web UI password</span><input id="setWebUiPassword" type="password" value="" autocomplete="new-password" placeholder="${s.has_web_ui_password ? "stored; leave blank to keep" : "optional"}"></label>
+  <label><input id="clearWebUiPassword" type="checkbox"> <span class="ui-icon">&#128465;</span>Disable Web UI password</label>
+  <label class="field full"><span><span class="ui-icon">&#128274;</span>Config secret key environment variable</span><input id="setConfigSecretKeyEnv" value="${esc(s.config_secret_key_env || "BACKUPRR_CONFIG_SECRET")}"></label>
   <label class="field full"><span><span class="ui-icon">&#128273;</span>Replace external API keys, one per line. Leave blank to keep existing keys.</span><textarea id="setExternalApiKeys" placeholder="Paste Home Assistant or automation API keys here"></textarea></label>
  <label><input id="clearExternalApiKeys" type="checkbox"> <span class="ui-icon">&#128465;</span>Clear all stored external API keys</label>
   <div class="chart-card full"><h3><span class="ui-icon">&#128260;</span>Update checks</h3><p class="muted">Backuprr checks GitHub releases on the configured schedule and stores the latest result locally.</p><div class="toolbar"><button onclick="post('/api/update-check/run').then(out=>settingsOut.textContent=JSON.stringify(out,null,2))"><span class="ui-icon">&#128260;</span>Check Now</button></div></div>
@@ -2824,6 +2933,7 @@ async function saveSettings(){
   backup_interval_seconds: Number(setBackupInterval.value),
   cloud_backup_interval_seconds: Number(setCloudBackupInterval.value),
   maintenance_interval_seconds: Number(setMaintenanceInterval.value),
+  auto_vacuum_after_compaction_rows: Number(setAutoVacuumAfterCompactionRows.value),
   restore_drill_task_interval_seconds: Number(setRestoreDrillTaskInterval.value),
   update_check_interval_seconds: Number(setUpdateCheckInterval.value),
   file_stability_seconds: Number(setFileStabilitySeconds.value),
@@ -2838,6 +2948,10 @@ async function saveSettings(){
   update_check_enabled: setUpdateCheckEnabled.checked,
   update_github_repo: setUpdateGithubRepo.value,
   update_check_timeout_seconds: Number(setUpdateCheckTimeout.value),
+  web_ui_username: setWebUiUsername.value,
+  web_ui_password: setWebUiPassword.value,
+  clear_web_ui_password: !!document.getElementById("clearWebUiPassword")?.checked,
+  config_secret_key_env: setConfigSecretKeyEnv.value,
   log_retention_days: Number(setLogRetentionDays.value),
   verbose_log_retention_days: Number(setVerboseLogRetentionDays.value),
   log_web_access: setLogWebAccess.checked,

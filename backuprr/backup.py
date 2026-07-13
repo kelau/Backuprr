@@ -445,6 +445,10 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         if getattr(config, "compact_chunk_rows", True):
             compacted = db.compact_chunks_to_manifest(file_id)
             db.log("debug", "post.compact", f"Compacted {compacted} chunk rows into manifest for {original}", file_id)
+            threshold = int(getattr(config, "auto_vacuum_after_compaction_rows", 0) or 0)
+            if threshold and compacted >= threshold:
+                db.vacuum_analyze()
+                db.log("info", "maintenance", f"Vacuumed database after compacting {compacted} chunk rows", file_id)
         db.log("info", "post", f"Posted backup for {original}", file_id)
         return file_id
     except PostNetworkBlockedError as exc:
