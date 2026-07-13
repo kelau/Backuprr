@@ -166,7 +166,12 @@ class Config:
     compression_min_gain_percent: int = 5
     queue_strategy: str = "older-first"
     auto_queue_exclude_patterns: List[str] = field(default_factory=list)
+    queue_pause_patterns: List[str] = field(default_factory=list)
+    retention_policy_patterns: List[str] = field(default_factory=list)
+    critical_verification_interval_days: int = 30
     external_api_keys: List[str] = field(default_factory=list)
+    api_rate_limit_per_minute: int = 120
+    external_api_rate_limit_per_minute: int = 60
     web_ui_username: str = "admin"
     web_ui_password: str = ""
     web_ui_role: str = "admin"
@@ -271,7 +276,12 @@ class Config:
             "compression_min_gain_percent": self.compression_min_gain_percent,
             "queue_strategy": self.queue_strategy,
             "auto_queue_exclude_patterns": self.auto_queue_exclude_patterns,
+            "queue_pause_patterns": self.queue_pause_patterns,
+            "retention_policy_patterns": self.retention_policy_patterns,
+            "critical_verification_interval_days": self.critical_verification_interval_days,
             "external_api_keys": self.external_api_keys,
+            "api_rate_limit_per_minute": self.api_rate_limit_per_minute,
+            "external_api_rate_limit_per_minute": self.external_api_rate_limit_per_minute,
             "web_ui_username": self.web_ui_username,
             "web_ui_password": self.web_ui_password,
             "web_ui_role": self.web_ui_role,
@@ -453,12 +463,31 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         config.queue_strategy = strategy
     if "auto_queue_exclude_patterns" in data:
         config.auto_queue_exclude_patterns = [str(item).strip() for item in data["auto_queue_exclude_patterns"] if str(item).strip()]
+    if "queue_pause_patterns" in data:
+        config.queue_pause_patterns = [str(item).strip() for item in data["queue_pause_patterns"] if str(item).strip()]
+    if "retention_policy_patterns" in data:
+        config.retention_policy_patterns = [str(item).strip() for item in data["retention_policy_patterns"] if str(item).strip()]
+    if "critical_verification_interval_days" in data:
+        days = int(data["critical_verification_interval_days"])
+        if days < 1 or days > 180:
+            raise ValueError("critical_verification_interval_days must be between 1 and 180")
+        config.critical_verification_interval_days = days
     if "external_api_keys" in data:
         keys = [str(item).strip() for item in data["external_api_keys"] if str(item).strip()]
         if keys:
             config.external_api_keys = keys
         elif data.get("clear_external_api_keys"):
             config.external_api_keys = []
+    if "api_rate_limit_per_minute" in data:
+        limit = int(data["api_rate_limit_per_minute"] or 0)
+        if limit < 0 or limit > 10000:
+            raise ValueError("api_rate_limit_per_minute must be between 0 and 10000")
+        config.api_rate_limit_per_minute = limit
+    if "external_api_rate_limit_per_minute" in data:
+        limit = int(data["external_api_rate_limit_per_minute"] or 0)
+        if limit < 0 or limit > 10000:
+            raise ValueError("external_api_rate_limit_per_minute must be between 0 and 10000")
+        config.external_api_rate_limit_per_minute = limit
     if "web_ui_username" in data:
         username = str(data["web_ui_username"]).strip()
         if not username:

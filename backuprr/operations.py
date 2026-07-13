@@ -1,3 +1,4 @@
+import fnmatch
 import hashlib
 import base64
 import hmac
@@ -10,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
+from .cloud_backup import backup_config_and_database
 from .config import Config
 from .db import Database, utcnow
 from .restore import restore_sample
@@ -190,6 +192,89 @@ def provider_confidence_report(db: Database) -> List[Dict[str, Any]]:
             score -= 10
         report.append({**dict(row), "confidence_score": max(0, min(100, score))})
     return report
+
+
+def retention_policy_for_path(config: Config, path: str) -> Dict[str, Any]:
+    """Resolve lightweight per-object retention hints from configured path patterns."""
+    text = str(path or "").replace("\\", "/")
+    name = Path(text).name
+    for pattern in getattr(config, "retention_policy_patterns", []) or []:
+        raw = str(pattern).strip()
+        if not raw:
+            continue
+        label = "critical"
+        expression = raw
+        interval = int(getattr(config, "critical_verification_interval_days", 30) or 30)
+        parts = raw.split(":", 2)
+        if len(parts) == 3 and parts[0].strip():
+            label = parts[0].strip()
+            expression = parts[1].strip()
+            try:
+                interval = int(parts[2])
+            except ValueError:
+                interval = int(getattr(config, "critical_verification_interval_days", 30) or 30)
+        elif len(parts) == 2 and parts[0].strip().isdigit():
+            expression = parts[1].strip()
+            interval = int(parts[0])
+        expression = expression or raw
+        lowered = expression.lower()
+        if fnmatch.fnmatch(text.lower(), lowered) or fnmatch.fnmatch(name.lower(), lowered):
+            return {
+                "policy": label,
+                "verification_interval_days": max(1, min(180, interval)),
+                "matched_pattern": raw,
+            }
+    return {
+        "policy": "standard",
+        "verification_interval_days": int(getattr(config, "verification_interval_days", 90) or 90),
+        "matched_pattern": "",
+    }
+
+
+def provider_failover_simulation(config: Config, failed_host: str = "") -> Dict[str, Any]:
+    """Model whether configured read/post paths survive a single host outage."""
+    failed = str(failed_host or "").strip()
+    results: Dict[str, Any] = {"failed_host": failed, "modes": {}, "ok": True}
+    for mode in ("read", "post"):
+        hosts = config.hosts_for_mode(mode)
+        remaining = [host for host in hosts if not failed or host.name != failed]
+        mode_ok = bool(remaining)
+        results["modes"][mode] = {
+            "configured": [host.name for host in hosts],
+            "remaining": [host.name for host in remaining],
+            "primary": remaining[0].name if remaining else "",
+            "ok": mode_ok,
+            "recommendation": "" if mode_ok else f"Add at least one {mode} host or reduce dependency on {failed or 'the failed host'}.",
+        }
+        results["ok"] = bool(results["ok"] and mode_ok)
+    return results
+
+
+def threat_model_report(db: Database, config: Config) -> Dict[str, Any]:
+    """Return the deployment assumptions and mitigations Backuprr can currently see."""
+    stats = db.stats()
+    mitigations = [
+        {"area": "Web UI", "status": "ok" if config.web_ui_password else "warning", "detail": "Basic Auth enabled" if config.web_ui_password else "No Web UI password configured"},
+        {"area": "Internal API", "status": "ok", "detail": "Browser AJAX calls require an in-memory token and CSRF token"},
+        {"area": "External API", "status": "ok" if config.external_api_keys else "warning", "detail": f"{len(config.external_api_keys)} API key(s) configured"},
+        {"area": "Secrets", "status": "ok" if os.getenv(config.config_secret_key_env) else "warning", "detail": f"Config secret env {config.config_secret_key_env} {'is set' if os.getenv(config.config_secret_key_env) else 'is not set'}"},
+        {"area": "Restore safety", "status": "ok" if config.restore_sandbox_enabled else "warning", "detail": "Origin restores are rehearsed in sandbox first" if config.restore_sandbox_enabled else "Restore sandbox is disabled"},
+        {"area": "Recovery metadata", "status": "ok" if int(stats.get("chunks_total", 0) or 0) else "warning", "detail": f"{int(stats.get('chunks_total', 0) or 0)} chunk metadata row(s) tracked"},
+    ]
+    return {
+        "assumptions": [
+            "The Web UI is intended for localhost, VPN, or trusted LAN access.",
+            "Usenet article subjects are obfuscated, but provider access and local config remain sensitive.",
+            "The catalog database is critical restore metadata and should be backed up independently.",
+        ],
+        "not_protected_against": [
+            "A fully compromised host with access to environment variables and config files.",
+            "Provider-side retention loss beyond what verification and re-posting can detect.",
+            "Exposure of the Web UI through an unauthenticated reverse proxy.",
+        ],
+        "mitigations": mitigations,
+        "recommendations": [item["detail"] for item in mitigations if item["status"] != "ok"],
+    }
 
 
 def db_growth_report(db: Database, config: Config) -> Dict[str, Any]:
@@ -408,7 +493,7 @@ def run_maintenance(db: Database, config: Config, vacuum: bool = False) -> Dict[
     return {"ok": True, "pruned_events": pruned, "compacted_transfer_samples": compacted_samples, "vacuum": bool(vacuum), "details": details}
 
 
-def restore_confidence(db: Database, source_path: str) -> Dict[str, Any]:
+def restore_confidence(db: Database, source_path: str, config: Config | None = None) -> Dict[str, Any]:
     """Score whether a file is likely restorable from currently cataloged chunk data."""
     with db.connect() as conn:
         row = conn.execute("SELECT * FROM files WHERE path=? OR relative_path=?", (source_path, source_path)).fetchone()
@@ -436,6 +521,20 @@ def restore_confidence(db: Database, source_path: str) -> Dict[str, Any]:
     score += int(verified_ratio * 20)
     if row["backup_par2"]:
         score += 10
+    policy = retention_policy_for_path(config, str(row["relative_path"] or row["path"])) if config else {
+        "policy": "standard",
+        "verification_interval_days": 90,
+        "matched_pattern": "",
+    }
+    if config:
+        provider_scores = [int(item.get("confidence_score", 0) or 0) for item in provider_confidence_report(db)]
+        if provider_scores:
+            score += int((sum(provider_scores) / len(provider_scores) - 50) / 10)
+        drill_rows = db.restore_drill_rows(1)
+        if drill_rows and drill_rows[0]["status"] == "ok":
+            score += 5
+        if policy["policy"] != "standard":
+            score += 3
     score = max(0, min(100, score))
     return {
         "file_id": int(row["id"]),
@@ -448,6 +547,7 @@ def restore_confidence(db: Database, source_path: str) -> Dict[str, Any]:
         "par2_protected": bool(row["backup_par2"]),
         "compressed": bool(row["backup_compressed"]),
         "last_verified": row["last_verify_at"] or chunks["last_verified"] or "",
+        "retention_policy": policy,
         "restorable": total > 0 and missing == 0,
         "warning": "" if total > 0 and missing == 0 else "missing or unavailable chunks may prevent restore",
     }
@@ -510,3 +610,32 @@ def restore_drill_due(db: Database, config: Config) -> bool:
         return True
     last = datetime.fromisoformat(rows[0]["checked_at"])
     return last <= datetime.now(timezone.utc) - timedelta(days=config.restore_drill_interval_days)
+
+
+def run_restore_rehearsal(db: Database, config: Config, source_path: str, sample_bytes: int | None = None) -> Dict[str, Any]:
+    """Read restore data into memory and discard it, proving the path without writing files."""
+    size = int(sample_bytes or config.restore_drill_sample_bytes or 1024 * 1024)
+    started = time.perf_counter()
+    payload = restore_sample(db, config, source_path, size)
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    with db.connect() as conn:
+        row = conn.execute("SELECT id FROM files WHERE path=? OR relative_path=?", (source_path, source_path)).fetchone()
+    file_id = int(row["id"]) if row else None
+    db.record_restore_drill(file_id, source_path, "ok", len(payload), f"restore rehearsal read {len(payload)} bytes in {elapsed_ms} ms")
+    return {"status": "ok", "path": source_path, "bytes_checked": len(payload), "elapsed_ms": elapsed_ms}
+
+
+def incident_mode(db: Database, config: Config) -> Dict[str, Any]:
+    """Pause workers and gather recovery artifacts after a suspected incident."""
+    db.set_paused("all", True)
+    diagnostics = diagnostics_bundle(db, config)
+    manifest = backup_manifest_export(db, config) if config.manifest_export_enabled else {"enabled": False}
+    cloud_results = backup_config_and_database(db, config) if config.cloud_backups else []
+    db.log("warning", "incident.mode", "Incident mode enabled: workers paused and recovery artifacts prepared")
+    return {
+        "ok": True,
+        "paused": db.paused_kinds(),
+        "diagnostics_events": len(diagnostics.get("recent_events", [])),
+        "manifest_bytes": manifest.get("bytes", 0),
+        "cloud_backups": cloud_results,
+    }

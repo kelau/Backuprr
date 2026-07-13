@@ -66,8 +66,10 @@ def file_is_stable(path: str, size: int, mtime_ns: int, stability_seconds: int) 
 def enqueue_unbacked(db: Database, config: Optional[Config] = None) -> int:
     count = 0
     skipped = 0
+    paused = 0
     unstable = 0
     patterns = list(getattr(config, "auto_queue_exclude_patterns", []) or [])
+    pause_patterns = list(getattr(config, "queue_pause_patterns", []) or [])
     stability_seconds = int(getattr(config, "file_stability_seconds", 0) or 0)
     strategy = str(getattr(config, "queue_strategy", "older-first") or "older-first")
     order = {
@@ -89,12 +91,16 @@ def enqueue_unbacked(db: Database, config: Optional[Config] = None) -> int:
         if patterns and excluded_by_auto_queue_filter(str(row["path"]), str(row["relative_path"]), patterns):
             skipped += 1
             continue
+        if pause_patterns and excluded_by_auto_queue_filter(str(row["path"]), str(row["relative_path"]), pause_patterns):
+            paused += 1
+            continue
         if stability_seconds and not file_is_stable(str(row["path"]), int(row["size"]), int(row["mtime_ns"]), stability_seconds):
             unstable += 1
             continue
         db.queue_file(int(row["id"]), priority=100, reason="unbacked")
         count += 1
     suffix = f", skipped {skipped} by auto-queue filter" if skipped else ""
+    suffix += f", paused {paused} by queue pause pattern" if paused else ""
     suffix += f", waiting for {unstable} unstable file(s)" if unstable else ""
     db.log("info" if count else "debug", "queue", f"Queued {count} unbacked files{suffix}")
     return count

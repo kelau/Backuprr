@@ -1,5 +1,6 @@
 import itertools
 import base64
+import copy
 import hmac
 import json
 import math
@@ -29,17 +30,21 @@ from .operations import (
     disaster_recovery_report,
     dry_run_plan,
     file_integrity_receipt,
+    incident_mode,
     notification_alerts,
     prometheus_metrics,
+    provider_failover_simulation,
     provider_confidence_report,
     restore_confidence,
     restore_plan,
     restore_preview,
+    run_restore_rehearsal,
     run_maintenance,
     run_restore_drill,
     setup_health_check,
     synthetic_catalog_plan,
     test_post_host_article_size,
+    threat_model_report,
 )
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder, restored_payloads
@@ -95,11 +100,13 @@ PAGE_ROUTES = {
     "/verification": "Verification",
     "/statistics": "Statistics",
     "/operations": "Operations",
+    "/security": "Security",
     "/settings": "Settings",
     "/about": "About",
 }
 
 INTERNAL_API_TOKEN = secrets.token_urlsafe(32)
+CSRF_TOKEN = secrets.token_urlsafe(32)
 
 
 def thread_usage_summary(posting_rows: list[dict[str, Any]], article_size: int, configured_threads: int) -> dict[str, int]:
@@ -141,6 +148,8 @@ class Handler(BaseHTTPRequestHandler):
     operation_counter = itertools.count(1)
     operation_revision = 0
     operations: dict[str, dict[str, Any]] = {}
+    rate_limit_lock = threading.Lock()
+    rate_limit_hits: dict[str, list[float]] = {}
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if getattr(self.config, "log_web_access", False):
@@ -211,8 +220,39 @@ class Handler(BaseHTTPRequestHandler):
         self.forbidden(f"{getattr(self.config, 'web_ui_role', 'read_only')} role cannot perform {action} actions")
         return False
 
+    def client_key(self, external: bool = False) -> str:
+        supplied = self.headers.get("X-API-Key", "") if external else ""
+        return f"{self.client_address[0]}:{'external' if external else 'internal'}:{supplied[:12]}"
+
+    def rate_limit_allows(self, external: bool = False) -> bool:
+        limit = int(
+            getattr(
+                self.config,
+                "external_api_rate_limit_per_minute" if external else "api_rate_limit_per_minute",
+                0,
+            )
+            or 0
+        )
+        if limit <= 0:
+            return True
+        now = time.time()
+        cutoff = now - 60
+        key = self.client_key(external)
+        with Handler.rate_limit_lock:
+            hits = [item for item in Handler.rate_limit_hits.get(key, []) if item >= cutoff]
+            if len(hits) >= limit:
+                Handler.rate_limit_hits[key] = hits
+                return False
+            hits.append(now)
+            Handler.rate_limit_hits[key] = hits
+        return True
+
+    def csrf_allows(self) -> bool:
+        supplied = self.headers.get("X-Backuprr-CSRF", "")
+        return bool(supplied) and secrets.compare_digest(supplied, CSRF_TOKEN)
+
     def action_for_post_path(self, path: str) -> str:
-        if path in {"/api/settings", "/api/maintenance/run", "/api/update-check/run"}:
+        if path in {"/api/settings", "/api/settings/validate", "/api/settings/profile/import", "/api/maintenance/run", "/api/update-check/run"}:
             return "admin"
         if path.startswith("/api/restore"):
             return "restore"
@@ -245,12 +285,15 @@ class Handler(BaseHTTPRequestHandler):
     def create_operation(self, kind: str, file_id: int | None, label: str, total: int = 0) -> str:
         with Handler.operation_lock:
             operation_id = str(next(Handler.operation_counter))
+            correlation_id = f"{kind}-{operation_id}-{secrets.token_hex(4)}"
             Handler.operations[operation_id] = {
                 "id": operation_id,
+                "correlation_id": correlation_id,
                 "kind": kind,
                 "file_id": file_id,
                 "label": label,
                 "status": "running",
+                "cancel_requested": False,
                 "done": 0,
                 "total": int(total or 0),
                 "bytes_done": 0,
@@ -260,6 +303,21 @@ class Handler(BaseHTTPRequestHandler):
             }
             Handler.operation_revision += 1
             return operation_id
+
+    def operation_canceled(self, operation_id: str) -> bool:
+        with Handler.operation_lock:
+            return bool(Handler.operations.get(operation_id, {}).get("cancel_requested"))
+
+    def cancel_operation(self, operation_id: str) -> bool:
+        with Handler.operation_lock:
+            operation = Handler.operations.get(operation_id)
+            if not operation or operation.get("status") != "running":
+                return False
+            operation["cancel_requested"] = True
+            operation["message"] = "Cancellation requested"
+            operation["updated_at"] = datetime.now(timezone.utc).isoformat()
+            Handler.operation_revision += 1
+            return True
 
     def update_operation(self, operation_id: str, done: int, total: int | None = None, bytes_done: int | None = None, message: str = "") -> None:
         with Handler.operation_lock:
@@ -318,13 +376,15 @@ class Handler(BaseHTTPRequestHandler):
         def worker() -> None:
             try:
                 def progress(done: int, total_chunks: int, bytes_done: int) -> None:
+                    if self.operation_canceled(operation_id):
+                        raise RuntimeError("operation canceled")
                     self.update_operation(operation_id, done, total_chunks, bytes_done, f"Restored {done}/{total_chunks} chunks")
 
                 target = restore_file(self.db, self.config, source_path, dest, progress=progress)
                 self.finish_operation(operation_id, "done", f"Restored to {target}")
             except Exception as exc:
                 self.db.log("error", "restore", f"Restore failed for {source_path}: {exc}", int(row["id"]))
-                self.finish_operation(operation_id, "failed", str(exc))
+                self.finish_operation(operation_id, "canceled" if "canceled" in str(exc).lower() else "failed", str(exc))
 
         threading.Thread(target=worker, name=f"backuprr-restore-{operation_id}", daemon=True).start()
         return operation_id
@@ -365,13 +425,15 @@ class Handler(BaseHTTPRequestHandler):
             for operation_id, row, target in operations:
                 try:
                     def progress(done: int, total_chunks: int, bytes_done: int, op_id: str = operation_id) -> None:
+                        if self.operation_canceled(op_id):
+                            raise RuntimeError("operation canceled")
                         self.update_operation(op_id, done, total_chunks, bytes_done, f"Restored {done}/{total_chunks} chunks")
 
                     restored_to = restore_file(self.db, self.config, str(row["path"]), target, progress=progress)
                     self.finish_operation(operation_id, "done", f"Restored to {restored_to}")
                 except Exception as exc:
                     self.db.log("error", "restore", f"Restore failed for {row['path']}: {exc}", int(row["id"]))
-                    self.finish_operation(operation_id, "failed", str(exc))
+                    self.finish_operation(operation_id, "canceled" if "canceled" in str(exc).lower() else "failed", str(exc))
 
         threading.Thread(target=worker, name="backuprr-folder-restore", daemon=True).start()
         return [operation_id for operation_id, _, _ in operations]
@@ -389,13 +451,15 @@ class Handler(BaseHTTPRequestHandler):
                 for operation_id, file_id in operations:
                     try:
                         def progress(done: int, total: int, op_id: str = operation_id) -> None:
+                            if self.operation_canceled(op_id):
+                                raise RuntimeError("operation canceled")
                             self.update_operation(op_id, done, total, message=f"Verified {done}/{total} chunks")
 
                         verified = verify_file_chunks(self.db, self.config, [file_id], progress=progress)
                         self.finish_operation(operation_id, "done", f"Verified {verified} chunks")
                     except Exception as exc:
                         self.db.log("error", "verify", f"Verification failed: {exc}", file_id)
-                        self.finish_operation(operation_id, "failed", str(exc))
+                        self.finish_operation(operation_id, "canceled" if "canceled" in str(exc).lower() else "failed", str(exc))
 
             threading.Thread(target=selected_worker, name="backuprr-selected-verify", daemon=True).start()
             return [operation_id for operation_id, _ in operations]
@@ -405,13 +469,15 @@ class Handler(BaseHTTPRequestHandler):
         def worker() -> None:
             try:
                 def progress(done: int, total: int) -> None:
+                    if self.operation_canceled(operation_id):
+                        raise RuntimeError("operation canceled")
                     self.update_operation(operation_id, done, total, message=f"Verified {done}/{total} chunks")
 
                 verified = verify_due_chunks(self.db, self.config, force=force, progress=progress)
                 self.finish_operation(operation_id, "done", f"Verified {verified} chunks")
             except Exception as exc:
                 self.db.log("error", "verify", f"Verification failed: {exc}")
-                self.finish_operation(operation_id, "failed", str(exc))
+                self.finish_operation(operation_id, "canceled" if "canceled" in str(exc).lower() else "failed", str(exc))
 
         threading.Thread(target=worker, name=f"backuprr-verify-{operation_id}", daemon=True).start()
         return [operation_id]
@@ -423,14 +489,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"ok": True, "version": __version__, "database": self.config.db_path().exists()})
         elif parsed.path == "/metrics":
             self.send_text(prometheus_metrics(self.db, self.config), "text/plain; version=0.0.4; charset=utf-8")
+        elif parsed.path.startswith("/external-api/") and not self.rate_limit_allows(external=True):
+            self.send_json({"error": "rate limit exceeded"}, 429)
         elif (parsed.path in PAGE_ROUTES or parsed.path.startswith("/api/")) and not self.web_ui_authorized():
             self.unauthorized("web UI authentication is required")
+        elif parsed.path.startswith("/api/") and not self.rate_limit_allows(external=False):
+            self.send_json({"error": "rate limit exceeded"}, 429)
         elif parsed.path in PAGE_ROUTES:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_security_headers()
             self.end_headers()
-            self.wfile.write(INDEX_HTML.replace("__INTERNAL_API_TOKEN__", INTERNAL_API_TOKEN).encode("utf-8"))
+            self.wfile.write(INDEX_HTML.replace("__INTERNAL_API_TOKEN__", INTERNAL_API_TOKEN).replace("__CSRF_TOKEN__", CSRF_TOKEN).encode("utf-8"))
         elif parsed.path.startswith("/external-api/"):
             if not self.external_api_authorized():
                 self.unauthorized("external API key is required")
@@ -493,6 +563,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(diagnostics_bundle(self.db, self.config))
         elif parsed.path == "/api/provider-confidence":
             self.send_json(provider_confidence_report(self.db))
+        elif parsed.path == "/api/provider-failover":
+            self.send_json(provider_failover_simulation(self.config, query.get("host", [""])[0]))
+        elif parsed.path == "/api/threat-model":
+            self.send_json(threat_model_report(self.db, self.config))
         elif parsed.path == "/api/db-growth":
             self.send_json(db_growth_report(self.db, self.config))
         elif parsed.path == "/api/manifest/export":
@@ -585,6 +659,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(self.all_tasks())
         elif parsed.path == "/api/settings":
             self.send_json(self.config.public_dict())
+        elif parsed.path == "/api/settings/profile/export":
+            self.send_json({"profile": self.config.public_dict(), "exported_at": datetime.now(timezone.utc).isoformat(), "version": __version__})
         elif parsed.path == "/api/operations/progress":
             self.send_json({"operations": self.operation_rows()})
         else:
@@ -594,6 +670,9 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path.startswith("/external-api/"):
+                if not self.rate_limit_allows(external=True):
+                    self.send_json({"error": "rate limit exceeded"}, 429)
+                    return
                 if not self.external_api_authorized():
                     self.unauthorized("external API key is required")
                     return
@@ -604,6 +683,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if parsed.path.startswith("/api/") and not self.internal_api_authorized():
                 self.forbidden("internal API token is required")
+                return
+            if parsed.path.startswith("/api/") and not self.csrf_allows():
+                self.forbidden("CSRF token is required")
+                return
+            if parsed.path.startswith("/api/") and not self.rate_limit_allows(external=False):
+                self.send_json({"error": "rate limit exceeded"}, 429)
                 return
             if parsed.path.startswith("/api/") and not self.require_role(self.action_for_post_path(parsed.path)):
                 return
@@ -656,6 +741,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.db.set_paused(kind, False)
                 audit_event(self.db, self.config, self.config.web_ui_username, "worker.resume", {"kind": kind})
                 self.send_json({"ok": True, "paused": self.db.paused_kinds()})
+            elif parsed.path == "/api/operations/cancel":
+                operation_id = str(data.get("operation_id", ""))
+                self.send_json({"ok": self.cancel_operation(operation_id), "operation_id": operation_id})
             elif parsed.path == "/api/health/check":
                 self.send_json({"hosts": check_usenet_hosts(self.db, self.config)})
             elif parsed.path == "/api/health/article-size":
@@ -673,10 +761,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(run_maintenance(self.db, self.config, vacuum=bool(data.get("vacuum"))))
             elif parsed.path == "/api/restore-drill/run":
                 self.send_json(run_restore_drill(self.db, self.config))
+            elif parsed.path == "/api/restore/rehearsal":
+                self.send_json(run_restore_rehearsal(self.db, self.config, data["path"], int(data.get("sample_bytes") or 0) or None))
+            elif parsed.path == "/api/incident/start":
+                self.send_json(incident_mode(self.db, self.config))
             elif parsed.path == "/api/update-check/run":
                 self.send_json(check_for_updates(self.db, self.config))
             elif parsed.path == "/api/restore/confidence":
-                self.send_json(restore_confidence(self.db, data["path"]))
+                self.send_json(restore_confidence(self.db, data["path"], self.config))
             elif parsed.path == "/api/restore/plan":
                 self.send_json(restore_plan(self.db, data["path"], data.get("dest") or ""))
             elif parsed.path == "/api/restore/preview":
@@ -694,6 +786,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"operation_ids": self.start_folder_restore_operations(data["path"], data.get("dest"))})
                 else:
                     self.send_json({"operation_id": self.start_restore_operation(data["path"], data.get("dest"))})
+            elif parsed.path == "/api/settings/validate":
+                candidate = copy.deepcopy(self.config)
+                update_config(candidate, data)
+                self.send_json({"ok": True, "settings": candidate.public_dict()})
+            elif parsed.path == "/api/settings/profile/import":
+                profile = dict(data.get("profile") or data)
+                update_config(self.config, profile)
+                self.config.save(self.config_path)
+                self.db.log("info", "settings.profile", "Imported settings profile")
+                self.send_json({"ok": True, "settings": self.config.public_dict()})
             elif parsed.path == "/api/settings":
                 update_config(self.config, data)
                 self.config.save(self.config_path)
@@ -1122,6 +1224,8 @@ pre { white-space:pre-wrap; background:var(--panel); border:1px solid var(--line
 .task-detail { color:var(--muted); background:var(--panel-2); }
 .task-detail td { padding-top:6px; padding-bottom:10px; }
 .task-row-actions { display:flex; flex-wrap:wrap; gap:6px; justify-content:flex-end; }
+.operation-line { display:grid; grid-template-columns:minmax(180px,1fr) minmax(220px,2fr) auto; gap:10px; align-items:center; padding:8px 0; border-bottom:1px solid var(--line); }
+.operation-line:last-child { border-bottom:0; }
 .version-notice { position:fixed; right:18px; bottom:18px; z-index:50; width:min(420px,calc(100vw - 36px)); background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:14px; box-shadow:var(--shadow); display:grid; gap:10px; }
 .version-notice h3 { margin:0; font-size:15px; display:flex; align-items:center; gap:6px; }
 .version-notice ul { margin:0; padding-left:20px; color:var(--muted); }
@@ -1137,10 +1241,10 @@ pre { white-space:pre-wrap; background:var(--panel); border:1px solid var(--line
 </main>
 <div id="versionNotice"></div>
 <script>
-const pages = ["Status","Files","Search","Log","Queue","Tasks","Verification","Statistics","Operations","Settings","About"];
+const pages = ["Status","Files","Search","Log","Queue","Tasks","Verification","Statistics","Operations","Security","Settings","About"];
 const pageSlugs = {
  Status:"/status", Files:"/files", Search:"/search", Log:"/log", Queue:"/queue", Tasks:"/tasks",
- Verification:"/verification", Statistics:"/statistics", Operations:"/operations", Settings:"/settings", About:"/about"
+ Verification:"/verification", Statistics:"/statistics", Operations:"/operations", Security:"/security", Settings:"/settings", About:"/about"
 };
 const slugPages = Object.fromEntries(Object.entries(pageSlugs).map(([name, slug]) => [slug, name]));
 const themeTemplates = [
@@ -1151,6 +1255,7 @@ const themeTemplates = [
  { id:"nordic_mint", name:"Nordic Mint" }
 ];
 const internalApiToken = "__INTERNAL_API_TOKEN__";
+const csrfToken = "__CSRF_TOKEN__";
 let page = pageFromPath(location.pathname);
 let settingsCache = null;
 let fileRowsCache = [];
@@ -1193,6 +1298,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.78":["Added threat model reporting, CSRF protection, API rate limits, operation cancellation, incident mode, restore rehearsal, failover simulation, settings profiles, queue pause patterns, and retention hints."],
  "0.2.77":["Added role-gated web actions, manifest export, provider confidence, restore sandbox mode, integrity receipts, retry policy controls, signed audit events, safer bulk previews, and database growth reporting."],
  "0.2.76":["Added setup health checks, alerts, diagnostics export, optional Web UI Basic Auth, opt-in config secret protection, folder rollups, dry-run warnings, and restore drill rotation improvements."],
  "0.2.75":["Completed backup chunk rows can now compact into a per-file manifest after success, keeping in-flight posts resumable while reducing database volume at scale."],
@@ -1206,7 +1312,7 @@ const releaseNotes = {
  "0.2.67":["Completed queue now shows stored chunk count instead of progress."],
  "0.2.66":["Retryable failed queue items recover after settings fixes.","Completed network-blocked rows no longer need attention."]
 };
-const api = (url, opts={}) => fetch(url, {...opts, headers:{"Content-Type":"application/json","X-Backuprr-Internal-Token":internalApiToken, ...(opts.headers || {})}}).then(r => r.json());
+const api = (url, opts={}) => fetch(url, {...opts, headers:{"Content-Type":"application/json","X-Backuprr-Internal-Token":internalApiToken,"X-Backuprr-CSRF":csrfToken, ...(opts.headers || {})}}).then(r => r.json());
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
 function jsString(v){ return JSON.stringify(String(v ?? "")).replace(/</g, "\\u003c"); }
@@ -1352,7 +1458,7 @@ function iconText(icon, text, cls=""){
  return `<span class="${cls}"><span class="ui-icon">${icon}</span>${esc(text)}</span>`;
 }
 function pageIcon(name){
- return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Operations:"&#128736;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
+ return ({Status:"&#128202;",Files:"&#128193;",Search:"&#128269;",Log:"&#128221;",Queue:"&#128230;",Tasks:"&#9881;",Verification:"&#10003;",Statistics:"&#128200;",Operations:"&#128736;",Security:"&#128737;",Settings:"&#128295;",About:"&#8505;"}[name] || "&#8226;");
 }
 function pageFromPath(path){
  const clean = String(path || "/").replace(/\/+$/, "") || "/";
@@ -1522,6 +1628,10 @@ async function render(){
   c.innerHTML = `<div id="operationsPanel"></div>`;
   await updateOperationsPage();
  }
+ if(page==="Security"){
+  c.innerHTML = `<div id="securityPanel"></div>`;
+  await updateSecurityPage();
+ }
  if(page==="Settings"){ settingsCache = await loadSettings(); c.innerHTML = settingsForm(settingsCache); initSettingsDirtyTracking(); }
  if(page==="About"){ c.innerHTML = aboutPage(); const s=await api("/api/status"); appVersion = s.version; updateVersionPillText(); maybeShowVersionNotice(appVersion); document.getElementById("aboutVersion").textContent=s.version; }
 }
@@ -1533,6 +1643,7 @@ async function refreshCurrentLivePage(){
  if(page==="Verification") await updateVerificationPage();
  if(page==="Statistics") await updateStatisticsPage();
  if(page==="Operations") await updateOperationsPage();
+ if(page==="Security") await updateSecurityPage();
 }
 async function refreshPageForChanges(previous, token){
  const filesChanged = previous.files_updated !== token.files_updated || previous.files_total !== token.files_total;
@@ -1550,6 +1661,7 @@ async function refreshPageForChanges(previous, token){
  if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged || operationsChanged)) await updateVerificationPage();
  if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged || transferChanged)) await updateStatisticsPage();
  if(page==="Operations" && (eventsChanged || tasksChanged || transferChanged)) await updateOperationsPage();
+ if(page==="Security" && eventsChanged) await updateSecurityPage();
 }
 async function updateStatusPage(){
  const s = await api("/api/status");
@@ -1823,7 +1935,8 @@ async function updateStatisticsPage(){
  if(target) target.innerHTML = statisticsDashboard(data);
 }
 async function updateOperationsPage(){
- const [tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts] = await Promise.all([
+ await refreshOperationProgress();
+ const [tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts, failover] = await Promise.all([
   api("/api/tasks"),
   api("/api/dry-run"),
   api("/api/benchmark?files=50000&size=1073741824&folders=1000"),
@@ -1833,10 +1946,21 @@ async function updateOperationsPage(){
   api("/api/restore-drills"),
   api("/api/backup-runs?limit=20"),
   api("/api/setup-health"),
-  api("/api/alerts")
+  api("/api/alerts"),
+  api("/api/provider-failover")
  ]);
  const target = document.getElementById("operationsPanel");
- if(target) target.innerHTML = operationsDashboard(tasks, plan, benchmark, recovery, health.hosts || [], maintenance || [], drills || [], runs || [], setup, alerts.alerts || []);
+ if(target) target.innerHTML = operationsDashboard(tasks, plan, benchmark, recovery, health.hosts || [], maintenance || [], drills || [], runs || [], setup, alerts.alerts || [], failover);
+}
+async function updateSecurityPage(){
+ const [model, setup, recovery, settings] = await Promise.all([
+  api("/api/threat-model"),
+  api("/api/setup-health"),
+  api("/api/disaster-recovery"),
+  api("/api/settings")
+ ]);
+ const target = document.getElementById("securityPanel");
+ if(target) target.innerHTML = securityDashboard(model, setup, recovery, settings);
 }
 function paginationControls(result, pageVar, updateFn, pageSizeVar="", label=""){
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || 1)));
@@ -2169,11 +2293,12 @@ function statisticsDashboard(data){
   ${table(restoreDrills, ["file_id","path","status","checked_at","bytes_checked","message"])}
  </div>`;
 }
-function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts){
+function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts, failover){
   return `<div class="dashboard">
    <div class="toolbar">
    <button class="danger" onclick="post('/api/worker/pause',{kind:'all'}).then(updateOperationsPage)"><span class="ui-icon">&#9208;</span>Pause all workers</button>
    <button onclick="post('/api/worker/resume',{kind:'all'}).then(updateOperationsPage)"><span class="ui-icon">&#9658;</span>Resume all workers</button>
+   <button class="danger" onclick="post('/api/incident/start').then(out=>showInlineJson('operationsIncidentOut', out)).then(updateOperationsPage)"><span class="ui-icon">&#128680;</span>Incident mode</button>
    <button class="primary" onclick="post('/api/health/check').then(updateOperationsPage)"><span class="ui-icon">&#128225;</span>Check hosts + article size</button>
    <button onclick="post('/api/maintenance/run', { vacuum:false }).then(updateOperationsPage)"><span class="ui-icon">&#128736;</span>Prune logs</button>
     <button onclick="post('/api/maintenance/run', { vacuum:true }).then(updateOperationsPage)"><span class="ui-icon">&#128190;</span>Vacuum database</button>
@@ -2182,8 +2307,10 @@ function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenan
     <button onclick="downloadManifestExport()"><span class="ui-icon">&#128230;</span>Export manifest</button>
     ${pushLabel()}
    </div>
+   <pre id="operationsIncidentOut"></pre>
    ${setupHealthPanel(setup)}
    ${alertsPanel(alerts || [])}
+   ${operationProgressPanel()}
    <h2 class="section-title"><span class="ui-icon">&#9208;</span>Worker controls</h2>
   <div class="task-strip">${tasks.map(task => `<div class="task-card"><h3><span class="ui-icon">${kindIcon(task.kind)}</span>${esc(task.name)}</h3><div>${statePill(task.paused ? "paused" : task.status)}</div><div class="toolbar"><button onclick="post('/api/worker/pause',{kind:${jsString(task.kind)}}).then(updateOperationsPage)">Pause</button><button onclick="post('/api/worker/resume',{kind:${jsString(task.kind)}}).then(updateOperationsPage)">Resume</button></div></div>`).join("")}</div>
   <h2 class="section-title"><span class="ui-icon">&#128221;</span>Dry-run backup plan</h2>
@@ -2211,6 +2338,8 @@ function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenan
    <div class="muted">Database: ${esc(recovery.database || "")} &middot; Config: ${esc(recovery.config || "")}</div>
    <div>${esc((recovery.issues || []).join(" / ") || "Config, database, and catalog metadata are present.")}</div>
   </div>
+  <h2 class="section-title"><span class="ui-icon">&#8644;</span>Provider failover simulation</h2>
+  ${failoverPanel(failover)}
   <h2 class="section-title"><span class="ui-icon">&#128225;</span>Provider health</h2>
   ${table(health, ["host_name","mode","status","article_size_bytes","latency_ms","checked_at","message"])}
   <h2 class="section-title"><span class="ui-icon">&#128230;</span>Recent backup sessions</h2>
@@ -2220,6 +2349,69 @@ function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenan
   <h2 class="section-title"><span class="ui-icon">&#8635;</span>Restore drill history</h2>
   ${table(drills, ["file_id","path","status","checked_at","bytes_checked","message"])}
   </div>`;
+}
+function showInlineJson(id, out){
+ const target = document.getElementById(id);
+ if(target) target.textContent = JSON.stringify(out, null, 2);
+ return out;
+}
+function operationProgressPanel(){
+ const running = operationRowsCache.filter(op => op.status === "running");
+ if(!running.length) return "";
+ return `<div class="chart-card">
+  <h3><span class="ui-icon">&#9658;</span>Running operations</h3>
+  ${running.map(op => `<div class="operation-line"><div><b>${esc(labelize(op.kind))}</b> <span class="muted">${esc(op.label || "")}</span></div>${inlineOperationProgress(op)}<button class="danger" onclick="cancelOperation(${jsString(op.id)})">Cancel</button></div>`).join("")}
+ </div>`;
+}
+function inlineOperationProgress(op){
+ const total = Number(op.total || 0);
+ const done = Number(op.done || 0);
+ const pct = total ? Math.min(100, Math.round((done / total) * 100)) : 5;
+ const bytes = Number(op.bytes_done || 0) ? ` / ${formatBytes(op.bytes_done)}` : "";
+ return `<div class="file-progress"><div class="progress-track"><div class="progress-fill" style="width:${Math.max(3,pct)}%"></div></div><span>${esc(op.message || `${done}/${total || "?"}`)}${esc(bytes)}</span></div>`;
+}
+async function cancelOperation(operationId){
+ await post("/api/operations/cancel", { operation_id: operationId });
+ await refreshOperationProgress();
+ if(page === "Operations") updateOperationsPage();
+ if(page === "Files") updateFilesPage();
+ if(page === "Verification") updateVerificationPage();
+}
+function failoverPanel(report){
+ if(!report || !report.modes) return `<p class="muted">No failover data available.</p>`;
+ return `<div class="chart-grid">${Object.entries(report.modes).map(([mode, data]) => `<div class="chart-card">
+  <h3><span class="ui-icon">${data.ok ? "&#10003;" : "&#9888;"}</span>${esc(labelize(mode))}</h3>
+  <div class="muted">Configured: ${esc((data.configured || []).join(", ") || "none")}</div>
+  <div>Primary after failure: <b>${esc(data.primary || "none")}</b></div>
+  <div class="${data.ok ? "muted" : "error"}">${esc(data.recommendation || "At least one host remains available.")}</div>
+ </div>`).join("")}</div>`;
+}
+function securityDashboard(model, setup, recovery, settings){
+ const mitigations = model.mitigations || [];
+ return `<div class="dashboard">
+  <div class="hero-status">
+   <h2><span class="ui-icon">&#128737;</span>Security posture</h2>
+   <div class="muted">This page describes what Backuprr can protect directly and what still depends on deployment hygiene.</div>
+  </div>
+  <div class="stats">
+   ${statCard("Web auth", settings.has_web_ui_password ? "Enabled" : "Off", "&#128274;")}
+   ${statCard("External keys", Number(settings.external_api_key_count || 0), "&#128273;")}
+   ${statCard("API rate limit", `${Number(settings.api_rate_limit_per_minute || 0) || "Off"}/min`, "&#9201;")}
+   ${statCard("External limit", `${Number(settings.external_api_rate_limit_per_minute || 0) || "Off"}/min`, "&#9201;")}
+  </div>
+  <h2 class="section-title"><span class="ui-icon">&#10003;</span>Mitigations</h2>
+  <div class="chart-grid">${mitigations.map(item => `<div class="chart-card">
+   <h3><span class="ui-icon">${item.status === "ok" ? "&#10003;" : "&#9888;"}</span>${esc(item.area)}</h3>
+   <div class="muted">${esc(item.detail)}</div>
+  </div>`).join("")}</div>
+  <h2 class="section-title"><span class="ui-icon">&#128221;</span>Assumptions</h2>
+  <div class="chart-card">${(model.assumptions || []).map(item => `<div>${esc(item)}</div>`).join("")}</div>
+  <h2 class="section-title"><span class="ui-icon">&#9888;</span>Not protected against</h2>
+  <div class="chart-card">${(model.not_protected_against || []).map(item => `<div>${esc(item)}</div>`).join("")}</div>
+  ${setupHealthPanel(setup)}
+  <h2 class="section-title"><span class="ui-icon">&#128737;</span>Recovery readiness</h2>
+  <div class="hero-status ${recovery.ok ? "" : "danger-zone"}"><h2>${recovery.ok ? "Recovery inputs look complete" : "Recovery needs attention"}</h2><div>${esc((recovery.issues || []).join(" / ") || "No open recovery issues.")}</div></div>
+ </div>`;
 }
 async function downloadDiagnostics(){
  const data = await api("/api/diagnostics");
@@ -2503,7 +2695,7 @@ function backupFeaturePills(file){
  return pills.join("");
 }
 function restoreDropdown(fileId){
- return `<details class="dropdown" onclick="event.stopPropagation()"><summary class="icon-btn" title="Restore or download">&#8635;</summary><div class="dropdown-menu restore-destination"><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'origin')">Restore To Origin</button><button onclick="showRestoreDestination(${Number(fileId)})">Restore To New Destination</button><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'download')">Download In Browser</button><button onclick="showIntegrityReceipt(${Number(fileId)})">Integrity Receipt</button><div id="restoreDest${Number(fileId)}" class="hidden"><input placeholder="Destination path"><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'destination', this.previousElementSibling.value)">Restore</button></div></div></details>`;
+ return `<details class="dropdown" onclick="event.stopPropagation()"><summary class="icon-btn" title="Restore or download">&#8635;</summary><div class="dropdown-menu restore-destination"><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'origin')">Restore To Origin</button><button onclick="showRestoreDestination(${Number(fileId)})">Restore To New Destination</button><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'download')">Download In Browser</button><button onclick="restoreRehearsal(${Number(fileId)})">Restore Rehearsal</button><button onclick="showIntegrityReceipt(${Number(fileId)})">Integrity Receipt</button><div id="restoreDest${Number(fileId)}" class="hidden"><input placeholder="Destination path"><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'destination', this.previousElementSibling.value)">Restore</button></div></div></details>`;
 }
 async function showIntegrityReceipt(fileId){
  closeDropdowns();
@@ -2743,6 +2935,14 @@ async function restoreCatalogFileMode(fileId, mode, destValue=""){
  setRestoreStatus(out.error || `Restore started for ${file.relative_path || file.path}.`, out.error ? "bad" : "warn", !out.error);
  await updateFilesPage();
 }
+async function restoreRehearsal(fileId){
+ const file = fileRowsCache.find(row => Number(row.id) === Number(fileId));
+ if(!file) return;
+ closeDropdowns();
+ setRestoreStatus(`Running restore rehearsal for ${file.relative_path || file.path}...`, "warn", true);
+ const out = await post("/api/restore/rehearsal", { path:file.path });
+ setRestoreStatus(out.error || `Restore rehearsal read ${formatBytes(out.bytes_checked || 0)} in ${out.elapsed_ms || 0} ms.`, out.error ? "bad" : "ok", true);
+}
 async function restoreCatalogFolder(path){
  return restoreCatalogFolderMode(path, "origin");
 }
@@ -2775,7 +2975,7 @@ function settingsForm(s){
  return `<div class="settings-header"><div class="tabs">
   ${["General","Usenet","Protection","Schedules","Endpoints","Logging","Security","Cloud"].map((name,index)=>`<button class="${index===0?"primary":""}" onclick="showSettingsTab('${name}', this)">${name}</button>`).join("")}
  </div><div class="toolbar-right"><button id="saveSettingsButton" class="primary" onclick="saveSettings()" disabled><span class="ui-icon">&#128190;</span>Save Settings</button><button id="resetSettingsButton" onclick="render()" disabled><span class="ui-icon">&#8635;</span>Reset</button></div></div>
- <div id="tabGeneral" class="tab-panel active"><div class="form-grid">
+ <div id="tabGeneral" class="tab-panel active"><h2 class="section-title"><span class="ui-icon">&#10003;</span>Basic</h2><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#127912;</span>UI template</span><select id="setUiTheme" onchange="applyTheme(this.value)">${themeOptions(s.ui_theme || "harbor_light")}</select></label>
   <label class="field"><span><span class="ui-icon">&#128101;</span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
   <label class="field"><span><span class="ui-icon">&#129513;</span>Article size</span><div class="range-field"><input id="setArticleSizeKib" type="range" min="100" max="5120" step="100" value="${esc(bytesToKib(s.article_size || 786432))}" oninput="setArticleSizeLabel.textContent=articleSizeLabel(this.value)"><span id="setArticleSizeLabel">${esc(articleSizeLabel(bytesToKib(s.article_size || 786432)))}</span></div></label>
@@ -2784,6 +2984,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128230;</span>Default queue strategy</span><select id="setQueueStrategy"><option value="older-first" ${s.queue_strategy==="older-first"?"selected":""}>Older First</option><option value="larger-first" ${s.queue_strategy==="larger-first"?"selected":""}>Larger First</option><option value="smaller-first" ${s.queue_strategy==="smaller-first"?"selected":""}>Smaller First</option><option value="folder-first" ${s.queue_strategy==="folder-first"?"selected":""}>Folder First</option></select></label>
   <label class="field"><span><span class="ui-icon">&#8635;</span>NNTP retry attempts</span><input id="setRetryAttempts" type="number" min="1" max="10" value="${esc(s.usenet_retry_attempts || 2)}"></label>
   <label class="field"><span><span class="ui-icon">&#9201;</span>NNTP retry backoff seconds</span><input id="setRetryBackoff" type="number" min="0" max="3600" value="${esc(s.usenet_retry_backoff_seconds || 5)}"></label>
+  <h2 class="section-title full"><span class="ui-icon">&#9881;</span>Advanced</h2>
   <label class="field full"><span><span class="ui-icon">&#8635;</span>Retry policy JSON</span><textarea id="setProviderRetryPolicy">${esc(JSON.stringify(s.provider_retry_policy || {}, null, 2))}</textarea></label>
   <label class="field"><span><span class="ui-icon">&#9208;</span>Auto-pause auth failures</span><input id="setAutoPauseAuthFailures" type="number" min="0" max="100" value="${esc(s.auto_pause_auth_failures ?? 3)}"></label>
   <label class="field"><span><span class="ui-icon">&#9208;</span>Auto-pause provider failures</span><input id="setAutoPauseProviderFailures" type="number" min="0" max="1000" value="${esc(s.auto_pause_provider_failures ?? 10)}"></label>
@@ -2801,7 +3002,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128260;</span>Update check interval seconds</span><input id="setUpdateCheckInterval" type="number" min="3600" value="${esc(s.update_check_interval_seconds || 86400)}"></label>
   <label class="field"><span><span class="ui-icon">&#9202;</span>File stability seconds before posting</span><input id="setFileStabilitySeconds" type="number" min="0" max="86400" value="${esc(s.file_stability_seconds ?? 300)}"></label>
  </div></div>
- <div id="tabProtection" class="tab-panel"><div class="form-grid">
+ <div id="tabProtection" class="tab-panel"><h2 class="section-title"><span class="ui-icon">&#10003;</span>Basic</h2><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#128274;</span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
   <label><input id="setCompressFiles" type="checkbox" ${s.compress_files?"checked":""}> <span class="ui-icon">&#128451;</span>Compress files</label>
   <label class="field"><span><span class="ui-icon">&#128300;</span>Compression sample bytes</span><input id="setCompressionSampleBytes" type="number" min="0" max="${64 * 1024 * 1024}" value="${esc(s.compression_sample_bytes ?? 2097152)}"></label>
@@ -2810,16 +3011,20 @@ function settingsForm(s){
   <label><input id="setPar2" type="checkbox" ${s.par2?.enabled?"checked":""}> <span class="ui-icon">&#128737;</span>Generate PAR2 recovery files</label>
   <label class="field"><span><span class="ui-icon">&#9881;</span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
   <label class="field"><span><span class="ui-icon">&#128737;</span>PAR2 redundancy</span><div class="range-field"><input id="setPar2Redundancy" type="range" min="1" max="50" step="1" value="${esc(s.par2?.redundancy_percent ?? 10)}" oninput="setPar2RedundancyLabel.textContent=this.value + '%'"><span id="setPar2RedundancyLabel">${esc(s.par2?.redundancy_percent ?? 10)}%</span></div></label>
+  <h2 class="section-title full"><span class="ui-icon">&#9881;</span>Advanced</h2>
   <label><input id="setCompactChunkMetadata" type="checkbox" ${s.compact_chunk_metadata === false ? "" : "checked"}> <span class="ui-icon">&#128451;</span>Compact stored chunk metadata</label>
   <label><input id="setCompactChunkRows" type="checkbox" ${s.compact_chunk_rows === false ? "" : "checked"}> <span class="ui-icon">&#129513;</span>Compact completed chunk rows</label>
   <label class="field"><span><span class="ui-icon">&#8635;</span>Restore drill interval days</span><input id="setRestoreDrillDays" type="number" min="1" max="3650" value="${esc(s.restore_drill_interval_days || 30)}"></label>
-  <label class="field"><span><span class="ui-icon">&#128207;</span>Restore drill sample bytes</span><input id="setRestoreDrillBytes" type="number" min="1" value="${esc(s.restore_drill_sample_bytes || 1048576)}"></label>
+ <label class="field"><span><span class="ui-icon">&#128207;</span>Restore drill sample bytes</span><input id="setRestoreDrillBytes" type="number" min="1" value="${esc(s.restore_drill_sample_bytes || 1048576)}"></label>
+  <label class="field"><span><span class="ui-icon">&#9201;</span>Critical verification interval days</span><input id="setCriticalVerificationDays" type="number" min="1" max="180" value="${esc(s.critical_verification_interval_days || 30)}"></label>
+  <label class="field full"><span><span class="ui-icon">&#128278;</span>Retention policy patterns. Format: label:glob:days, for example critical:*.iso:30</span><textarea id="setRetentionPolicyPatterns">${esc((s.retention_policy_patterns || []).join("\n"))}</textarea></label>
   <label><input id="setRestoreSandboxEnabled" type="checkbox" ${s.restore_sandbox_enabled?"checked":""}> <span class="ui-icon">&#128737;</span>Restore to sandbox before replacing origin</label>
   <label class="field full"><span><span class="ui-icon">&#128193;</span>Restore sandbox path</span><input id="setRestoreSandboxPath" value="${esc(s.restore_sandbox_path || "")}" placeholder="optional; defaults beside origin"></label>
  </div></div>
  <div id="tabEndpoints" class="tab-panel"><div class="form-grid">
  <label class="field full"><span><span class="ui-icon">&#128193;</span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
   <label class="field full"><span><span class="ui-icon">&#128683;</span>Auto-queue exclude patterns, one per line. Examples: MP4, .mp4, *.sample, regex:\\.partial$, /Season \\d+/</span><textarea id="setAutoQueueExcludePatterns">${esc((s.auto_queue_exclude_patterns || []).join("\n"))}</textarea></label>
+  <label class="field full"><span><span class="ui-icon">&#9208;</span>Queue pause patterns, one per line. Matching files stay cataloged but are not queued automatically.</span><textarea id="setQueuePausePatterns">${esc((s.queue_pause_patterns || []).join("\n"))}</textarea></label>
  </div></div>
  <div id="tabUsenet" class="tab-panel"><div class="form-grid">
   <div class="toolbar"><button onclick="addHost()"><span class="ui-icon">&#10133;</span>Add Host</button></div>
@@ -2833,7 +3038,7 @@ function settingsForm(s){
   <div class="toolbar"><button onclick="addLogDestination()"><span class="ui-icon">&#10133;</span>Add Log Destination</button></div>
  <div class="field full"><span><span class="ui-icon">&#128225;</span>Log aggregation destinations</span><div id="logDestinationList" class="host-list">${logDestinationRows(s.log_destinations || [])}</div></div>
  </div></div>
- <div id="tabSecurity" class="tab-panel"><div class="form-grid">
+ <div id="tabSecurity" class="tab-panel"><h2 class="section-title"><span class="ui-icon">&#128737;</span>Basic</h2><div class="form-grid">
   <div class="chart-card full"><h3><span class="ui-icon">&#128273;</span>External API</h3><p class="muted">Use <code>/external-api/status</code>, <code>/external-api/files</code>, <code>/external-api/queue</code>, and <code>/external-api/tasks</code> with <code>X-API-Key</code> or <code>Authorization: Bearer ...</code>. Stored keys: ${Number(s.external_api_key_count || 0)}.</p></div>
   <div class="chart-card full"><h3><span class="ui-icon">&#128274;</span>Web UI Auth</h3><p class="muted">Optional Basic Auth protects browser pages and internal AJAX endpoints. Leave the password blank to keep the current value.</p></div>
   <label class="field"><span><span class="ui-icon">&#128100;</span>Web UI username</span><input id="setWebUiUsername" value="${esc(s.web_ui_username || "admin")}"></label>
@@ -2843,6 +3048,9 @@ function settingsForm(s){
   <label class="field full"><span><span class="ui-icon">&#128274;</span>Config secret key environment variable</span><input id="setConfigSecretKeyEnv" value="${esc(s.config_secret_key_env || "BACKUPRR_CONFIG_SECRET")}"></label>
   <label><input id="setAuditMode" type="checkbox" ${s.audit_mode?"checked":""}> <span class="ui-icon">&#128221;</span>Enable signed audit events</label>
   <label class="field"><span><span class="ui-icon">&#128273;</span>Audit secret env</span><input id="setAuditSecretKeyEnv" value="${esc(s.audit_secret_key_env || "BACKUPRR_AUDIT_SECRET")}"></label>
+  <label class="field"><span><span class="ui-icon">&#9201;</span>Internal API rate limit per minute</span><input id="setApiRateLimit" type="number" min="0" max="10000" value="${esc(s.api_rate_limit_per_minute ?? 120)}"></label>
+  <label class="field"><span><span class="ui-icon">&#9201;</span>External API rate limit per minute</span><input id="setExternalApiRateLimit" type="number" min="0" max="10000" value="${esc(s.external_api_rate_limit_per_minute ?? 60)}"></label>
+  <h2 class="section-title full"><span class="ui-icon">&#9881;</span>Advanced</h2>
   <label><input id="setManifestExportEnabled" type="checkbox" ${s.manifest_export_enabled === false ? "" : "checked"}> <span class="ui-icon">&#128230;</span>Enable manifest export</label>
   <label><input id="setManifestExportEncrypt" type="checkbox" ${s.manifest_export_encrypt?"checked":""}> <span class="ui-icon">&#128274;</span>Encrypt manifest export</label>
   <label class="field"><span><span class="ui-icon">&#128273;</span>Manifest export secret env</span><input id="setManifestExportPassphraseEnv" value="${esc(s.manifest_export_passphrase_env || "BACKUPRR_MANIFEST_EXPORT_SECRET")}"></label>
@@ -2853,6 +3061,7 @@ function settingsForm(s){
   <label><input id="setUpdateCheckEnabled" type="checkbox" ${s.update_check_enabled === false ? "" : "checked"}> <span class="ui-icon">&#128260;</span>Enable GitHub update checks</label>
   <label class="field"><span><span class="ui-icon">&#128279;</span>GitHub repository</span><input id="setUpdateGithubRepo" value="${esc(s.update_github_repo || "kelau/Backuprr")}" placeholder="owner/repo"></label>
   <label class="field"><span><span class="ui-icon">&#9201;</span>Update check timeout seconds</span><input id="setUpdateCheckTimeout" type="number" min="1" max="60" value="${esc(s.update_check_timeout_seconds || 10)}"></label>
+  <div class="chart-card full"><h3><span class="ui-icon">&#128230;</span>Settings profiles</h3><p class="muted">Export a redacted settings profile or import one to quickly clone safe defaults between installs.</p><div class="toolbar"><button onclick="downloadSettingsProfile()"><span class="ui-icon">&#8681;</span>Export profile</button><button onclick="document.getElementById('settingsProfileImport').click()"><span class="ui-icon">&#8679;</span>Import profile</button><input id="settingsProfileImport" type="file" accept="application/json" class="hidden" onchange="importSettingsProfile(this.files[0])"></div></div>
  </div></div>
  <div id="tabCloud" class="tab-panel"><div class="form-grid">
   <div class="toolbar"><button onclick="addCloudTarget()"><span class="ui-icon">&#10133;</span>Add Cloud Target</button><button onclick="post('/api/cloud-backup').then(out=>settingsOut.textContent=JSON.stringify(out,null,2))"><span class="ui-icon">&#9729;</span>Backup Config/DB Now</button></div>
@@ -3025,8 +3234,29 @@ function collectLogDestinations(){
   password: row.querySelector(".logDestinationPassword").value,
   min_level: row.querySelector(".logDestinationMinLevel").value,
   timeout_seconds: Number(row.querySelector(".logDestinationTimeout").value),
-  enabled: row.querySelector(".logDestinationEnabled").checked
+ enabled: row.querySelector(".logDestinationEnabled").checked
  })).filter(destination => destination.name || destination.url || destination.enabled);
+}
+async function downloadSettingsProfile(){
+ const out = await api("/api/settings/profile/export");
+ const blob = new Blob([JSON.stringify(out, null, 2)], {type:"application/json"});
+ const url = URL.createObjectURL(blob);
+ const link = document.createElement("a");
+ link.href = url;
+ link.download = `backuprr-settings-profile-${new Date().toISOString().replace(/[:.]/g,"-")}.json`;
+ link.click();
+ URL.revokeObjectURL(url);
+}
+async function importSettingsProfile(file){
+ if(!file) return;
+ const text = await file.text();
+ const data = JSON.parse(text);
+ const out = await post("/api/settings/profile/import", data.profile ? data : { profile:data });
+ settingsOut.textContent = JSON.stringify(out, null, 2);
+ if(out.ok){
+  settingsCache = out.settings;
+  render();
+ }
 }
 async function saveSettings(){
  const payload = {
@@ -3062,6 +3292,8 @@ async function saveSettings(){
   config_secret_key_env: setConfigSecretKeyEnv.value,
   audit_mode: setAuditMode.checked,
   audit_secret_key_env: setAuditSecretKeyEnv.value,
+  api_rate_limit_per_minute: Number(setApiRateLimit.value),
+  external_api_rate_limit_per_minute: Number(setExternalApiRateLimit.value),
   manifest_export_enabled: setManifestExportEnabled.checked,
   manifest_export_encrypt: setManifestExportEncrypt.checked,
   manifest_export_passphrase_env: setManifestExportPassphraseEnv.value,
@@ -3076,6 +3308,8 @@ async function saveSettings(){
   compression_min_gain_percent: Number(setCompressionMinGainPercent.value),
   restore_drill_interval_days: Number(setRestoreDrillDays.value),
   restore_drill_sample_bytes: Number(setRestoreDrillBytes.value),
+  critical_verification_interval_days: Number(setCriticalVerificationDays.value),
+  retention_policy_patterns: setRetentionPolicyPatterns.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   restore_sandbox_enabled: setRestoreSandboxEnabled.checked,
   restore_sandbox_path: setRestoreSandboxPath.value,
   compress_files: setCompressFiles.checked,
@@ -3083,6 +3317,7 @@ async function saveSettings(){
   encryption_passphrase_env: setPassEnv.value,
   endpoints: setEndpoints.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   auto_queue_exclude_patterns: setAutoQueueExcludePatterns.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
+  queue_pause_patterns: setQueuePausePatterns.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   usenet_hosts: collectHosts(),
   cloud_backups: collectCloudTargets(),
   log_destinations: collectLogDestinations(),
@@ -3093,7 +3328,18 @@ async function saveSettings(){
   payload.external_api_keys = externalKeys;
   payload.clear_external_api_keys = !!document.getElementById("clearExternalApiKeys")?.checked;
  }
- const out = await post("/api/settings", payload);
+ let out;
+ try{
+  const validation = await post("/api/settings/validate", payload);
+  if(!validation.ok){
+   settingsOut.textContent = JSON.stringify(validation, null, 2);
+   return;
+  }
+  out = await post("/api/settings", payload);
+ } catch(error){
+  settingsOut.textContent = `Settings validation failed: ${error}`;
+  return;
+ }
  settingsOut.textContent = JSON.stringify(out, null, 2);
  if(out.ok) settingsCache = out.settings;
  if(out.ok){

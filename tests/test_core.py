@@ -38,7 +38,10 @@ from backuprr.operations import (
     disaster_recovery_report,
     dry_run_plan,
     file_integrity_receipt,
+    provider_failover_simulation,
     notification_alerts,
+    retention_policy_for_path,
+    threat_model_report,
     prometheus_metrics,
     provider_confidence_report,
     restore_confidence,
@@ -179,7 +182,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.77")
+        self.assertEqual(__version__, "0.2.78")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -1260,6 +1263,20 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(row["posted_chunks"], 1)
         self.assertEqual(row["posted_bytes"], 8)
 
+    def test_queue_pause_patterns_keep_matching_files_out_of_auto_queue(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "ready.mkv").write_bytes(b"abc")
+        (media / "hold.iso").write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        self.config.queue_pause_patterns = ["*.iso"]
+        queued = enqueue_unbacked(self.db, self.config)
+        self.assertEqual(queued, 1)
+        rows = self.db.list_queue(include_done=True)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(str(rows[0]["path"]).endswith("ready.mkv"))
+
     def test_file_rows_include_live_queue_progress(self):
         media = self.root / "media"
         media.mkdir()
@@ -1577,7 +1594,12 @@ class CoreTests(unittest.TestCase):
                 "update_github_repo": "example/Backuprr",
                 "update_check_timeout_seconds": 12,
                 "auto_queue_exclude_patterns": ["*.sample", ".tmp"],
+                "queue_pause_patterns": ["*.iso"],
+                "retention_policy_patterns": ["critical:*.iso:14"],
+                "critical_verification_interval_days": 14,
                 "external_api_keys": ["ha-key", "automation-key"],
+                "api_rate_limit_per_minute": 240,
+                "external_api_rate_limit_per_minute": 80,
                 "web_ui_username": "operator",
                 "web_ui_password": "ui-secret",
                 "web_ui_role": "operator",
@@ -1659,7 +1681,12 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.update_github_repo, "example/Backuprr")
         self.assertEqual(self.config.update_check_timeout_seconds, 12)
         self.assertEqual(self.config.auto_queue_exclude_patterns, ["*.sample", ".tmp"])
+        self.assertEqual(self.config.queue_pause_patterns, ["*.iso"])
+        self.assertEqual(self.config.retention_policy_patterns, ["critical:*.iso:14"])
+        self.assertEqual(self.config.critical_verification_interval_days, 14)
         self.assertEqual(self.config.external_api_keys, ["ha-key", "automation-key"])
+        self.assertEqual(self.config.api_rate_limit_per_minute, 240)
+        self.assertEqual(self.config.external_api_rate_limit_per_minute, 80)
         self.assertEqual(self.config.web_ui_username, "operator")
         self.assertEqual(self.config.web_ui_password, "ui-secret")
         self.assertEqual(self.config.web_ui_role, "operator")
@@ -1751,6 +1778,20 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(bundle["config"]["usenet_hosts"][0]["username"], "***")
         self.assertEqual(bundle["config"]["usenet_hosts"][0]["password"], "")
         self.assertIn("tables", bundle)
+
+    def test_threat_model_and_failover_reports_reflect_security_config(self):
+        self.config.external_api_keys = ["ha-key"]
+        self.config.web_ui_password = "ui-secret"
+        self.config.usenet_hosts = [
+            UsenetHost(name="read-a", mode="read", host="news-a.example.test", port=563, priority=10),
+            UsenetHost(name="post-a", mode="post", host="post-a.example.test", port=563, priority=10),
+            UsenetHost(name="post-b", mode="post", host="post-b.example.test", port=563, priority=5),
+        ]
+        model = threat_model_report(self.db, self.config)
+        self.assertTrue(any(item["area"] == "External API" and item["status"] == "ok" for item in model["mitigations"]))
+        failover = provider_failover_simulation(self.config, "post-a")
+        self.assertTrue(failover["modes"]["post"]["ok"])
+        self.assertEqual(failover["modes"]["post"]["primary"], "post-b")
 
     def test_provider_growth_manifest_receipt_preview_and_audit_helpers(self):
         media = self.root / "media"
@@ -2158,11 +2199,14 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
         self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
-        confidence = restore_confidence(self.db, str(path))
+        self.config.retention_policy_patterns = ["critical:*.mkv:14"]
+        confidence = restore_confidence(self.db, str(path), self.config)
         self.assertTrue(confidence["restorable"])
         self.assertEqual(confidence["chunk_count"], 1)
         self.assertGreaterEqual(confidence["confidence_score"], 70)
         self.assertFalse(confidence["par2_protected"])
+        self.assertEqual(confidence["retention_policy"]["policy"], "critical")
+        self.assertEqual(retention_policy_for_path(self.config, str(path))["verification_interval_days"], 14)
 
     def test_restore_plan_reports_destination_and_overwrite(self):
         media = self.root / "media"

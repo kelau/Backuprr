@@ -26,7 +26,7 @@ a CLI and an AJAX-enabled Web UI.
 - Restore support for individual files and folders to the original location or
   an alternate destination.
 - Web pages for Status, Files, Search, Log, Queue, Tasks, Verification,
-  Statistics, Settings, and About.
+  Statistics, Operations, Security, Settings, and About.
 - Live-refreshing operational pages and a Status dashboard with task progress,
   queue/file summaries, and simple charts.
 - Operations page and CLI commands for worker pause/resume, provider health
@@ -56,6 +56,10 @@ a CLI and an AJAX-enabled Web UI.
 - Safety-first chunk row compaction: in-progress posts keep durable per-chunk
   rows for restart recovery, while completed files can compact those rows into
   a compressed per-file manifest to shrink the database at multi-TB scale.
+- Production hardening controls: CSRF-protected internal actions, API rate
+  limits, operation cancellation, incident mode, provider failover simulation,
+  restore rehearsal, queue pause patterns, settings profile import/export, and
+  a threat model page for deployment review.
 - CLI commands matching the Web UI operations.
 
 ## Application flow
@@ -298,9 +302,10 @@ in a temporary directory to avoid leaving `.par2` files beside your media.
 
 ## APIs
 
-The Web UI uses `/api/*` as an internal API and sends a per-process token that
-is embedded into the served app page. Direct calls to `/api/*` without that
-token are rejected.
+The Web UI uses `/api/*` as an internal API and sends per-process internal and
+CSRF tokens that are embedded into the served app page. Direct calls to `/api/*`
+without those tokens are rejected. Internal and external API rate limits are
+configurable in Settings.
 
 Integrations such as Home Assistant should use `/external-api/*` with either
 `X-API-Key: <key>` or `Authorization: Bearer <key>`. Configure keys in Settings
