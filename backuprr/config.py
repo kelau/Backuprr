@@ -169,8 +169,18 @@ class Config:
     external_api_keys: List[str] = field(default_factory=list)
     web_ui_username: str = "admin"
     web_ui_password: str = ""
+    web_ui_role: str = "admin"
     config_secret_key_env: str = "BACKUPRR_CONFIG_SECRET"
     auto_vacuum_after_compaction_rows: int = 100000
+    provider_retry_policy: Dict[str, Dict[str, int]] = field(default_factory=dict)
+    restore_sandbox_enabled: bool = False
+    restore_sandbox_path: str = ""
+    audit_mode: bool = False
+    audit_secret_key_env: str = "BACKUPRR_AUDIT_SECRET"
+    manifest_export_enabled: bool = True
+    manifest_export_encrypt: bool = False
+    manifest_export_passphrase_env: str = "BACKUPRR_MANIFEST_EXPORT_SECRET"
+    manifest_export_interval_seconds: int = 86400
     ui_theme: str = "harbor_light"
     update_check_enabled: bool = True
     update_github_repo: str = "kelau/Backuprr"
@@ -264,8 +274,18 @@ class Config:
             "external_api_keys": self.external_api_keys,
             "web_ui_username": self.web_ui_username,
             "web_ui_password": self.web_ui_password,
+            "web_ui_role": self.web_ui_role,
             "config_secret_key_env": self.config_secret_key_env,
             "auto_vacuum_after_compaction_rows": self.auto_vacuum_after_compaction_rows,
+            "provider_retry_policy": self.provider_retry_policy,
+            "restore_sandbox_enabled": self.restore_sandbox_enabled,
+            "restore_sandbox_path": self.restore_sandbox_path,
+            "audit_mode": self.audit_mode,
+            "audit_secret_key_env": self.audit_secret_key_env,
+            "manifest_export_enabled": self.manifest_export_enabled,
+            "manifest_export_encrypt": self.manifest_export_encrypt,
+            "manifest_export_passphrase_env": self.manifest_export_passphrase_env,
+            "manifest_export_interval_seconds": self.manifest_export_interval_seconds,
             "ui_theme": self.ui_theme,
             "update_check_enabled": self.update_check_enabled,
             "update_github_repo": self.update_github_repo,
@@ -444,6 +464,11 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if not username:
             raise ValueError("web_ui_username cannot be blank")
         config.web_ui_username = username
+    if "web_ui_role" in data:
+        role = str(data["web_ui_role"]).strip()
+        if role not in {"admin", "operator", "read_only"}:
+            raise ValueError("web_ui_role must be admin, operator, or read_only")
+        config.web_ui_role = role
     if data.get("web_ui_password"):
         config.web_ui_password = str(data["web_ui_password"])
     elif data.get("clear_web_ui_password"):
@@ -455,6 +480,36 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if threshold < 0:
             raise ValueError("auto_vacuum_after_compaction_rows cannot be negative")
         config.auto_vacuum_after_compaction_rows = threshold
+    if "provider_retry_policy" in data:
+        policy: Dict[str, Dict[str, int]] = {}
+        for key, value in dict(data["provider_retry_policy"] or {}).items():
+            if key not in {"auth", "network", "provider", "tool", "locked_file", "hourly_limit"}:
+                raise ValueError("provider_retry_policy contains an unsupported failure class")
+            attempts = int(dict(value or {}).get("attempts", 1))
+            backoff = int(dict(value or {}).get("backoff_seconds", 0))
+            if attempts < 0 or attempts > 25 or backoff < 0 or backoff > 86400:
+                raise ValueError("provider_retry_policy attempts/backoff are out of range")
+            policy[key] = {"attempts": attempts, "backoff_seconds": backoff}
+        config.provider_retry_policy = policy
+    if "restore_sandbox_enabled" in data:
+        config.restore_sandbox_enabled = bool(data["restore_sandbox_enabled"])
+    if "restore_sandbox_path" in data:
+        config.restore_sandbox_path = str(data["restore_sandbox_path"] or "").strip()
+    if "audit_mode" in data:
+        config.audit_mode = bool(data["audit_mode"])
+    if "audit_secret_key_env" in data:
+        config.audit_secret_key_env = str(data["audit_secret_key_env"] or "BACKUPRR_AUDIT_SECRET").strip()
+    if "manifest_export_enabled" in data:
+        config.manifest_export_enabled = bool(data["manifest_export_enabled"])
+    if "manifest_export_encrypt" in data:
+        config.manifest_export_encrypt = bool(data["manifest_export_encrypt"])
+    if "manifest_export_passphrase_env" in data:
+        config.manifest_export_passphrase_env = str(data["manifest_export_passphrase_env"] or "BACKUPRR_MANIFEST_EXPORT_SECRET").strip()
+    if "manifest_export_interval_seconds" in data:
+        interval = int(data["manifest_export_interval_seconds"] or 0)
+        if interval < 3600 or interval > 30 * 86400:
+            raise ValueError("manifest_export_interval_seconds must be between 1 hour and 30 days")
+        config.manifest_export_interval_seconds = interval
     if "ui_theme" in data:
         theme = str(data["ui_theme"]).strip()
         if theme not in {"harbor_light", "emerald_console", "slate_cinema", "graphite", "nordic_mint"}:

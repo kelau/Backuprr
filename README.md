@@ -43,6 +43,9 @@ a CLI and an AJAX-enabled Web UI.
   diagnostics export for easier troubleshooting.
 - Optional Web UI Basic Auth plus opt-in config secret protection using
   `BACKUPRR_CONFIG_SECRET` or a configured key environment variable.
+- Role-gated Web UI actions, signed audit events, restore sandbox validation,
+  integrity receipts, encrypted manifest exports, provider confidence scoring,
+  and database growth projections for safer long-term operation.
 - Chunk-level hourly throttling, resumable posts, and retry/failover across
   configured post hosts.
 - Safety backpressure can pause the backup worker after provider, auth, or tool
@@ -197,7 +200,12 @@ direct provider username/password used for NNTP authentication:
   "scan_interval_seconds": 300,
   "web_ui_username": "admin",
   "web_ui_password": "",
+  "web_ui_role": "admin",
   "config_secret_key_env": "BACKUPRR_CONFIG_SECRET",
+  "restore_sandbox_enabled": false,
+  "audit_mode": false,
+  "manifest_export_enabled": true,
+  "manifest_export_encrypt": false,
   "auto_vacuum_after_compaction_rows": 100000,
   "backup_interval_seconds": 300,
   "update_check_interval_seconds": 86400,

@@ -21,14 +21,20 @@ from .db import Database
 from .log_forwarding import LogForwarder
 from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, MaintenanceMonitor, RestoreDrillMonitor, UpdateCheckMonitor
 from .operations import (
+    audit_event,
+    backup_manifest_export,
     check_usenet_hosts,
+    db_growth_report,
     diagnostics_bundle,
     disaster_recovery_report,
     dry_run_plan,
+    file_integrity_receipt,
     notification_alerts,
     prometheus_metrics,
+    provider_confidence_report,
     restore_confidence,
     restore_plan,
+    restore_preview,
     run_maintenance,
     run_restore_drill,
     setup_health_check,
@@ -190,6 +196,29 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return False
         return hmac.compare_digest(username, self.config.web_ui_username) and hmac.compare_digest(password, self.config.web_ui_password)
+
+    def web_role_allows(self, action: str) -> bool:
+        role = getattr(self.config, "web_ui_role", "admin")
+        if role == "admin":
+            return True
+        if role == "operator":
+            return action in {"run", "restore", "queue", "read"}
+        return action == "read"
+
+    def require_role(self, action: str) -> bool:
+        if self.web_role_allows(action):
+            return True
+        self.forbidden(f"{getattr(self.config, 'web_ui_role', 'read_only')} role cannot perform {action} actions")
+        return False
+
+    def action_for_post_path(self, path: str) -> str:
+        if path in {"/api/settings", "/api/maintenance/run", "/api/update-check/run"}:
+            return "admin"
+        if path.startswith("/api/restore"):
+            return "restore"
+        if path.startswith("/api/queue") or path.startswith("/api/files") or path.startswith("/api/folders"):
+            return "queue"
+        return "run"
 
     def internal_api_authorized(self, query: dict[str, list[str]] | None = None) -> bool:
         supplied = self.headers.get("X-Backuprr-Internal-Token", "")
@@ -452,6 +481,8 @@ class Handler(BaseHTTPRequestHandler):
                     "maintenance": rowdicts(self.db.maintenance_rows(20)),
                     "restore_drills": rowdicts(self.db.restore_drill_rows(20)),
                     "folder_rollups": self.db.folder_rollups(100),
+                    "provider_confidence": provider_confidence_report(self.db),
+                    "db_growth": db_growth_report(self.db, self.config),
                 }
             )
         elif parsed.path == "/api/setup-health":
@@ -460,6 +491,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"alerts": notification_alerts(self.db, self.config)})
         elif parsed.path == "/api/diagnostics":
             self.send_json(diagnostics_bundle(self.db, self.config))
+        elif parsed.path == "/api/provider-confidence":
+            self.send_json(provider_confidence_report(self.db))
+        elif parsed.path == "/api/db-growth":
+            self.send_json(db_growth_report(self.db, self.config))
+        elif parsed.path == "/api/manifest/export":
+            self.send_json(backup_manifest_export(self.db, self.config))
+        elif parsed.path == "/api/files/receipt":
+            self.send_json(file_integrity_receipt(self.db, int(query.get("file_id", ["0"])[0])))
         elif parsed.path == "/api/dry-run":
             self.send_json(dry_run_plan(self.db, self.config))
         elif parsed.path == "/api/benchmark":
@@ -566,6 +605,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/") and not self.internal_api_authorized():
                 self.forbidden("internal API token is required")
                 return
+            if parsed.path.startswith("/api/") and not self.require_role(self.action_for_post_path(parsed.path)):
+                return
             data = self.read_json()
             if parsed.path == "/api/scan":
                 self.send_json({"files": self.monitor.scan_once()})
@@ -608,10 +649,12 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/worker/pause":
                 kind = str(data.get("kind", "all"))
                 self.db.set_paused(kind, True)
+                audit_event(self.db, self.config, self.config.web_ui_username, "worker.pause", {"kind": kind})
                 self.send_json({"ok": True, "paused": self.db.paused_kinds()})
             elif parsed.path == "/api/worker/resume":
                 kind = str(data.get("kind", "all"))
                 self.db.set_paused(kind, False)
+                audit_event(self.db, self.config, self.config.web_ui_username, "worker.resume", {"kind": kind})
                 self.send_json({"ok": True, "paused": self.db.paused_kinds()})
             elif parsed.path == "/api/health/check":
                 self.send_json({"hosts": check_usenet_hosts(self.db, self.config)})
@@ -636,12 +679,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json(restore_confidence(self.db, data["path"]))
             elif parsed.path == "/api/restore/plan":
                 self.send_json(restore_plan(self.db, data["path"], data.get("dest") or ""))
+            elif parsed.path == "/api/restore/preview":
+                self.send_json(restore_preview(self.db, [int(item) for item in data.get("file_ids", [])], data.get("dest") or ""))
             elif parsed.path == "/api/restore":
                 if data.get("folder"):
+                    audit_event(self.db, self.config, self.config.web_ui_username, "restore.folder", {"path": data.get("path"), "dest": data.get("dest")})
                     self.send_json({"restored": restore_folder(self.db, self.config, data["path"], data.get("dest"))})
                 else:
+                    audit_event(self.db, self.config, self.config.web_ui_username, "restore.file", {"path": data.get("path"), "dest": data.get("dest")})
                     self.send_json({"target": str(restore_file(self.db, self.config, data["path"], data.get("dest")))})
             elif parsed.path == "/api/restore/start":
+                audit_event(self.db, self.config, self.config.web_ui_username, "restore.start", {"path": data.get("path"), "dest": data.get("dest"), "folder": bool(data.get("folder"))})
                 if data.get("folder"):
                     self.send_json({"operation_ids": self.start_folder_restore_operations(data["path"], data.get("dest"))})
                 else:
@@ -653,6 +701,7 @@ class Handler(BaseHTTPRequestHandler):
                 for endpoint in self.config.endpoints:
                     self.db.add_endpoint(endpoint)
                 self.db.log("info", "settings", "Updated configuration from Web UI")
+                audit_event(self.db, self.config, self.config.web_ui_username, "settings.update", {"keys": sorted(data.keys())})
                 self.monitor.trigger()
                 self.send_json({"ok": True, "settings": self.config.public_dict()})
             else:
@@ -683,6 +732,7 @@ class Handler(BaseHTTPRequestHandler):
             "paused_workers": self.db.paused_kinds(),
             "setup_health": setup_health_check(self.db, self.config),
             "alerts": notification_alerts(self.db, self.config),
+            "provider_confidence": provider_confidence_report(self.db),
         }
 
     def handle_external_get(self, parsed: Any, query: dict[str, list[str]]) -> None:
@@ -1143,6 +1193,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.77":["Added role-gated web actions, manifest export, provider confidence, restore sandbox mode, integrity receipts, retry policy controls, signed audit events, safer bulk previews, and database growth reporting."],
  "0.2.76":["Added setup health checks, alerts, diagnostics export, optional Web UI Basic Auth, opt-in config secret protection, folder rollups, dry-run warnings, and restore drill rotation improvements."],
  "0.2.75":["Completed backup chunk rows can now compact into a per-file manifest after success, keeping in-flight posts resumable while reducing database volume at scale."],
  "0.2.74":["Added scale benchmark planning, disaster recovery readiness checks, Prometheus metrics, container health checks, smarter compression sampling, queue strategies, and worker safety pause controls."],
@@ -1819,6 +1870,7 @@ function statusDashboard(status, tasks, speed){
   const attention = queueAttentionSummary(stats);
   const setup = status.setup_health || {};
   const alerts = status.alerts || [];
+  const providerConfidence = status.provider_confidence || [];
   const protectedPct = total ? Math.round((backed / total) * 100) : 0;
  const activeTask = tasks.find(task => task.status === "running");
  const nextTask = tasks
@@ -1851,8 +1903,9 @@ function statusDashboard(status, tasks, speed){
   <div class="chart-grid">
    ${throughputPanel(throughput)}
    ${hourlyPostBudgetPanel(hourlyPostBudget)}
-   ${threadPanel(nntpThreads)}
-   ${compressionPanel(compression)}
+    ${threadPanel(nntpThreads)}
+    ${providerConfidencePanel(providerConfidence)}
+    ${compressionPanel(compression)}
    ${par2Panel(par2)}
   </div>
   <div class="chart-grid">
@@ -1875,6 +1928,15 @@ function statusDashboard(status, tasks, speed){
     ["unchecked", Math.max(0, chunks - verifiedChunks - missingChunks), "warn"]
    ])}
   </div>
+ </div>`;
+}
+function providerConfidencePanel(rows){
+ const best = rows.length ? Math.round(rows.reduce((sum,row)=>sum + Number(row.confidence_score || 0), 0) / rows.length) : 0;
+ return `<div class="chart-card">
+  <h3><span class="ui-icon">&#128225;</span>Provider confidence</h3>
+  <div class="thread-meter"><b>${rows.length ? `${best}%` : "-"}</b><span class="muted">${rows.length || 0} profiled host${rows.length === 1 ? "" : "s"}</span></div>
+  <div class="progress-track"><div class="progress-fill" style="width:${best}%"></div></div>
+  <div class="muted">${rows.slice(0,3).map(row => `${esc(row.host_name)} ${Number(row.confidence_score || 0)}%`).join(" / ") || "Run provider health checks to build confidence history."}</div>
  </div>`;
 }
 function setupHealthPanel(setup){
@@ -2060,6 +2122,8 @@ function statisticsDashboard(data){
   const maintenance = data.maintenance || [];
   const restoreDrills = data.restore_drills || [];
   const folderRollups = data.folder_rollups || [];
+  const providerConfidence = data.provider_confidence || [];
+  const dbGrowth = data.db_growth || {};
  const eventCounts = {};
  for(const event of events){ eventCounts[event.event_type] = (eventCounts[event.event_type] || 0) + 1; }
  const eventRows = Object.entries(eventCounts).sort((a,b)=>b[1]-a[1]).slice(0, 10).map(([label, value]) => [label, value, "ok"]);
@@ -2085,8 +2149,16 @@ function statisticsDashboard(data){
   ${table(backupManifests, ["id","file_id","backup_run_id","app_version","article_size","chunk_count","bytes_total","flags","created_at"])}
    <h2 class="section-title"><span class="ui-icon">&#128202;</span>Database tables</h2>
    ${table(dbTables, ["table","rows","estimated_bytes"])}
+   <h2 class="section-title"><span class="ui-icon">&#128200;</span>Database growth controls</h2>
+   <div class="stats">
+    ${statCard("Current DB estimate", formatBytes(dbGrowth.current_estimated_bytes || 0), "&#128190;")}
+    ${statCard("Projected @ 10 TiB", formatBytes((dbGrowth.projected_db_bytes || {})["10 TiB"] || 0), "&#128202;")}
+    ${statCard("Chunk compaction", dbGrowth.chunk_compaction_enabled ? "Enabled" : "Disabled", "&#129513;")}
+   </div>
    <h2 class="section-title"><span class="ui-icon">&#128193;</span>Folder rollups</h2>
    ${table(folderRollups, ["folder","files","bytes_total","backed_up_files","backed_up_bytes","verified_files","compressed_files","par2_files","attention_files"])}
+   <h2 class="section-title"><span class="ui-icon">&#128225;</span>Provider confidence</h2>
+   ${table(providerConfidence, ["host_name","mode","checks","failures","max_article_size_bytes","avg_latency_ms","confidence_score","last_checked_at"])}
    <h2 class="section-title"><span class="ui-icon">&#128225;</span>Provider profiles</h2>
   ${table(providerProfiles, ["host_name","mode","checks","failures","max_article_size_bytes","avg_latency_ms","last_checked_at"])}
   <h2 class="section-title"><span class="ui-icon">&#128225;</span>Host health</h2>
@@ -2107,6 +2179,7 @@ function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenan
     <button onclick="post('/api/maintenance/run', { vacuum:true }).then(updateOperationsPage)"><span class="ui-icon">&#128190;</span>Vacuum database</button>
     <button onclick="post('/api/restore-drill/run').then(updateOperationsPage)"><span class="ui-icon">&#8635;</span>Run restore drill</button>
     <button onclick="downloadDiagnostics()"><span class="ui-icon">&#128221;</span>Export diagnostics</button>
+    <button onclick="downloadManifestExport()"><span class="ui-icon">&#128230;</span>Export manifest</button>
     ${pushLabel()}
    </div>
    ${setupHealthPanel(setup)}
@@ -2155,6 +2228,18 @@ async function downloadDiagnostics(){
  const link = document.createElement("a");
  link.href = url;
  link.download = `backuprr-diagnostics-${new Date().toISOString().replace(/[:.]/g,"-")}.json`;
+ document.body.appendChild(link);
+ link.click();
+ link.remove();
+ URL.revokeObjectURL(url);
+}
+async function downloadManifestExport(){
+ const data = await api("/api/manifest/export");
+ const blob = new Blob([data.payload || JSON.stringify(data, null, 2)], {type:"application/json"});
+ const url = URL.createObjectURL(blob);
+ const link = document.createElement("a");
+ link.href = url;
+ link.download = `backuprr-manifest-${new Date().toISOString().replace(/[:.]/g,"-")}.json`;
  document.body.appendChild(link);
  link.click();
  link.remove();
@@ -2418,7 +2503,13 @@ function backupFeaturePills(file){
  return pills.join("");
 }
 function restoreDropdown(fileId){
- return `<details class="dropdown" onclick="event.stopPropagation()"><summary class="icon-btn" title="Restore or download">&#8635;</summary><div class="dropdown-menu restore-destination"><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'origin')">Restore To Origin</button><button onclick="showRestoreDestination(${Number(fileId)})">Restore To New Destination</button><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'download')">Download In Browser</button><div id="restoreDest${Number(fileId)}" class="hidden"><input placeholder="Destination path"><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'destination', this.previousElementSibling.value)">Restore</button></div></div></details>`;
+ return `<details class="dropdown" onclick="event.stopPropagation()"><summary class="icon-btn" title="Restore or download">&#8635;</summary><div class="dropdown-menu restore-destination"><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'origin')">Restore To Origin</button><button onclick="showRestoreDestination(${Number(fileId)})">Restore To New Destination</button><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'download')">Download In Browser</button><button onclick="showIntegrityReceipt(${Number(fileId)})">Integrity Receipt</button><div id="restoreDest${Number(fileId)}" class="hidden"><input placeholder="Destination path"><button onclick="restoreCatalogFileMode(${Number(fileId)}, 'destination', this.previousElementSibling.value)">Restore</button></div></div></details>`;
+}
+async function showIntegrityReceipt(fileId){
+ closeDropdowns();
+ const receipt = await api(`/api/files/receipt?file_id=${Number(fileId)}`);
+ setRestoreStatus(`Receipt: ${receipt.chunk_count} chunks / ${receipt.compressed ? "compressed" : "plain"} / ${receipt.par2_protected ? "PAR2" : "no PAR2"} / last verified ${formatDateTime(receipt.last_verify_at) || "never"}`, "ok");
+ console.log("Backuprr integrity receipt", receipt);
 }
 function folderRestoreDropdown(path){
  return `<details class="dropdown" onclick="event.stopPropagation()"><summary class="icon-btn" title="Restore folder">&#8635;</summary><div class="dropdown-menu restore-destination"><button onclick="restoreCatalogFolderMode(${jsString(path)}, 'origin')">Restore To Origin</button><button onclick="showFolderRestoreDestination(this)">Restore To New Destination</button><div class="hidden"><input placeholder="Destination folder"><button onclick="restoreCatalogFolderMode(${jsString(path)}, 'destination', this.previousElementSibling.value)">Restore</button></div></div></details>`;
@@ -2558,9 +2649,12 @@ async function boostFolder(path){
  await updateFilesPage();
 }
 async function boostSelectedFiles(){
- const ids = Array.from(selectedFiles);
- if(!ids.length) return alert("Select files first");
- const out = await post("/api/files/priority-many", { file_ids:ids, amount:10 });
+  const ids = Array.from(selectedFiles);
+  if(!ids.length) return alert("Select files first");
+  const selectedRows = Array.from(selectedFileData.values()).filter(row => selectedFiles.has(Number(row.id)));
+  const totalBytes = selectedRows.reduce((sum,row)=>sum + Number(row.size || 0), 0);
+  if(!confirm(`Increase queue priority for ${ids.length} selected item(s) totaling ${formatBytes(totalBytes)}?`)) return;
+  const out = await post("/api/files/priority-many", { file_ids:ids, amount:10 });
  if(out.error) alert(out.error);
  await updateFilesPage();
 }
@@ -2601,8 +2695,10 @@ async function restoreSelectedFilesMode(mode, destValue=""){
   window.open(`/api/restore/download-zip?internal_token=${encodeURIComponent(internalApiToken)}&${ids}`, "_blank");
   return;
  }
- const dest = mode === "destination" ? destValue : "";
- let restored = 0;
+  const dest = mode === "destination" ? destValue : "";
+  const preview = await post("/api/restore/preview", { file_ids:selectedRows.map(row => row.id), dest:dest || "" });
+  if(!confirm(`Restore ${preview.files} file(s), ${formatBytes(preview.bytes_total)} total, destination: ${preview.destination}, overwrites: ${preview.overwrite_count}. Continue?`)) return;
+  let restored = 0;
  setRestoreStatus(`Starting restore for ${selectedRows.length} files...`, "warn");
  for(const file of selectedRows){
   const confidence = await post("/api/restore/confidence", { path:file.path });
@@ -2688,6 +2784,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128230;</span>Default queue strategy</span><select id="setQueueStrategy"><option value="older-first" ${s.queue_strategy==="older-first"?"selected":""}>Older First</option><option value="larger-first" ${s.queue_strategy==="larger-first"?"selected":""}>Larger First</option><option value="smaller-first" ${s.queue_strategy==="smaller-first"?"selected":""}>Smaller First</option><option value="folder-first" ${s.queue_strategy==="folder-first"?"selected":""}>Folder First</option></select></label>
   <label class="field"><span><span class="ui-icon">&#8635;</span>NNTP retry attempts</span><input id="setRetryAttempts" type="number" min="1" max="10" value="${esc(s.usenet_retry_attempts || 2)}"></label>
   <label class="field"><span><span class="ui-icon">&#9201;</span>NNTP retry backoff seconds</span><input id="setRetryBackoff" type="number" min="0" max="3600" value="${esc(s.usenet_retry_backoff_seconds || 5)}"></label>
+  <label class="field full"><span><span class="ui-icon">&#8635;</span>Retry policy JSON</span><textarea id="setProviderRetryPolicy">${esc(JSON.stringify(s.provider_retry_policy || {}, null, 2))}</textarea></label>
   <label class="field"><span><span class="ui-icon">&#9208;</span>Auto-pause auth failures</span><input id="setAutoPauseAuthFailures" type="number" min="0" max="100" value="${esc(s.auto_pause_auth_failures ?? 3)}"></label>
   <label class="field"><span><span class="ui-icon">&#9208;</span>Auto-pause provider failures</span><input id="setAutoPauseProviderFailures" type="number" min="0" max="1000" value="${esc(s.auto_pause_provider_failures ?? 10)}"></label>
  </div></div>
@@ -2717,6 +2814,8 @@ function settingsForm(s){
   <label><input id="setCompactChunkRows" type="checkbox" ${s.compact_chunk_rows === false ? "" : "checked"}> <span class="ui-icon">&#129513;</span>Compact completed chunk rows</label>
   <label class="field"><span><span class="ui-icon">&#8635;</span>Restore drill interval days</span><input id="setRestoreDrillDays" type="number" min="1" max="3650" value="${esc(s.restore_drill_interval_days || 30)}"></label>
   <label class="field"><span><span class="ui-icon">&#128207;</span>Restore drill sample bytes</span><input id="setRestoreDrillBytes" type="number" min="1" value="${esc(s.restore_drill_sample_bytes || 1048576)}"></label>
+  <label><input id="setRestoreSandboxEnabled" type="checkbox" ${s.restore_sandbox_enabled?"checked":""}> <span class="ui-icon">&#128737;</span>Restore to sandbox before replacing origin</label>
+  <label class="field full"><span><span class="ui-icon">&#128193;</span>Restore sandbox path</span><input id="setRestoreSandboxPath" value="${esc(s.restore_sandbox_path || "")}" placeholder="optional; defaults beside origin"></label>
  </div></div>
  <div id="tabEndpoints" class="tab-panel"><div class="form-grid">
  <label class="field full"><span><span class="ui-icon">&#128193;</span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
@@ -2738,9 +2837,16 @@ function settingsForm(s){
   <div class="chart-card full"><h3><span class="ui-icon">&#128273;</span>External API</h3><p class="muted">Use <code>/external-api/status</code>, <code>/external-api/files</code>, <code>/external-api/queue</code>, and <code>/external-api/tasks</code> with <code>X-API-Key</code> or <code>Authorization: Bearer ...</code>. Stored keys: ${Number(s.external_api_key_count || 0)}.</p></div>
   <div class="chart-card full"><h3><span class="ui-icon">&#128274;</span>Web UI Auth</h3><p class="muted">Optional Basic Auth protects browser pages and internal AJAX endpoints. Leave the password blank to keep the current value.</p></div>
   <label class="field"><span><span class="ui-icon">&#128100;</span>Web UI username</span><input id="setWebUiUsername" value="${esc(s.web_ui_username || "admin")}"></label>
+  <label class="field"><span><span class="ui-icon">&#128274;</span>Web UI role</span><select id="setWebUiRole"><option value="admin" ${s.web_ui_role==="admin"?"selected":""}>Admin</option><option value="operator" ${s.web_ui_role==="operator"?"selected":""}>Operator</option><option value="read_only" ${s.web_ui_role==="read_only"?"selected":""}>Read Only</option></select></label>
   <label class="field"><span><span class="ui-icon">&#128273;</span>Web UI password</span><input id="setWebUiPassword" type="password" value="" autocomplete="new-password" placeholder="${s.has_web_ui_password ? "stored; leave blank to keep" : "optional"}"></label>
   <label><input id="clearWebUiPassword" type="checkbox"> <span class="ui-icon">&#128465;</span>Disable Web UI password</label>
   <label class="field full"><span><span class="ui-icon">&#128274;</span>Config secret key environment variable</span><input id="setConfigSecretKeyEnv" value="${esc(s.config_secret_key_env || "BACKUPRR_CONFIG_SECRET")}"></label>
+  <label><input id="setAuditMode" type="checkbox" ${s.audit_mode?"checked":""}> <span class="ui-icon">&#128221;</span>Enable signed audit events</label>
+  <label class="field"><span><span class="ui-icon">&#128273;</span>Audit secret env</span><input id="setAuditSecretKeyEnv" value="${esc(s.audit_secret_key_env || "BACKUPRR_AUDIT_SECRET")}"></label>
+  <label><input id="setManifestExportEnabled" type="checkbox" ${s.manifest_export_enabled === false ? "" : "checked"}> <span class="ui-icon">&#128230;</span>Enable manifest export</label>
+  <label><input id="setManifestExportEncrypt" type="checkbox" ${s.manifest_export_encrypt?"checked":""}> <span class="ui-icon">&#128274;</span>Encrypt manifest export</label>
+  <label class="field"><span><span class="ui-icon">&#128273;</span>Manifest export secret env</span><input id="setManifestExportPassphraseEnv" value="${esc(s.manifest_export_passphrase_env || "BACKUPRR_MANIFEST_EXPORT_SECRET")}"></label>
+  <label class="field"><span><span class="ui-icon">&#9201;</span>Manifest export interval seconds</span><input id="setManifestExportInterval" type="number" min="3600" value="${esc(s.manifest_export_interval_seconds || 86400)}"></label>
   <label class="field full"><span><span class="ui-icon">&#128273;</span>Replace external API keys, one per line. Leave blank to keep existing keys.</span><textarea id="setExternalApiKeys" placeholder="Paste Home Assistant or automation API keys here"></textarea></label>
  <label><input id="clearExternalApiKeys" type="checkbox"> <span class="ui-icon">&#128465;</span>Clear all stored external API keys</label>
   <div class="chart-card full"><h3><span class="ui-icon">&#128260;</span>Update checks</h3><p class="muted">Backuprr checks GitHub releases on the configured schedule and stores the latest result locally.</p><div class="toolbar"><button onclick="post('/api/update-check/run').then(out=>settingsOut.textContent=JSON.stringify(out,null,2))"><span class="ui-icon">&#128260;</span>Check Now</button></div></div>
@@ -2944,14 +3050,22 @@ async function saveSettings(){
   auto_pause_provider_failures: Number(setAutoPauseProviderFailures.value),
   usenet_retry_attempts: Number(setRetryAttempts.value),
   usenet_retry_backoff_seconds: Number(setRetryBackoff.value),
+  provider_retry_policy: JSON.parse(setProviderRetryPolicy.value || "{}"),
   ui_theme: setUiTheme.value,
   update_check_enabled: setUpdateCheckEnabled.checked,
   update_github_repo: setUpdateGithubRepo.value,
   update_check_timeout_seconds: Number(setUpdateCheckTimeout.value),
   web_ui_username: setWebUiUsername.value,
+  web_ui_role: setWebUiRole.value,
   web_ui_password: setWebUiPassword.value,
   clear_web_ui_password: !!document.getElementById("clearWebUiPassword")?.checked,
   config_secret_key_env: setConfigSecretKeyEnv.value,
+  audit_mode: setAuditMode.checked,
+  audit_secret_key_env: setAuditSecretKeyEnv.value,
+  manifest_export_enabled: setManifestExportEnabled.checked,
+  manifest_export_encrypt: setManifestExportEncrypt.checked,
+  manifest_export_passphrase_env: setManifestExportPassphraseEnv.value,
+  manifest_export_interval_seconds: Number(setManifestExportInterval.value),
   log_retention_days: Number(setLogRetentionDays.value),
   verbose_log_retention_days: Number(setVerboseLogRetentionDays.value),
   log_web_access: setLogWebAccess.checked,
@@ -2962,6 +3076,8 @@ async function saveSettings(){
   compression_min_gain_percent: Number(setCompressionMinGainPercent.value),
   restore_drill_interval_days: Number(setRestoreDrillDays.value),
   restore_drill_sample_bytes: Number(setRestoreDrillBytes.value),
+  restore_sandbox_enabled: setRestoreSandboxEnabled.checked,
+  restore_sandbox_path: setRestoreSandboxPath.value,
   compress_files: setCompressFiles.checked,
   encrypt_bodies: setEncrypt.checked,
   encryption_passphrase_env: setPassEnv.value,

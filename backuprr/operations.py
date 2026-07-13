@@ -1,4 +1,7 @@
 import hashlib
+import base64
+import hmac
+import json
 import math
 import os
 import time
@@ -172,6 +175,117 @@ def diagnostics_bundle(db: Database, config: Config) -> Dict[str, Any]:
         "host_health": [dict(row) for row in db.host_health_rows(20)],
         "recent_events": [dict(row) for row in db.list_events(limit=100, exclude_event_types=["web.access"])],
     }
+
+
+def provider_confidence_report(db: Database) -> List[Dict[str, Any]]:
+    rows = db.provider_profiles()
+    report = []
+    for row in rows:
+        checks = max(1, int(row["checks"] or 0))
+        failures = int(row["failures"] or 0)
+        latency = int(row["avg_latency_ms"] or 0)
+        article_size = int(row["max_article_size_bytes"] or 0)
+        score = 100 - min(60, int((failures / checks) * 100)) - min(20, latency // 1000)
+        if article_size and article_size < 768 * 1024:
+            score -= 10
+        report.append({**dict(row), "confidence_score": max(0, min(100, score))})
+    return report
+
+
+def db_growth_report(db: Database, config: Config) -> Dict[str, Any]:
+    stats = db.stats()
+    tables = db.table_stats()
+    current_bytes = sum(int(row.get("estimated_bytes") or 0) for row in tables)
+    active_files = max(1, int(stats.get("files_total", 0) or 1))
+    active_bytes = max(1, int(stats.get("files_bytes_total", 0) or 1))
+    bytes_per_file = current_bytes / active_files
+    bytes_per_data_byte = current_bytes / active_bytes
+    projections = {}
+    for label, size in {"1 TiB": 1024**4, "10 TiB": 10 * 1024**4, "100 TiB": 100 * 1024**4}.items():
+        projections[label] = int(max(bytes_per_file * active_files, bytes_per_data_byte * size))
+    return {
+        "current_estimated_bytes": current_bytes,
+        "table_stats": tables,
+        "reclaimable_hint": "Run maintenance with vacuum after large compaction or log pruning.",
+        "projected_db_bytes": projections,
+        "chunk_compaction_enabled": bool(config.compact_chunk_rows),
+    }
+
+
+def file_integrity_receipt(db: Database, file_id: int) -> Dict[str, Any]:
+    file_row = db.file_by_id(file_id)
+    manifests = []
+    with db.connect() as conn:
+        manifests = [dict(row) for row in conn.execute("SELECT * FROM backup_manifests WHERE file_id=? ORDER BY id DESC", (file_id,)).fetchall()]
+    return {
+        "file_id": int(file_row["id"]),
+        "path": file_row["path"],
+        "relative_path": file_row["relative_path"],
+        "state": file_row["state"],
+        "original_sha256": file_row["sha256"],
+        "size": int(file_row["size"]),
+        "chunk_count": db.chunk_count_for_file(file_id),
+        "compressed": bool(file_row["backup_compressed"]),
+        "par2_protected": bool(file_row["backup_par2"]),
+        "last_backup_at": file_row["last_backup_at"] or "",
+        "last_verify_at": file_row["last_verify_at"] or "",
+        "latest_manifest": manifests[0] if manifests else {},
+    }
+
+
+def backup_manifest_export(db: Database, config: Config) -> Dict[str, Any]:
+    if not config.manifest_export_enabled:
+        return {"enabled": False, "message": "manifest export is disabled"}
+    with db.connect() as conn:
+        files = [dict(row) for row in conn.execute("SELECT id, path, relative_path, size, sha256, state, last_backup_at, last_verify_at, backup_compressed, backup_par2 FROM files WHERE state!='deleted' ORDER BY relative_path").fetchall()]
+        manifests = [dict(row) for row in conn.execute("SELECT file_id, file_sha256, app_version, article_size, chunk_count, bytes_total, flags, manifest_json, created_at FROM backup_manifests ORDER BY file_id, id").fetchall()]
+    payload = {
+        "version": 1,
+        "generated_at": utcnow(),
+        "app_newsgroup": config.newsgroup,
+        "files": files,
+        "backup_manifests": manifests,
+    }
+    raw = json.dumps(payload, sort_keys=True).encode("utf-8")
+    encrypted = False
+    if config.manifest_export_encrypt:
+        secret = os.getenv(config.manifest_export_passphrase_env)
+        if not secret:
+            raise RuntimeError(f"{config.manifest_export_passphrase_env} must be set for encrypted manifest export")
+        stream = hashlib.sha256(secret.encode("utf-8")).digest()
+        protected = bytes(byte ^ stream[index % len(stream)] for index, byte in enumerate(raw))
+        mac = hmac.new(secret.encode("utf-8"), protected, hashlib.sha256).hexdigest()
+        raw = json.dumps({"encrypted": True, "mac": mac, "payload": base64.b64encode(protected).decode("ascii")}).encode("utf-8")
+        encrypted = True
+    return {
+        "enabled": True,
+        "encrypted": encrypted,
+        "generated_at": payload["generated_at"],
+        "file_count": len(files),
+        "manifest_count": len(manifests),
+        "bytes": len(raw),
+        "payload": raw.decode("utf-8"),
+    }
+
+
+def restore_preview(db: Database, file_ids: List[int], dest: str = "") -> Dict[str, Any]:
+    rows = [db.file_by_id(int(file_id)) for file_id in file_ids]
+    overwrite = 0
+    total_bytes = 0
+    for row in rows:
+        target = Path(dest) / Path(row["path"]).name if dest else Path(row["path"])
+        overwrite += 1 if target.exists() else 0
+        total_bytes += int(row["size"] or 0)
+    return {"files": len(rows), "bytes_total": total_bytes, "overwrite_count": overwrite, "destination": dest or "origin"}
+
+
+def audit_event(db: Database, config: Config, actor: str, action: str, data: Dict[str, Any]) -> None:
+    if not config.audit_mode:
+        return
+    secret = os.getenv(config.audit_secret_key_env) or "backuprr-local-audit"
+    payload = {"actor": actor, "action": action, "data": data, "ts": utcnow()}
+    signature = hmac.new(secret.encode("utf-8"), json.dumps(payload, sort_keys=True).encode("utf-8"), hashlib.sha256).hexdigest()
+    db.log("info", "audit", f"{actor} {action}", data=json.dumps({**payload, "signature": signature}, sort_keys=True))
 
 
 def prometheus_metrics(db: Database, config: Config) -> str:

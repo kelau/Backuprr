@@ -21,7 +21,21 @@
   "external_api_keys": [],
   "web_ui_username": "admin",
   "web_ui_password": "",
+  "web_ui_role": "admin",
   "config_secret_key_env": "BACKUPRR_CONFIG_SECRET",
+  "provider_retry_policy": {
+    "network": { "attempts": 3, "backoff_seconds": 30 },
+    "provider": { "attempts": 2, "backoff_seconds": 120 },
+    "hourly_limit": { "attempts": 0, "backoff_seconds": 3600 }
+  },
+  "restore_sandbox_enabled": false,
+  "restore_sandbox_path": "",
+  "audit_mode": false,
+  "audit_secret_key_env": "BACKUPRR_AUDIT_SECRET",
+  "manifest_export_enabled": true,
+  "manifest_export_encrypt": false,
+  "manifest_export_passphrase_env": "BACKUPRR_MANIFEST_EXPORT_SECRET",
+  "manifest_export_interval_seconds": 86400,
   "log_destinations": [
     {
       "name": "home-loki",

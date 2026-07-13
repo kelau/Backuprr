@@ -2,6 +2,7 @@ import io
 import json
 import os
 import email.message
+import hashlib
 import tempfile
 import unittest
 import zipfile
@@ -30,13 +31,19 @@ from backuprr.log_forwarding import build_payload
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
 from backuprr.operations import (
     check_usenet_hosts,
+    audit_event,
+    backup_manifest_export,
+    db_growth_report,
     diagnostics_bundle,
     disaster_recovery_report,
     dry_run_plan,
+    file_integrity_receipt,
     notification_alerts,
     prometheus_metrics,
+    provider_confidence_report,
     restore_confidence,
     restore_plan,
+    restore_preview,
     run_maintenance,
     run_restore_drill,
     setup_health_check,
@@ -172,7 +179,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.76")
+        self.assertEqual(__version__, "0.2.77")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -1553,6 +1560,7 @@ class CoreTests(unittest.TestCase):
                 "auto_pause_provider_failures": 11,
                 "usenet_retry_attempts": 4,
                 "usenet_retry_backoff_seconds": 8,
+                "provider_retry_policy": {"network": {"attempts": 3, "backoff_seconds": 30}},
                 "queue_strategy": "folder-first",
                 "ui_theme": "nordic_mint",
                 "log_retention_days": 40,
@@ -1572,7 +1580,16 @@ class CoreTests(unittest.TestCase):
                 "external_api_keys": ["ha-key", "automation-key"],
                 "web_ui_username": "operator",
                 "web_ui_password": "ui-secret",
+                "web_ui_role": "operator",
                 "config_secret_key_env": "BACKUPRR_TEST_CONFIG_SECRET",
+                "restore_sandbox_enabled": True,
+                "restore_sandbox_path": str(self.root / "sandbox"),
+                "audit_mode": True,
+                "audit_secret_key_env": "BACKUPRR_TEST_AUDIT",
+                "manifest_export_enabled": True,
+                "manifest_export_encrypt": False,
+                "manifest_export_passphrase_env": "BACKUPRR_TEST_MANIFEST",
+                "manifest_export_interval_seconds": 7200,
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
                 "encryption_passphrase_env": "BACKUPRR_SECRET",
@@ -1625,6 +1642,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.auto_pause_provider_failures, 11)
         self.assertEqual(self.config.usenet_retry_attempts, 4)
         self.assertEqual(self.config.usenet_retry_backoff_seconds, 8)
+        self.assertEqual(self.config.provider_retry_policy["network"]["attempts"], 3)
         self.assertEqual(self.config.queue_strategy, "folder-first")
         self.assertEqual(self.config.ui_theme, "nordic_mint")
         self.assertEqual(self.config.log_retention_days, 40)
@@ -1644,7 +1662,15 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.external_api_keys, ["ha-key", "automation-key"])
         self.assertEqual(self.config.web_ui_username, "operator")
         self.assertEqual(self.config.web_ui_password, "ui-secret")
+        self.assertEqual(self.config.web_ui_role, "operator")
         self.assertEqual(self.config.config_secret_key_env, "BACKUPRR_TEST_CONFIG_SECRET")
+        self.assertTrue(self.config.restore_sandbox_enabled)
+        self.assertEqual(self.config.restore_sandbox_path, str(self.root / "sandbox"))
+        self.assertTrue(self.config.audit_mode)
+        self.assertEqual(self.config.audit_secret_key_env, "BACKUPRR_TEST_AUDIT")
+        self.assertTrue(self.config.manifest_export_enabled)
+        self.assertFalse(self.config.manifest_export_encrypt)
+        self.assertEqual(self.config.manifest_export_interval_seconds, 7200)
         self.assertTrue(self.config.zip_subfolders)
         self.assertTrue(self.config.compress_files)
         self.assertTrue(self.config.encrypt_bodies)
@@ -1725,6 +1751,32 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(bundle["config"]["usenet_hosts"][0]["username"], "***")
         self.assertEqual(bundle["config"]["usenet_hosts"][0]["password"], "")
         self.assertIn("tables", bundle)
+
+    def test_provider_growth_manifest_receipt_preview_and_audit_helpers(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with patch("backuprr.backup.UsenetClient", FakePostClient):
+            self.assertIsNotNone(post_next(self.db, self.config))
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.record_host_check("post", "post", "ok", "fine", latency_ms=20, article_size_bytes=1024)
+        self.assertTrue(provider_confidence_report(self.db)[0]["confidence_score"] > 0)
+        self.assertIn("projected_db_bytes", db_growth_report(self.db, self.config))
+        receipt = file_integrity_receipt(self.db, file_id)
+        self.assertEqual(receipt["chunk_count"], 2)
+        export = backup_manifest_export(self.db, self.config)
+        self.assertTrue(export["enabled"])
+        self.assertEqual(export["file_count"], 1)
+        preview = restore_preview(self.db, [file_id])
+        self.assertEqual(preview["files"], 1)
+        self.config.audit_mode = True
+        audit_event(self.db, self.config, "tester", "unit.action", {"file_id": file_id})
+        self.assertEqual(len(self.db.list_events(["info"], event_types=["audit"])), 1)
 
     def test_log_forwarding_payloads_match_platform(self):
         event = {
@@ -2059,6 +2111,25 @@ class CoreTests(unittest.TestCase):
         with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
             self.assertEqual(restore_file(self.db, self.config, str(path), str(target)), target)
         self.assertEqual(target.read_bytes(), b"restored payload")
+
+    def test_restore_sandbox_validates_before_replacing_origin(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"placeholder")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET sha256=?, size=? WHERE id=?", (hashlib.sha256(b"restored payload").hexdigest(), len(b"restored payload"), file_id))
+        self.db.add_chunk(file_id, 0, "<chunk@example.test>", 16, "abc", "[hidden]")
+        self.config.restore_sandbox_enabled = True
+        self.config.restore_sandbox_path = str(self.root / "sandbox")
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        with patch("backuprr.restore.UsenetClient", FakeRestoreClient):
+            self.assertEqual(restore_file(self.db, self.config, str(path)), path)
+        self.assertEqual(path.read_bytes(), b"restored payload")
+        self.assertFalse(any((self.root / "sandbox").iterdir()))
 
     def test_restored_payloads_reports_download_progress(self):
         media = self.root / "media"

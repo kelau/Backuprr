@@ -1,6 +1,7 @@
 import email
 import hashlib
 import os
+import shutil
 import zlib
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional
@@ -41,12 +42,18 @@ def restore_file(
     if target.exists() and target.is_dir():
         target = target / Path(file_row["path"]).name
     target.parent.mkdir(parents=True, exist_ok=True)
+    origin_restore = target.resolve() == Path(file_row["path"]).resolve()
+    sandbox_target = target
+    if origin_restore and config.restore_sandbox_enabled:
+        base = Path(config.restore_sandbox_path) if config.restore_sandbox_path else target.parent / ".backuprr-restore-sandbox"
+        base.mkdir(parents=True, exist_ok=True)
+        sandbox_target = base / f"{target.name}.restore-{os.getpid()}"
     host = select_host(config, "read")
     passphrase = config.encryption_passphrase()
     restored_bytes = 0
     total_chunks = len(chunks)
     decompressor = zlib.decompressobj(wbits=31) if int(file_row["backup_compressed"] or 0) else None
-    with UsenetClient(host) as client, target.open("wb") as output:
+    with UsenetClient(host) as client, sandbox_target.open("wb") as output:
         if not client.conn:
             raise RuntimeError("NNTP connection not open")
         for index, chunk in enumerate(chunks, start=1):
@@ -66,7 +73,13 @@ def restore_file(
             if tail:
                 output.write(tail)
                 restored_bytes += len(tail)
-    if target.resolve() == Path(file_row["path"]).resolve():
+    if sandbox_target != target:
+        restored_hash = sha256_file(sandbox_target)
+        if restored_hash != file_row["sha256"]:
+            sandbox_target.unlink(missing_ok=True)
+            raise RuntimeError("sandbox restore hash check failed; origin was not replaced")
+        shutil.move(str(sandbox_target), str(target))
+    if origin_restore:
         original_mtime_ns = int(file_row["mtime_ns"] or target.stat().st_mtime_ns)
         os.utime(target, ns=(original_mtime_ns, original_mtime_ns))
         stat = target.stat()
