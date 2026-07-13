@@ -69,13 +69,20 @@ def enqueue_unbacked(db: Database, config: Optional[Config] = None) -> int:
     unstable = 0
     patterns = list(getattr(config, "auto_queue_exclude_patterns", []) or [])
     stability_seconds = int(getattr(config, "file_stability_seconds", 0) or 0)
+    strategy = str(getattr(config, "queue_strategy", "older-first") or "older-first")
+    order = {
+        "older-first": "mtime_ns ASC",
+        "larger-first": "size DESC",
+        "smaller-first": "size ASC",
+        "folder-first": "relative_path ASC",
+    }.get(strategy, "mtime_ns ASC")
     with db.connect() as conn:
         rows = conn.execute(
-            """
+            f"""
             SELECT id, path, relative_path, size, mtime_ns FROM files
             WHERE state IN ('discovered', 'changed', 'missing_chunks')
               AND id NOT IN (SELECT file_id FROM queue WHERE status IN ('queued', 'posting'))
-            ORDER BY created_at ASC
+            ORDER BY {order}, created_at ASC
             """
         ).fetchall()
     for row in rows:

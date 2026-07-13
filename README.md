@@ -31,6 +31,8 @@ a CLI and an AJAX-enabled Web UI.
   queue/file summaries, and simple charts.
 - Operations page and CLI commands for worker pause/resume, provider health
   checks, dry-run planning, database maintenance, and restore drills.
+- Scale planning tools for synthetic catalog benchmarks, disaster recovery
+  readiness checks, Prometheus metrics, and container health checks.
 - Automatic post-host article-size probes to learn the largest body size the
   provider accepts before tuning large-scale backup chunking.
 - Backup run history, host health history, maintenance history, and restore
@@ -39,6 +41,8 @@ a CLI and an AJAX-enabled Web UI.
   controls.
 - Chunk-level hourly throttling, resumable posts, and retry/failover across
   configured post hosts.
+- Safety backpressure can pause the backup worker after provider, auth, or tool
+  failures so large queues do not churn through repeated errors unattended.
 - Volume controls for large catalogs: web access logs and successful per-chunk
   logs are disabled by default, transfer samples are bucketed, and new chunk
   rows omit debug-only subject/body-hash metadata unless explicitly enabled.
@@ -102,6 +106,9 @@ For large catalog testing, bind a generated media tree into `/media` and keep
 the database on a persistent volume. Backuprr is designed to scan incrementally,
 avoid rehashing unchanged files, and spread verification work across files based
 on each file's last confirmed chunk state.
+
+Both the Dockerfile and compose stack include a `/healthz` health check. The
+Web UI also exposes Prometheus text metrics at `/metrics`.
 
 For a direct `docker run` deployment:
 
@@ -223,6 +230,9 @@ backuprr --config config.json queue prioritize --filter older-first
 backuprr --config config.json post-next
 backuprr --config config.json verify
 backuprr --config config.json dry-run
+backuprr --config config.json benchmark --files 50000 --size 1073741824
+backuprr --config config.json disaster-recovery
+backuprr --config config.json metrics
 backuprr --config config.json health-check
 backuprr --config config.json article-size-test
 backuprr --config config.json maintenance --vacuum
@@ -249,6 +259,11 @@ subject/hash generation.
 The provider health check automatically posts disposable obfuscated probe
 articles to each configured post host and records the largest accepted article
 body size. You can run only that probe with `backuprr article-size-test`.
+
+Use `backuprr benchmark` before scaling up to estimate chunk-row volume and
+database growth for synthetic catalogs, and use `backuprr disaster-recovery` to
+confirm the config, database, chunk metadata, cloud targets, and API keys needed
+to rebuild the service after a host loss.
 
 Body encryption uses a passphrase-derived HMAC-SHA256 keystream implemented with
 the Python standard library. For high-assurance environments, integrate a

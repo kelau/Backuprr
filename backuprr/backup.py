@@ -70,8 +70,40 @@ def file_is_already_compressed(path: Path) -> bool:
     return any(suffix in COMPRESSED_EXTENSIONS for suffix in suffixes)
 
 
+def sample_compression_gain(path: Path, sample_bytes: int) -> float:
+    sample_bytes = max(0, int(sample_bytes or 0))
+    if sample_bytes <= 0:
+        return 100.0
+    with path.open("rb") as handle:
+        data = handle.read(sample_bytes)
+    if not data:
+        return 0.0
+    compressed = zlib.compress(data, level=6)
+    return max(0.0, ((len(data) - len(compressed)) / len(data)) * 100)
+
+
 def compression_enabled_for(path: Path, config: Config) -> bool:
-    return bool(getattr(config, "compress_files", False)) and not file_is_already_compressed(path)
+    if not bool(getattr(config, "compress_files", False)) or file_is_already_compressed(path):
+        return False
+    minimum_gain = float(getattr(config, "compression_min_gain_percent", 0) or 0)
+    if minimum_gain <= 0:
+        return True
+    return sample_compression_gain(path, int(getattr(config, "compression_sample_bytes", 0) or 0)) >= minimum_gain
+
+
+def auto_pause_after_failure(db: Database, config: Config, exc: Exception, host_name: str = "") -> None:
+    text = str(exc)
+    auth_threshold = int(getattr(config, "auto_pause_auth_failures", 0) or 0)
+    provider_threshold = int(getattr(config, "auto_pause_provider_failures", 0) or 0)
+    auth_failure = any(code in text for code in ("480 Authentication Required", "502 Authentication Failed"))
+    recent_auth_failures = db.recent_host_failure_count(host_name, "post", auth_threshold, "Authentication") if host_name and auth_threshold else 0
+    recent_provider_failures = db.recent_host_failure_count(host_name, "post", provider_threshold) if host_name and provider_threshold else 0
+    if auth_threshold and auth_failure and (not host_name or recent_auth_failures >= auth_threshold):
+        db.set_paused("backup", True)
+        db.log("error", "worker.autopause", f"Paused backup worker after {auth_threshold} authentication failure(s){f' on {host_name}' if host_name else ''}: {text}")
+    elif provider_threshold and ("All post hosts failed" in text or "PAR2 command not found" in text or recent_provider_failures >= provider_threshold):
+        db.set_paused("backup", True)
+        db.log("error", "worker.autopause", f"Paused backup worker after provider/tool failure threshold: {text}")
 
 
 def chunk_buffered(parts: Iterable[bytes], size: int) -> Iterator[bytes]:
@@ -294,6 +326,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                         db.record_host_check(host.name, host.mode, "failed", str(exc))
                         if is_socket_permission_error(exc):
                             raise PostNetworkBlockedError(f"NNTP socket access is blocked by the OS or sandbox ({exc})") from exc
+                        auto_pause_after_failure(db, config, exc, host.name)
                         db.log("warning", "post.retry", f"Post attempt {attempt + 1}/{attempts} failed on {host.name}: {exc}", file_id)
                 if attempt + 1 < attempts and backoff:
                     time.sleep(backoff)
@@ -422,6 +455,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
     except Exception as exc:
         db.update_file_state(file_id, "failed")
         db.set_queue_status(file_id, "failed")
+        auto_pause_after_failure(db, config, exc)
         if run_id is not None:
             db.finish_backup_run(run_id, "failed", str(exc))
         db.log("error", "post", f"Failed posting {original}: {exc}", file_id)

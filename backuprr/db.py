@@ -39,6 +39,13 @@ class Database:
                 "INSERT OR REPLACE INTO app_meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations(version, name, applied_at)
+                VALUES(?,?,?)
+                """,
+                (SCHEMA_VERSION, f"schema-{SCHEMA_VERSION}", utcnow()),
+            )
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         queue_columns = {row["name"] for row in conn.execute("PRAGMA table_info(queue)").fetchall()}
@@ -192,6 +199,10 @@ class Database:
     def worker_state(self, kind: str) -> Optional[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM worker_state WHERE kind=?", (kind,)).fetchone()
+
+    def worker_state_rows(self) -> List[sqlite3.Row]:
+        with self.connect() as conn:
+            return conn.execute("SELECT * FROM worker_state ORDER BY kind").fetchall()
 
     def save_worker_state(
         self,
@@ -825,6 +836,26 @@ class Database:
     def host_health_rows(self, limit: int = 50) -> List[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM host_stats ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+    def recent_host_failure_count(self, host_name: str, mode: str = "post", limit: int = 10, message_like: str = "") -> int:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT status, message FROM host_stats
+                WHERE host_name=? AND mode=?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (host_name, mode, max(1, int(limit))),
+            ).fetchall()
+        failures = 0
+        for row in rows:
+            if row["status"] != "failed":
+                break
+            if message_like and message_like not in str(row["message"]):
+                break
+            failures += 1
+        return failures
 
     def provider_profiles(self) -> List[sqlite3.Row]:
         with self.connect() as conn:
@@ -1573,6 +1604,12 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS app_meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  applied_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS endpoints (

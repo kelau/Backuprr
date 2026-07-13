@@ -18,7 +18,18 @@ from .config import Config, update_config
 from .db import Database
 from .log_forwarding import LogForwarder
 from .monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, MaintenanceMonitor, RestoreDrillMonitor, UpdateCheckMonitor
-from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, restore_plan, run_maintenance, run_restore_drill, test_post_host_article_size
+from .operations import (
+    check_usenet_hosts,
+    disaster_recovery_report,
+    dry_run_plan,
+    prometheus_metrics,
+    restore_confidence,
+    restore_plan,
+    run_maintenance,
+    run_restore_drill,
+    synthetic_catalog_plan,
+    test_post_host_article_size,
+)
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder, restored_payloads
 from .update_checker import check_for_updates, update_result
@@ -114,8 +125,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        self.send_security_headers()
         self.end_headers()
         self.wfile.write(payload)
+
+    def send_text(self, text: str, content_type: str = "text/plain; charset=utf-8", status: int = 200) -> None:
+        payload = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_security_headers()
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def send_security_headers(self) -> None:
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
 
     def unauthorized(self, message: str = "unauthorized") -> None:
         self.send_json({"error": message}, 401)
@@ -319,9 +345,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        if parsed.path in PAGE_ROUTES:
+        if parsed.path == "/healthz":
+            self.send_json({"ok": True, "version": __version__, "database": self.config.db_path().exists()})
+        elif parsed.path == "/metrics":
+            self.send_text(prometheus_metrics(self.db, self.config), "text/plain; version=0.0.4; charset=utf-8")
+        elif parsed.path in PAGE_ROUTES:
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_security_headers()
             self.end_headers()
             self.wfile.write(INDEX_HTML.replace("__INTERNAL_API_TOKEN__", INTERNAL_API_TOKEN).encode("utf-8"))
         elif parsed.path.startswith("/external-api/"):
@@ -377,6 +408,13 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif parsed.path == "/api/dry-run":
             self.send_json(dry_run_plan(self.db, self.config))
+        elif parsed.path == "/api/benchmark":
+            files = int(query.get("files", ["50000"])[0])
+            size = int(query.get("size", [str(1024 * 1024 * 1024)])[0])
+            folders = int(query.get("folders", ["1000"])[0])
+            self.send_json(synthetic_catalog_plan(files, size, self.config.article_size, folders))
+        elif parsed.path == "/api/disaster-recovery":
+            self.send_json(disaster_recovery_report(self.db, self.config))
         elif parsed.path == "/api/health":
             self.send_json({"hosts": rowdicts(self.db.host_health_rows(50))})
         elif parsed.path == "/api/backup-runs":
@@ -1043,6 +1081,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.74":["Added scale benchmark planning, disaster recovery readiness checks, Prometheus metrics, container health checks, smarter compression sampling, queue strategies, and worker safety pause controls."],
  "0.2.73":["Added daily GitHub release update checks with Status, Tasks, Settings, API, and CLI support."],
  "0.2.72":["Table sort preferences now persist per browser using cookies.","Backuprr now shows a first-use/update notice with recent feature highlights."],
  "0.2.71":["Fixed clickable table sorting headers after HTML attribute escaping broke handlers."],
@@ -1669,16 +1708,18 @@ async function updateStatisticsPage(){
  if(target) target.innerHTML = statisticsDashboard(data);
 }
 async function updateOperationsPage(){
- const [tasks, plan, health, maintenance, drills, runs] = await Promise.all([
+ const [tasks, plan, benchmark, recovery, health, maintenance, drills, runs] = await Promise.all([
   api("/api/tasks"),
   api("/api/dry-run"),
+  api("/api/benchmark?files=50000&size=1073741824&folders=1000"),
+  api("/api/disaster-recovery"),
   api("/api/health"),
   api("/api/maintenance"),
   api("/api/restore-drills"),
   api("/api/backup-runs?limit=20")
  ]);
  const target = document.getElementById("operationsPanel");
- if(target) target.innerHTML = operationsDashboard(tasks, plan, health.hosts || [], maintenance || [], drills || [], runs || []);
+ if(target) target.innerHTML = operationsDashboard(tasks, plan, benchmark, recovery, health.hosts || [], maintenance || [], drills || [], runs || []);
 }
 function paginationControls(result, pageVar, updateFn, pageSizeVar="", label=""){
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || 1)));
@@ -1965,7 +2006,7 @@ function statisticsDashboard(data){
   ${table(restoreDrills, ["file_id","path","status","checked_at","bytes_checked","message"])}
  </div>`;
 }
-function operationsDashboard(tasks, plan, health, maintenance, drills, runs){
+function operationsDashboard(tasks, plan, benchmark, recovery, health, maintenance, drills, runs){
  return `<div class="dashboard">
   <div class="toolbar">
    <button class="danger" onclick="post('/api/worker/pause',{kind:'all'}).then(updateOperationsPage)"><span class="ui-icon">&#9208;</span>Pause all workers</button>
@@ -1984,7 +2025,23 @@ function operationsDashboard(tasks, plan, health, maintenance, drills, runs){
    ${statCard("Unprotected", plan.files_unprotected || 0, "&#9888;")}
    ${statCard("Data to protect", formatBytes(plan.bytes_unprotected || 0), "&#128190;")}
    ${statCard("Estimated articles", plan.estimated_articles || 0, "&#129513;")}
+   ${statCard("Estimated DB chunks", plan.estimated_chunk_rows || 0, "&#128202;")}
+   ${statCard("PAR2 overhead", formatBytes(plan.estimated_par2_overhead_bytes || 0), "&#128737;")}
    ${statCard("Estimated time", plan.estimated_days_at_limit == null ? "No limit" : `${plan.estimated_days_at_limit} days`, "&#9201;")}
+  </div>
+  <h2 class="section-title"><span class="ui-icon">&#128300;</span>Scale benchmark model</h2>
+  <div class="stats">
+   ${statCard("Model files", benchmark.files || 0, "&#128196;")}
+   ${statCard("Model data", formatBytes(benchmark.total_bytes || 0), "&#128190;")}
+   ${statCard("Chunk rows", benchmark.estimated_chunk_rows || 0, "&#129513;")}
+   ${statCard("Chunk table", formatBytes(benchmark.estimated_chunk_table_bytes || 0), "&#128202;")}
+   ${statCard("Recommended article", formatBytes(benchmark.recommended_article_size || 0), "&#128225;")}
+  </div>
+  <h2 class="section-title"><span class="ui-icon">&#128737;</span>Disaster recovery readiness</h2>
+  <div class="hero-status ${recovery.ok ? "" : "danger-zone"}">
+   <h2><span class="ui-icon">${recovery.ok ? "&#10003;" : "&#9888;"}</span>${recovery.ok ? "Recovery inputs look complete" : "Recovery needs attention"}</h2>
+   <div class="muted">Database: ${esc(recovery.database || "")} &middot; Config: ${esc(recovery.config || "")}</div>
+   <div>${esc((recovery.issues || []).join(" / ") || "Config, database, and catalog metadata are present.")}</div>
   </div>
   <h2 class="section-title"><span class="ui-icon">&#128225;</span>Provider health</h2>
   ${table(health, ["host_name","mode","status","article_size_bytes","latency_ms","checked_at","message"])}
@@ -2521,8 +2578,11 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#129513;</span>Article size</span><div class="range-field"><input id="setArticleSizeKib" type="range" min="100" max="5120" step="100" value="${esc(bytesToKib(s.article_size || 786432))}" oninput="setArticleSizeLabel.textContent=articleSizeLabel(this.value)"><span id="setArticleSizeLabel">${esc(articleSizeLabel(bytesToKib(s.article_size || 786432)))}</span></div></label>
   <label class="field"><span><span class="ui-icon">&#128225;</span>NNTP threads</span><div class="range-field"><input id="setNntpThreads" type="range" min="1" max="50" step="1" value="${esc(s.nntp_threads || 4)}" oninput="setNntpThreadsLabel.textContent=countLabel(this.value, 'threads')"><span id="setNntpThreadsLabel">${esc(countLabel(s.nntp_threads || 4, "threads"))}</span></div></label>
   <label class="field"><span><span class="ui-icon">&#9201;</span>Post limit per hour</span><div class="range-field"><input id="setHourlyPostLimitGb" type="range" min="0" max="1000" step="10" value="${esc(bytesToGb(s.hourly_post_limit_bytes || 0))}" oninput="setHourlyPostLimitLabel.textContent=postLimitLabel(this.value)"><span id="setHourlyPostLimitLabel">${esc(postLimitLabel(bytesToGb(s.hourly_post_limit_bytes || 0)))}</span></div></label>
+  <label class="field"><span><span class="ui-icon">&#128230;</span>Default queue strategy</span><select id="setQueueStrategy"><option value="older-first" ${s.queue_strategy==="older-first"?"selected":""}>Older First</option><option value="larger-first" ${s.queue_strategy==="larger-first"?"selected":""}>Larger First</option><option value="smaller-first" ${s.queue_strategy==="smaller-first"?"selected":""}>Smaller First</option><option value="folder-first" ${s.queue_strategy==="folder-first"?"selected":""}>Folder First</option></select></label>
   <label class="field"><span><span class="ui-icon">&#8635;</span>NNTP retry attempts</span><input id="setRetryAttempts" type="number" min="1" max="10" value="${esc(s.usenet_retry_attempts || 2)}"></label>
   <label class="field"><span><span class="ui-icon">&#9201;</span>NNTP retry backoff seconds</span><input id="setRetryBackoff" type="number" min="0" max="3600" value="${esc(s.usenet_retry_backoff_seconds || 5)}"></label>
+  <label class="field"><span><span class="ui-icon">&#9208;</span>Auto-pause auth failures</span><input id="setAutoPauseAuthFailures" type="number" min="0" max="100" value="${esc(s.auto_pause_auth_failures ?? 3)}"></label>
+  <label class="field"><span><span class="ui-icon">&#9208;</span>Auto-pause provider failures</span><input id="setAutoPauseProviderFailures" type="number" min="0" max="1000" value="${esc(s.auto_pause_provider_failures ?? 10)}"></label>
  </div></div>
  <div id="tabSchedules" class="tab-panel"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#10003;</span>Verify interval</span><div class="range-field"><input id="setVerifyDays" type="range" min="1" max="180" step="1" value="${esc(s.verification_interval_days)}" oninput="setVerifyDaysLabel.textContent=countLabel(this.value, 'days')"><span id="setVerifyDaysLabel">${esc(countLabel(s.verification_interval_days, "days"))}</span></div></label>
@@ -2539,6 +2599,8 @@ function settingsForm(s){
  <div id="tabProtection" class="tab-panel"><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#128274;</span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
   <label><input id="setCompressFiles" type="checkbox" ${s.compress_files?"checked":""}> <span class="ui-icon">&#128451;</span>Compress files</label>
+  <label class="field"><span><span class="ui-icon">&#128300;</span>Compression sample bytes</span><input id="setCompressionSampleBytes" type="number" min="0" max="${64 * 1024 * 1024}" value="${esc(s.compression_sample_bytes ?? 2097152)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128200;</span>Minimum compression gain percent</span><input id="setCompressionMinGainPercent" type="number" min="0" max="95" value="${esc(s.compression_min_gain_percent ?? 5)}"></label>
   <label><input id="setEncrypt" type="checkbox" ${s.encrypt_bodies?"checked":""}> <span class="ui-icon">&#128274;</span>Encrypt article bodies</label>
   <label><input id="setPar2" type="checkbox" ${s.par2?.enabled?"checked":""}> <span class="ui-icon">&#128737;</span>Generate PAR2 recovery files</label>
   <label class="field"><span><span class="ui-icon">&#9881;</span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
@@ -2762,6 +2824,9 @@ async function saveSettings(){
   file_stability_seconds: Number(setFileStabilitySeconds.value),
   nntp_threads: Number(setNntpThreads.value),
   hourly_post_limit_bytes: gbToBytes(setHourlyPostLimitGb.value),
+  queue_strategy: setQueueStrategy.value,
+  auto_pause_auth_failures: Number(setAutoPauseAuthFailures.value),
+  auto_pause_provider_failures: Number(setAutoPauseProviderFailures.value),
   usenet_retry_attempts: Number(setRetryAttempts.value),
   usenet_retry_backoff_seconds: Number(setRetryBackoff.value),
   ui_theme: setUiTheme.value,
@@ -2773,6 +2838,8 @@ async function saveSettings(){
   log_web_access: setLogWebAccess.checked,
   log_chunk_events: setLogChunkEvents.checked,
   compact_chunk_metadata: setCompactChunkMetadata.checked,
+  compression_sample_bytes: Number(setCompressionSampleBytes.value),
+  compression_min_gain_percent: Number(setCompressionMinGainPercent.value),
   restore_drill_interval_days: Number(setRestoreDrillDays.value),
   restore_drill_sample_bytes: Number(setRestoreDrillBytes.value),
   compress_files: setCompressFiles.checked,

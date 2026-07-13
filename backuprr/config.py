@@ -106,6 +106,8 @@ class Config:
     file_stability_seconds: int = 300
     nntp_threads: int = 4
     hourly_post_limit_bytes: int = 0
+    auto_pause_auth_failures: int = 3
+    auto_pause_provider_failures: int = 10
     usenet_retry_attempts: int = 2
     usenet_retry_backoff_seconds: int = 5
     log_retention_days: int = 30
@@ -116,6 +118,9 @@ class Config:
     log_chunk_events: bool = False
     compact_chunk_metadata: bool = True
     transfer_sample_bucket_seconds: int = 60
+    compression_sample_bytes: int = 2 * 1024 * 1024
+    compression_min_gain_percent: int = 5
+    queue_strategy: str = "older-first"
     auto_queue_exclude_patterns: List[str] = field(default_factory=list)
     external_api_keys: List[str] = field(default_factory=list)
     ui_theme: str = "harbor_light"
@@ -185,6 +190,8 @@ class Config:
             "file_stability_seconds": self.file_stability_seconds,
             "nntp_threads": self.nntp_threads,
             "hourly_post_limit_bytes": self.hourly_post_limit_bytes,
+            "auto_pause_auth_failures": self.auto_pause_auth_failures,
+            "auto_pause_provider_failures": self.auto_pause_provider_failures,
             "usenet_retry_attempts": self.usenet_retry_attempts,
             "usenet_retry_backoff_seconds": self.usenet_retry_backoff_seconds,
             "log_retention_days": self.log_retention_days,
@@ -195,6 +202,9 @@ class Config:
             "log_chunk_events": self.log_chunk_events,
             "compact_chunk_metadata": self.compact_chunk_metadata,
             "transfer_sample_bucket_seconds": self.transfer_sample_bucket_seconds,
+            "compression_sample_bytes": self.compression_sample_bytes,
+            "compression_min_gain_percent": self.compression_min_gain_percent,
+            "queue_strategy": self.queue_strategy,
             "auto_queue_exclude_patterns": self.auto_queue_exclude_patterns,
             "external_api_keys": self.external_api_keys,
             "ui_theme": self.ui_theme,
@@ -292,6 +302,16 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if limit < 0:
             raise ValueError("hourly_post_limit_bytes cannot be negative")
         config.hourly_post_limit_bytes = limit
+    if "auto_pause_auth_failures" in data:
+        failures = int(data["auto_pause_auth_failures"])
+        if failures < 0 or failures > 100:
+            raise ValueError("auto_pause_auth_failures must be between 0 and 100")
+        config.auto_pause_auth_failures = failures
+    if "auto_pause_provider_failures" in data:
+        failures = int(data["auto_pause_provider_failures"])
+        if failures < 0 or failures > 1000:
+            raise ValueError("auto_pause_provider_failures must be between 0 and 1000")
+        config.auto_pause_provider_failures = failures
     if "usenet_retry_attempts" in data:
         attempts = int(data["usenet_retry_attempts"])
         if attempts < 1 or attempts > 10:
@@ -333,6 +353,21 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if seconds < 1 or seconds > 3600:
             raise ValueError("transfer_sample_bucket_seconds must be between 1 and 3600")
         config.transfer_sample_bucket_seconds = seconds
+    if "compression_sample_bytes" in data:
+        sample_bytes = int(data["compression_sample_bytes"])
+        if sample_bytes < 0 or sample_bytes > 64 * 1024 * 1024:
+            raise ValueError("compression_sample_bytes must be between 0 and 64 MiB")
+        config.compression_sample_bytes = sample_bytes
+    if "compression_min_gain_percent" in data:
+        gain = int(data["compression_min_gain_percent"])
+        if gain < 0 or gain > 95:
+            raise ValueError("compression_min_gain_percent must be between 0 and 95")
+        config.compression_min_gain_percent = gain
+    if "queue_strategy" in data:
+        strategy = str(data["queue_strategy"]).strip()
+        if strategy not in {"older-first", "larger-first", "smaller-first", "folder-first"}:
+            raise ValueError("queue_strategy must be older-first, larger-first, smaller-first, or folder-first")
+        config.queue_strategy = strategy
     if "auto_queue_exclude_patterns" in data:
         config.auto_queue_exclude_patterns = [str(item).strip() for item in data["auto_queue_exclude_patterns"] if str(item).strip()]
     if "external_api_keys" in data:

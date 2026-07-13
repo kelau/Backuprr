@@ -8,7 +8,17 @@ from .cloud_backup import backup_config_and_database
 from .config import Config
 from .db import Database
 from .log_forwarding import LogForwarder
-from .operations import check_usenet_hosts, dry_run_plan, restore_confidence, run_maintenance, run_restore_drill, test_post_host_article_size
+from .operations import (
+    check_usenet_hosts,
+    disaster_recovery_report,
+    dry_run_plan,
+    prometheus_metrics,
+    restore_confidence,
+    run_maintenance,
+    run_restore_drill,
+    synthetic_catalog_plan,
+    test_post_host_article_size,
+)
 from .queueing import enqueue_unbacked, move, prioritize
 from .restore import restore_file, restore_folder
 from .scanner import scan_all
@@ -46,6 +56,12 @@ def main(argv=None) -> int:
     verify.add_argument("--force", action="store_true")
     sub.add_parser("cloud-backup")
     sub.add_parser("dry-run")
+    benchmark = sub.add_parser("benchmark")
+    benchmark.add_argument("--files", type=int, default=50000)
+    benchmark.add_argument("--size", type=int, default=1024 * 1024 * 1024)
+    benchmark.add_argument("--folders", type=int, default=1000)
+    sub.add_parser("disaster-recovery")
+    sub.add_parser("metrics")
     sub.add_parser("health-check")
     article_size = sub.add_parser("article-size-test")
     article_size.add_argument("--host")
@@ -104,6 +120,12 @@ def main(argv=None) -> int:
         print(json.dumps(backup_config_and_database(db, config), indent=2))
     elif args.command == "dry-run":
         print(json.dumps(dry_run_plan(db, config), indent=2))
+    elif args.command == "benchmark":
+        print(json.dumps(synthetic_catalog_plan(args.files, args.size, config.article_size, args.folders), indent=2))
+    elif args.command == "disaster-recovery":
+        print(json.dumps(disaster_recovery_report(db, config), indent=2))
+    elif args.command == "metrics":
+        print(prometheus_metrics(db, config), end="")
     elif args.command == "health-check":
         print(json.dumps(check_usenet_hosts(db, config), indent=2))
     elif args.command == "article-size-test":

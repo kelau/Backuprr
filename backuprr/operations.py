@@ -2,6 +2,7 @@ import hashlib
 import math
 import os
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
@@ -27,6 +28,14 @@ def dry_run_plan(db: Database, config: Config) -> Dict[str, Any]:
     hourly_limit = int(config.hourly_post_limit_bytes or 0)
     estimated_hours = round(target_bytes / hourly_limit, 2) if hourly_limit else None
     estimated_days = round(estimated_hours / 24, 2) if estimated_hours is not None else None
+    par2_percent = int((config.par2 or {}).get("redundancy_percent", 0) or 0) if (config.par2 or {}).get("enabled") else 0
+    par2_overhead = math.ceil(target_bytes * (par2_percent / 100)) if par2_percent else 0
+    encrypted_overhead = article_count * (len(b"BACKUPRR-ENC1") + 16) if config.encrypt_bodies else 0
+    estimated_rows = {
+        "files": int(stats.get("files_total", 0)),
+        "chunks": int(stats.get("chunks_total", 0)) + article_count,
+        "backup_manifests": int(stats.get("backup_runs_total", 0)) + int(stats.get("files_total", 0)),
+    }
     return {
         "files_total": int(stats.get("files_total", 0)),
         "files_unprotected": int(stats.get("files_total", 0)) - int(stats.get("files_backed_up", 0)),
@@ -34,10 +43,98 @@ def dry_run_plan(db: Database, config: Config) -> Dict[str, Any]:
         "bytes_queued_or_posting": queued_bytes,
         "article_size": article_size,
         "estimated_articles": article_count,
+        "estimated_chunk_rows": article_count,
+        "estimated_par2_overhead_bytes": par2_overhead,
+        "estimated_encryption_overhead_bytes": encrypted_overhead,
+        "estimated_post_bytes": target_bytes + par2_overhead + encrypted_overhead,
+        "estimated_db_rows_after_backup": estimated_rows,
+        "manifest_compaction_hint": "Use larger article sizes or compact chunk metadata; future manifest blobs can reduce per-chunk row pressure.",
         "hourly_limit_bytes": hourly_limit,
         "estimated_hours_at_limit": estimated_hours,
         "estimated_days_at_limit": estimated_days,
     }
+
+
+def synthetic_catalog_plan(file_count: int, average_file_size: int, article_size: int, folders: int = 100) -> Dict[str, Any]:
+    file_count = max(0, int(file_count))
+    average_file_size = max(0, int(average_file_size))
+    article_size = max(1, int(article_size))
+    folders = max(1, int(folders))
+    total_bytes = file_count * average_file_size
+    chunk_rows = file_count * max(1, math.ceil(average_file_size / article_size)) if file_count else 0
+    return {
+        "files": file_count,
+        "folders": min(folders, file_count) if file_count else 0,
+        "average_file_size": average_file_size,
+        "total_bytes": total_bytes,
+        "article_size": article_size,
+        "estimated_chunk_rows": chunk_rows,
+        "estimated_chunk_table_bytes": chunk_rows * 220,
+        "estimated_file_table_bytes": file_count * 350,
+        "recommended_article_size": min(5 * 1024 * 1024, max(article_size, 2 * 1024 * 1024 if total_bytes > 1024**4 else article_size)),
+    }
+
+
+def disaster_recovery_report(db: Database, config: Config) -> Dict[str, Any]:
+    db_path = config.db_path()
+    config_path = Path(config.source_path) if config.source_path else None
+    stats = db.stats()
+    issues = []
+    if not db_path.exists():
+        issues.append("database file is missing")
+    if not config_path or not config_path.exists():
+        issues.append("config file is missing or was not loaded from disk")
+    if not config.external_api_keys:
+        issues.append("no external API keys configured")
+    if not config.cloud_backups:
+        issues.append("no config/database cloud backup targets configured")
+    if int(stats.get("chunks_total", 0)) <= 0 and int(stats.get("files_backed_up", 0)) > 0:
+        issues.append("backed-up files exist without chunk metadata")
+    return {
+        "ok": not issues,
+        "issues": issues,
+        "database": str(db_path),
+        "database_exists": db_path.exists(),
+        "config": str(config_path) if config_path else "",
+        "config_exists": bool(config_path and config_path.exists()),
+        "cloud_backup_targets": len(config.cloud_backups),
+        "external_api_key_count": len(config.external_api_keys),
+        "files_total": int(stats.get("files_total", 0)),
+        "chunks_total": int(stats.get("chunks_total", 0)),
+    }
+
+
+def prometheus_metrics(db: Database, config: Config) -> str:
+    stats = db.stats()
+    tasks = db.worker_state_rows()
+    lines = [
+        "# HELP backuprr_files_total Active cataloged files.",
+        "# TYPE backuprr_files_total gauge",
+        f"backuprr_files_total {int(stats.get('files_total', 0))}",
+        "# HELP backuprr_queue_items Queue items by status.",
+        "# TYPE backuprr_queue_items gauge",
+    ]
+    for key, value in sorted(stats.items()):
+        if key.startswith("queue_"):
+            lines.append(f'backuprr_queue_items{{status="{key.removeprefix("queue_")}"}} {int(value or 0)}')
+    lines.extend(
+        [
+            "# HELP backuprr_chunks_total Stored Usenet chunk metadata rows.",
+            "# TYPE backuprr_chunks_total gauge",
+            f"backuprr_chunks_total {int(stats.get('chunks_total', 0))}",
+            "# HELP backuprr_bytes_total Cataloged file bytes.",
+            "# TYPE backuprr_bytes_total gauge",
+            f"backuprr_bytes_total {int(stats.get('files_bytes_total', 0))}",
+            "# HELP backuprr_hourly_post_limit_bytes Configured hourly upload limit.",
+            "# TYPE backuprr_hourly_post_limit_bytes gauge",
+            f"backuprr_hourly_post_limit_bytes {int(config.hourly_post_limit_bytes or 0)}",
+            "# HELP backuprr_worker_runs Worker run count by kind.",
+            "# TYPE backuprr_worker_runs counter",
+        ]
+    )
+    for task in tasks:
+        lines.append(f'backuprr_worker_runs{{kind="{task["kind"]}"}} {int(task["runs"] or 0)}')
+    return "\n".join(lines) + "\n"
 
 
 def check_usenet_hosts(db: Database, config: Config) -> List[Dict[str, Any]]:
@@ -145,6 +242,16 @@ def restore_confidence(db: Database, source_path: str) -> Dict[str, Any]:
     total = int(chunks["total"] or 0)
     missing = int(chunks["missing"] or 0)
     verified = int(chunks["verified"] or 0)
+    verified_ratio = (verified / total) if total else 0
+    score = 0
+    if total > 0:
+        score += 45
+    if missing == 0 and total > 0:
+        score += 25
+    score += int(verified_ratio * 20)
+    if row["backup_par2"]:
+        score += 10
+    score = max(0, min(100, score))
     return {
         "file_id": int(row["id"]),
         "path": row["path"],
@@ -152,9 +259,31 @@ def restore_confidence(db: Database, source_path: str) -> Dict[str, Any]:
         "chunk_count": total,
         "verified_chunks": verified,
         "missing_chunks": missing,
+        "confidence_score": score,
+        "par2_protected": bool(row["backup_par2"]),
+        "compressed": bool(row["backup_compressed"]),
         "last_verified": row["last_verify_at"] or chunks["last_verified"] or "",
         "restorable": total > 0 and missing == 0,
         "warning": "" if total > 0 and missing == 0 else "missing or unavailable chunks may prevent restore",
+    }
+
+
+def compression_sample(path: Path, sample_bytes: int = 2 * 1024 * 1024) -> Dict[str, Any]:
+    sample_bytes = max(0, int(sample_bytes))
+    if sample_bytes == 0:
+        data = path.read_bytes()
+    else:
+        with path.open("rb") as handle:
+            data = handle.read(sample_bytes)
+    if not data:
+        return {"sampled_bytes": 0, "compressed_bytes": 0, "gain_percent": 0.0, "compressible": False}
+    compressed = zlib.compress(data, level=6)
+    gain = max(0.0, round(((len(data) - len(compressed)) / len(data)) * 100, 2))
+    return {
+        "sampled_bytes": len(data),
+        "compressed_bytes": len(compressed),
+        "gain_percent": gain,
+        "compressible": gain > 0,
     }
 
 

@@ -28,7 +28,18 @@ from backuprr.crypto import xor_crypt
 from backuprr.db import Database
 from backuprr.log_forwarding import build_payload
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
-from backuprr.operations import check_usenet_hosts, dry_run_plan, restore_confidence, restore_plan, run_maintenance, run_restore_drill, test_post_host_article_size
+from backuprr.operations import (
+    check_usenet_hosts,
+    disaster_recovery_report,
+    dry_run_plan,
+    prometheus_metrics,
+    restore_confidence,
+    restore_plan,
+    run_maintenance,
+    run_restore_drill,
+    synthetic_catalog_plan,
+    test_post_host_article_size,
+)
 from backuprr.queueing import enqueue_unbacked, excluded_by_auto_queue_filter, prioritize
 from backuprr.restore import restore_file, restore_sample, restored_payloads
 from backuprr.scanner import scan_all
@@ -158,7 +169,24 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.73")
+        self.assertEqual(__version__, "0.2.74")
+
+    def test_synthetic_catalog_plan_estimates_chunk_rows(self):
+        plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
+        self.assertEqual(plan["files"], 50000)
+        self.assertEqual(plan["estimated_chunk_rows"], 50000 * 512)
+        self.assertGreater(plan["estimated_chunk_table_bytes"], 0)
+
+    def test_prometheus_metrics_include_queue_and_worker_values(self):
+        self.db.save_worker_state("backup", "Usenet backup worker", "", "", "", 0.1, "ok", "", 2, 1)
+        metrics = prometheus_metrics(self.db, self.config)
+        self.assertIn("backuprr_files_total", metrics)
+        self.assertIn('backuprr_worker_runs{kind="backup"} 2', metrics)
+
+    def test_disaster_recovery_report_flags_missing_cloud_targets(self):
+        report = disaster_recovery_report(self.db, self.config)
+        self.assertFalse(report["ok"])
+        self.assertIn("no config/database cloud backup targets configured", report["issues"])
 
     def test_compare_versions_handles_prefixed_semver(self):
         self.assertGreater(compare_versions("v0.2.10", "0.2.9"), 0)
@@ -225,6 +253,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("host_stats", tables)
         self.assertIn("maintenance_runs", tables)
         self.assertIn("restore_drills", tables)
+        self.assertIn("schema_migrations", tables)
 
     def test_article_size_probe_records_largest_supported_size(self):
         LimitedPostClient.max_size = 300 * 1024
@@ -522,6 +551,27 @@ class CoreTests(unittest.TestCase):
         self.config.file_stability_seconds = 0
         self.assertEqual(enqueue_unbacked(self.db, self.config), 1)
 
+    def test_auto_queue_uses_configured_strategy(self):
+        media = self.root / "media"
+        media.mkdir()
+        small = media / "small.mkv"
+        large = media / "large.mkv"
+        small.write_bytes(b"1")
+        large.write_bytes(b"1" * 100)
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        self.config.queue_strategy = "larger-first"
+        enqueue_unbacked(self.db, self.config)
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT f.relative_path FROM queue q
+                JOIN files f ON f.id=q.file_id
+                ORDER BY q.position
+                """
+            ).fetchall()
+        self.assertEqual([row["relative_path"] for row in rows], ["large.mkv", "small.mkv"])
+
     def test_scan_skips_unreadable_file_content(self):
         media = self.root / "media"
         media.mkdir()
@@ -753,6 +803,15 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(compression_enabled_for(media / "movie.mkv", self.config))
         self.assertFalse(compression_enabled_for(media / "archive.zip", self.config))
 
+    def test_compression_sampling_skips_low_gain_payloads(self):
+        media = self.root / "media"
+        media.mkdir()
+        randomish = media / "random.bin"
+        randomish.write_bytes(os.urandom(32 * 1024))
+        self.config.compress_files = True
+        self.config.compression_min_gain_percent = 95
+        self.assertFalse(compression_enabled_for(randomish, self.config))
+
     def test_post_next_records_compressed_backup_metadata(self):
         media = self.root / "media"
         media.mkdir()
@@ -872,6 +931,8 @@ class CoreTests(unittest.TestCase):
         plan = dry_run_plan(self.db, self.config)
         self.assertEqual(plan["estimated_articles"], 2)
         self.assertEqual(plan["estimated_hours_at_limit"], 1.0)
+        self.assertEqual(plan["estimated_chunk_rows"], 2)
+        self.assertIn("estimated_post_bytes", plan)
 
     def test_maintenance_prunes_old_verbose_events(self):
         with self.db.connect() as conn:
@@ -1462,8 +1523,11 @@ class CoreTests(unittest.TestCase):
                 "file_stability_seconds": 88,
                 "nntp_threads": 6,
                 "hourly_post_limit_bytes": 123456,
+                "auto_pause_auth_failures": 7,
+                "auto_pause_provider_failures": 11,
                 "usenet_retry_attempts": 4,
                 "usenet_retry_backoff_seconds": 8,
+                "queue_strategy": "folder-first",
                 "ui_theme": "nordic_mint",
                 "log_retention_days": 40,
                 "verbose_log_retention_days": 5,
@@ -1473,6 +1537,8 @@ class CoreTests(unittest.TestCase):
                 "log_chunk_events": True,
                 "compact_chunk_metadata": False,
                 "transfer_sample_bucket_seconds": 60,
+                "compression_sample_bytes": 4096,
+                "compression_min_gain_percent": 12,
                 "update_check_enabled": True,
                 "update_github_repo": "example/Backuprr",
                 "update_check_timeout_seconds": 12,
@@ -1525,8 +1591,11 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.file_stability_seconds, 88)
         self.assertEqual(self.config.nntp_threads, 6)
         self.assertEqual(self.config.hourly_post_limit_bytes, 123456)
+        self.assertEqual(self.config.auto_pause_auth_failures, 7)
+        self.assertEqual(self.config.auto_pause_provider_failures, 11)
         self.assertEqual(self.config.usenet_retry_attempts, 4)
         self.assertEqual(self.config.usenet_retry_backoff_seconds, 8)
+        self.assertEqual(self.config.queue_strategy, "folder-first")
         self.assertEqual(self.config.ui_theme, "nordic_mint")
         self.assertEqual(self.config.log_retention_days, 40)
         self.assertEqual(self.config.verbose_log_retention_days, 5)
@@ -1536,6 +1605,8 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(self.config.log_chunk_events)
         self.assertFalse(self.config.compact_chunk_metadata)
         self.assertEqual(self.config.transfer_sample_bucket_seconds, 60)
+        self.assertEqual(self.config.compression_sample_bytes, 4096)
+        self.assertEqual(self.config.compression_min_gain_percent, 12)
         self.assertTrue(self.config.update_check_enabled)
         self.assertEqual(self.config.update_github_repo, "example/Backuprr")
         self.assertEqual(self.config.update_check_timeout_seconds, 12)
@@ -1901,6 +1972,8 @@ class CoreTests(unittest.TestCase):
         confidence = restore_confidence(self.db, str(path))
         self.assertTrue(confidence["restorable"])
         self.assertEqual(confidence["chunk_count"], 1)
+        self.assertGreaterEqual(confidence["confidence_score"], 70)
+        self.assertFalse(confidence["par2_protected"])
 
     def test_restore_plan_reports_destination_and_overwrite(self):
         media = self.root / "media"
