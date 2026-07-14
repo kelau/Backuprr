@@ -188,7 +188,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.85")
+        self.assertEqual(__version__, "0.2.86")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
