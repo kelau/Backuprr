@@ -194,7 +194,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.88")
+        self.assertEqual(__version__, "0.2.89")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -410,6 +410,16 @@ class CoreTests(unittest.TestCase):
         second = self.db.list_events(["info", "debug"], limit=1, offset=1, search="proxmox")
         self.assertEqual(len(second), 1)
         self.assertNotEqual(rows[0]["id"], second[0]["id"])
+
+    def test_event_log_can_fetch_rows_after_id_incrementally(self):
+        self.db.log("info", "backup.task", "Initial proxmox event")
+        first = self.db.list_events(["info"], limit=1)[0]
+        self.db.log("info", "backup.task", "New proxmox event")
+        self.db.log("warning", "verify.chunk", "Filtered warning")
+        rows = self.db.list_events_after_id(first["id"], ["info"], limit=10, search="proxmox")
+        self.assertEqual(len(rows), 1)
+        self.assertGreater(rows[0]["id"], first["id"])
+        self.assertIn("New proxmox", rows[0]["message"])
 
     def test_scan_catalogs_files_and_enqueue_unbacked(self):
         media = self.root / "media"

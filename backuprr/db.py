@@ -1648,6 +1648,23 @@ class Database:
                 (*params, limit, offset),
             ).fetchall()
 
+    def list_events_after_id(
+        self,
+        after_id: int,
+        levels: Optional[List[str]] = None,
+        limit: int = 100,
+        event_types: Optional[List[str]] = None,
+        exclude_event_types: Optional[List[str]] = None,
+        search: str = "",
+    ) -> List[sqlite3.Row]:
+        where, params = self._event_filters(levels, event_types, exclude_event_types, search)
+        prefix = "WHERE" if not where else f"{where} AND"
+        with self.connect() as conn:
+            return conn.execute(
+                f"SELECT * FROM events {prefix} id > ? ORDER BY id DESC LIMIT ?",
+                (*params, int(after_id), int(limit)),
+            ).fetchall()
+
     def event_count(
         self,
         levels: Optional[List[str]] = None,

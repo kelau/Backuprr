@@ -709,6 +709,18 @@ class Handler(BaseHTTPRequestHandler):
             search = query.get("q", [""])[0]
             sort_by = query.get("sort", ["id"])[0]
             sort_dir = query.get("dir", ["desc"])[0]
+            after_id = int(query.get("after_id", ["0"])[0] or 0)
+            if after_id > 0:
+                self.send_json(
+                    {
+                        "rows": rowdicts(self.db.list_events_after_id(after_id, levels, page_size, event_types, exclude_event_types, search)),
+                        "page": 1,
+                        "page_size": page_size,
+                        "after_id": after_id,
+                        "incremental": True,
+                    }
+                )
+                return
             offset = (page - 1) * page_size
             self.send_json(
                 {
@@ -1391,6 +1403,10 @@ let logEventTypeSelection = [];
 let logPage = 1;
 let logPageSize = 100;
 let logTextFilter = "";
+let logRowsCache = [];
+let logResultCache = null;
+let logSignature = "";
+let logNewestId = 0;
 let eventSource = null;
 let lastChangeToken = null;
 let activeQueuePage = 1;
@@ -1423,6 +1439,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.89":["The Log table now fetches only newly matching rows during live updates when the current view can be updated incrementally."],
  "0.2.88":["Verification table data now refreshes incrementally with request backoff to reduce internal API 429s during active runs."],
  "0.2.87":["Verification rate limits and temporary provider failures are now treated as retryable deferrals instead of missing chunks."],
  "0.2.86":["Verification tables now keep their last valid payload during live refreshes, preventing flicker while verification is running."],
@@ -1874,7 +1891,7 @@ async function refreshPageForChanges(previous, token){
  const operationsChanged = previous.operation_revision !== token.operation_revision;
  if(page==="Status" && (filesChanged || queueChanged || chunksChanged || tasksChanged || transferChanged || operationsChanged)) await updateStatusPage();
  if(page==="Files" && (filesChanged || queueChanged || transferChanged || operationsChanged)) await updateFilesPage();
- if(page==="Log" && eventsChanged) await updateLogPage(false);
+ if(page==="Log" && eventsChanged) await updateLogPage({incremental:true});
  if(page==="Queue" && (queueChanged || filesChanged || transferChanged)) await updateQueuePage();
  if(page==="Tasks" && (eventsChanged || tasksChanged)) await updateTasksPage();
  if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged || operationsChanged)) await updateVerificationPage({invalidate:chunksChanged || filesChanged});
@@ -2906,14 +2923,60 @@ function updateLogFilterLabels(){
  if(eventSummary) eventSummary.textContent = logSelectionSummary("Event types", logEventTypeSelection, eventOptions.length);
  updateLogEventTypeGroupStates();
 }
-async function updateLogPage(saveSelection=true){
+function logQueryParts(){
+ const levels = logLevelSelection.map(level => "level="+encodeURIComponent(level)).join("&");
+ const eventTypes = logEventTypeSelection.map(type => "event_type="+encodeURIComponent(type)).join("&");
+ return {levels, eventTypes};
+}
+function currentLogSignature(){
+ const sort = tableSorts.log || {};
+ return `${logPage}|${logPageSize}|${logTextFilter}|${logLevelSelection.join(",")}|${logEventTypeSelection.join(",")}|${sort.col || "id"}|${sort.dir || "desc"}`;
+}
+function renderLogRows(result){
+ const target = document.getElementById("logRows");
+ if(target) target.innerHTML = table(result.rows || [], ["id","ts","level","event_type","message","file_id"], { scope:"log", pageVar:"logPage", updateFn:"updateLogPage" }) + paginationControls(result, "logPage", "updateLogPage", "logPageSize");
+}
+function canUpdateLogIncrementally(signature){
+ const sort = tableSorts.log || {};
+ return logPage === 1 && (!sort.col || sort.col === "id") && (!sort.dir || sort.dir === "desc") && signature === logSignature && logResultCache && logNewestId > 0;
+}
+async function updateLogPage(options={}){
  logLevelSelection = Array.from(document.querySelectorAll(".logLevel:checked")).map(input => input.value);
  logEventTypeSelection = Array.from(document.querySelectorAll(".logEventType:checked")).map(input => input.value);
  logTextFilter = document.getElementById("logSearch")?.value || logTextFilter;
- const levels = logLevelSelection.map(level => "level="+encodeURIComponent(level)).join("&");
- const eventTypes = logEventTypeSelection.map(type => "event_type="+encodeURIComponent(type)).join("&");
+ const {levels, eventTypes} = logQueryParts();
+ const signature = currentLogSignature();
+ if(options.incremental && canUpdateLogIncrementally(signature)){
+  const delta = await api(`/api/log?page=1&page_size=${logPageSize}&after_id=${logNewestId}&q=${encodeURIComponent(logTextFilter)}&${levels}&${eventTypes}`);
+  if(delta.rate_limited){
+   renderLogRows(logResultCache);
+   updateLogFilterLabels();
+   return;
+  }
+  if(delta.incremental && Array.isArray(delta.rows) && delta.rows.length){
+   const seen = new Set(logRowsCache.map(row => Number(row.id)));
+   const incoming = delta.rows.filter(row => !seen.has(Number(row.id)));
+   logRowsCache = [...incoming, ...logRowsCache].slice(0, logPageSize);
+   logNewestId = Math.max(logNewestId, ...incoming.map(row => Number(row.id || 0)));
+   logResultCache = {...logResultCache, rows:logRowsCache, total:Number(logResultCache.total || 0) + incoming.length};
+   renderLogRows(logResultCache);
+   updateLogFilterLabels();
+   return;
+  }
+  renderLogRows(logResultCache);
+  updateLogFilterLabels();
+  return;
+ }
  const result = await api(`/api/log?page=${logPage}&page_size=${logPageSize}&q=${encodeURIComponent(logTextFilter)}&${levels}&${eventTypes}${sortQuery("log")}`);
- document.getElementById("logRows").innerHTML = table(result.rows || [], ["id","ts","level","event_type","message","file_id"], { scope:"log", pageVar:"logPage", updateFn:"updateLogPage" }) + paginationControls(result, "logPage", "updateLogPage", "logPageSize");
+ if(!result.error && Array.isArray(result.rows)){
+  logRowsCache = result.rows;
+  logResultCache = result;
+  logSignature = signature;
+  logNewestId = Math.max(0, ...logRowsCache.map(row => Number(row.id || 0)));
+  renderLogRows(result);
+ } else if(logResultCache) {
+  renderLogRows(logResultCache);
+ }
  updateLogFilterLabels();
 }
 async function loadLog(){ await updateLogPage(); }
