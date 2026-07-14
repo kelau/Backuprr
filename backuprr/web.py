@@ -1397,6 +1397,7 @@ let verificationRefreshRunning = false;
 let verificationProgressFetchedAt = 0;
 let apiRateLimitedUntil = 0;
 let healthBarFetchedAt = 0;
+let renderSeq = 0;
 let appVersion = "";
 let logLevelSelection = ["error","warning","info"];
 let logEventTypeSelection = [];
@@ -1407,6 +1408,8 @@ let logRowsCache = [];
 let logResultCache = null;
 let logSignature = "";
 let logNewestId = 0;
+let queueResultCache = {};
+let tasksRowsCache = [];
 let eventSource = null;
 let lastChangeToken = null;
 let activeQueuePage = 1;
@@ -1439,6 +1442,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.92":["Page navigation now ignores stale async renders and table views keep the last good data during temporary internal API cooldowns."],
  "0.2.91":["Manual and forced verification can now recheck missing chunks and recover stale failed missing-chunk rows when all chunks exist."],
  "0.2.90":["PAR2 creation now uses MultiPar par2j syntax when needed and reports captured tool output on failures."],
  "0.2.89":["The Log table now fetches only newly matching rows during live updates when the current view can be updated incrementally."],
@@ -1546,6 +1550,17 @@ function table(rows, cols, options={}){
  if(!rows.length) return "<p class='muted'>No rows.</p>";
  return `<table><thead><tr>${cols.map(c=>sortableHeader(c, null, options)).join("")}</tr></thead><tbody>`+
  rows.map(r=>`<tr>${cols.map(c=>`<td data-sort-value="${esc(sortCellValue(c, r[c], r))}">${formatCellHtml(c, r[c], r)}</td>`).join("")}</tr>`).join("")+"</tbody></table>";
+}
+function validPagedResult(result){
+ return Boolean(result && !result.error && Array.isArray(result.rows) && Number.isFinite(Number(result.total)));
+}
+function holdTableMessage(cached=null){
+ if(cached) return "";
+ const wait = Date.now() < apiRateLimitedUntil ? "Waiting for the internal API cooldown before loading this table..." : "Loading table data...";
+ return `<p class='muted'>${esc(wait)}</p>`;
+}
+function isActiveRender(token, pageName){
+ return token === renderSeq && page === pageName;
 }
 function sortableHeader(col, label, options={}){
  const sort = options.scope ? tableSorts[options.scope] || {} : {};
@@ -1806,18 +1821,23 @@ function groupedEventTypeDropdown(types, selected){
   </div>`).join("")}</div></details>`;
 }
 async function render(){
+ const renderToken = ++renderSeq;
+ const requestedPage = page;
  nav();
  connectChanges();
  if(!settingsCache) await loadSettings();
  else applyTheme(settingsCache.ui_theme);
+ if(!isActiveRender(renderToken, requestedPage)) return;
  await updateVersionPill();
  await updateHealthBar();
+ if(!isActiveRender(renderToken, requestedPage)) return;
  const c = document.getElementById("content");
- if(page==="Status"){
+ if(requestedPage==="Status"){
   c.innerHTML = `<div id="statusPanel"></div>`;
-  await updateStatusPage();
+  await updateStatusPage({renderToken, pageName:requestedPage});
  }
- if(page==="Files"){
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="Files"){
   c.innerHTML = `<div class="toolbar">
    <input id="filesSearch" placeholder="Search files" oninput="filesPage=1;updateFilesPage()">
    <label><input id="showUnbackedOnly" type="checkbox" onchange="filesPage=1;updateFilesPage()"> <span class="ui-icon">&#9888;</span>Only unbacked</label>
@@ -1826,51 +1846,63 @@ async function render(){
    ${selectedRestoreDropdown()}
    ${pushLabel()}
   </div><div id="restoreStatus" class="muted"></div><div id="filesTree"></div><div id="filesSelectionSummary" class="selection-summary"></div>`;
-  await updateFilesPage();
+  await updateFilesPage({renderToken, pageName:requestedPage});
  }
- if(page==="Search"){
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="Search"){
   c.innerHTML = `<div class="toolbar"><input id="q" placeholder="Search files"><button onclick="search()"><span class="ui-icon">&#128269;</span>Search</button></div><div id="results"></div>`;
  }
- if(page==="Log"){
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="Log"){
   const eventTypes = await api("/api/log/event-types");
-  if(!logEventTypeSelection.length) logEventTypeSelection = eventTypes.filter(type => type !== "web.access");
+  if(!isActiveRender(renderToken, requestedPage)) return;
+  const safeEventTypes = Array.isArray(eventTypes) ? eventTypes : [];
+  if(!logEventTypeSelection.length) logEventTypeSelection = safeEventTypes.filter(type => type !== "web.access");
   const levels = ["error","warning","info","debug","verbose"];
   c.innerHTML = `<div class="toolbar-grid">
    <input id="logSearch" placeholder="Filter log text" value="${esc(logTextFilter)}" oninput="logTextFilter=this.value;logPage=1;updateLogPage(false)">
     <div class="toolbar-options">
     ${multiSelectDropdown("Levels", "logLevel", levels, logLevelSelection, "levelPill", "logLevelSummary")}
-    ${groupedEventTypeDropdown(eventTypes, logEventTypeSelection)}
+    ${groupedEventTypeDropdown(safeEventTypes, logEventTypeSelection)}
     ${pushLabel()}
    </div>
   </div><div id="logRows"></div>`;
-  await updateLogPage();
+  await updateLogPage({renderToken, pageName:requestedPage});
  }
- if(page==="Queue"){
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="Queue"){
   c.innerHTML = `<div class="toolbar"><select id="filter"><option>older-first</option><option>larger-first</option><option>smaller-first</option></select><button onclick="post('/api/queue/prioritize',{filter:document.getElementById('filter').value}).then(updateQueuePage)"><span class="ui-icon">&#8593;</span>Apply filter</button><button class="primary" onclick="post('/api/backup/run').then(updateQueuePage)"><span class="ui-icon">&#9658;</span>Backup now</button>${pushLabel()}</div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Needs attention</h2><div id="attentionQueueRows"></div><h2 class="section-title"><span class="ui-icon">&#9658;</span>Active</h2><div id="activeQueueRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Completed</h2><div id="completedQueueRows"></div>`;
-  await updateQueuePage();
+  await updateQueuePage({renderToken, pageName:requestedPage});
  }
- if(page==="Tasks"){
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="Tasks"){
   c.innerHTML = `<div id="taskRows"></div>`;
-  await updateTasksPage();
+  await updateTasksPage({renderToken, pageName:requestedPage});
  }
- if(page==="Verification"){
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="Verification"){
   c.innerHTML = `<div class="toolbar"><input id="verificationSearch" placeholder="Filter verification files" value="${esc(verificationTextFilter)}" oninput="verificationTextFilter=this.value;verificationMissingPage=verificationUnverifiedPage=verificationVerifiedPage=verificationNoChunksPage=1;updateVerificationPage({invalidate:true})"><button class="primary" onclick="verifySelectedFiles()"><span class="ui-icon">&#10003;</span>Verify selected</button><button onclick="verifyAllFiles()"><span class="ui-icon">&#10003;</span>Verify all</button>${pushLabel()}</div><div id="verificationStatus" class="async-status"></div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Missing chunks</h2><div id="verificationMissingRows"></div><h2 class="section-title"><span class="ui-icon">&#128269;</span>Unverified</h2><div id="verificationUnverifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Verified</h2><div id="verificationVerifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#128230;</span>No chunks</h2><div id="verificationNoChunksRows"></div>`;
-  await updateVerificationPage({invalidate:true});
+  await updateVerificationPage({invalidate:true, renderToken, pageName:requestedPage});
  }
- if(page==="Statistics"){
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="Statistics"){
   c.innerHTML = `<div id="statisticsPanel"></div>`;
-  await updateStatisticsPage();
+  await updateStatisticsPage({renderToken, pageName:requestedPage});
  }
- if(page==="Operations"){
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="Operations"){
   c.innerHTML = `<div id="operationsPanel"></div>`;
-  await updateOperationsPage();
+  await updateOperationsPage({renderToken, pageName:requestedPage});
  }
- if(page==="Security"){
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="Security"){
   c.innerHTML = `<div id="securityPanel"></div>`;
-  await updateSecurityPage();
+  await updateSecurityPage({renderToken, pageName:requestedPage});
  }
- if(page==="Settings"){ settingsCache = await loadSettings(); c.innerHTML = settingsForm(settingsCache); addSettingsHelpText(); applySettingsHelpPreference(); initSettingsDirtyTracking(); }
- if(page==="About"){ c.innerHTML = aboutPage(); const s=await api("/api/status"); appVersion = s.version; updateVersionPillText(); maybeShowVersionNotice(appVersion); document.getElementById("aboutVersion").textContent=s.version; }
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="Settings"){ settingsCache = await loadSettings(); if(!isActiveRender(renderToken, requestedPage)) return; c.innerHTML = settingsForm(settingsCache); addSettingsHelpText(); applySettingsHelpPreference(); initSettingsDirtyTracking(); }
+ if(!isActiveRender(renderToken, requestedPage)) return;
+ if(requestedPage==="About"){ c.innerHTML = aboutPage(); const s=await api("/api/status"); if(!isActiveRender(renderToken, requestedPage)) return; appVersion = s.version; updateVersionPillText(); maybeShowVersionNotice(appVersion); document.getElementById("aboutVersion").textContent=s.version; }
 }
 async function refreshCurrentLivePage(){
  await updateHealthBar();
@@ -1902,13 +1934,15 @@ async function refreshPageForChanges(previous, token){
  if(page==="Security" && eventsChanged) await updateSecurityPage();
  if(filesChanged || queueChanged || eventsChanged || tasksChanged || transferChanged) await updateHealthBar();
 }
-async function updateStatusPage(){
+async function updateStatusPage(options={}){
  const [s, tasks, speed, readiness] = await Promise.all([
   api("/api/status"),
   api("/api/tasks"),
   api("/api/speed?minutes=10&bucket=10"),
   api("/api/readiness")
  ]);
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Status")) return;
+ if(s?.error || !Array.isArray(tasks)) return;
  appVersion = s.version;
  updateVersionPillText();
  maybeShowVersionNotice(appVersion);
@@ -1965,20 +1999,24 @@ function dismissVersionNotice(){
  const target = document.getElementById("versionNotice");
  if(target) target.innerHTML = "";
 }
-async function updateFilesPage(){
+async function updateFilesPage(options={}){
  await refreshOperationProgress();
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Files")) return;
  const openFolders = new Set(Array.from(document.querySelectorAll("#filesTree details[data-path][open]")).map(item => item.dataset.path));
  const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
  const unbacked = !!document.getElementById("showUnbackedOnly")?.checked;
  const q = document.getElementById("filesSearch")?.value || "";
  const result = await api(`/api/files?page=${filesPage}&page_size=${filesPageSize}&include_deleted=${showDeleted ? 1 : 0}&unbacked=${unbacked ? 1 : 0}&q=${encodeURIComponent(q)}${sortQuery("files")}`);
- fileRowsCache = result.rows || [];
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Files")) return;
+ const valid = validPagedResult(result);
+ if(valid) fileRowsCache = result.rows || [];
  for(const row of fileRowsCache){
   if(selectedFiles.has(Number(row.id))) selectedFileData.set(Number(row.id), row);
  }
  const target = document.getElementById("filesTree");
  if(target){
-  target.innerHTML = fileTree(fileRowsCache, showDeleted) + paginationControls(result, "filesPage", "updateFilesPage", "filesPageSize");
+  const pageResult = valid ? result : {rows:fileRowsCache, page:filesPage, page_size:filesPageSize, total:fileRowsCache.length};
+  target.innerHTML = holdTableMessage(valid ? pageResult : (fileRowsCache.length ? pageResult : null)) + fileTree(fileRowsCache, showDeleted) + paginationControls(pageResult, "filesPage", "updateFilesPage", "filesPageSize");
   target.querySelectorAll("details[data-path]").forEach(details => {
    if(openFolders.has(details.dataset.path)) details.open = true;
   });
@@ -1992,18 +2030,23 @@ async function refreshOperationProgress(){
   operationRowsCache = result.operations;
  }
 }
-async function updateQueuePage(){
+async function updateQueuePage(options={}){
  const attention = await api(`/api/queue?status=attention&page=${attentionQueuePage}&page_size=${queuePageSize}${sortQuery("queueAttention")}`);
  const active = await api(`/api/queue?page=${activeQueuePage}&page_size=${queuePageSize}${sortQuery("queueActive")}`);
  const done = await api(`/api/queue?status=done&page=${completedQueuePage}&page_size=${queuePageSize}${sortQuery("queueCompleted")}`);
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Queue")) return;
+ queueResultCache.attention = validPagedResult(attention) ? attention : queueResultCache.attention;
+ queueResultCache.active = validPagedResult(active) ? active : queueResultCache.active;
+ queueResultCache.done = validPagedResult(done) ? done : queueResultCache.done;
  const attentionTarget = document.getElementById("attentionQueueRows");
  const activeTarget = document.getElementById("activeQueueRows");
  const doneTarget = document.getElementById("completedQueueRows");
- if(attentionTarget) attentionTarget.innerHTML = pagedTable(attention, "attentionQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"], "queueAttention");
- if(activeTarget) activeTarget.innerHTML = pagedTable(active, "activeQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"], "queueActive");
- if(doneTarget) doneTarget.innerHTML = pagedTable(done, "completedQueuePage", ["file_id","path","size","chunk_count","state"], "queueCompleted");
+ if(attentionTarget) attentionTarget.innerHTML = pagedTable(queueResultCache.attention, "attentionQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"], "queueAttention");
+ if(activeTarget) activeTarget.innerHTML = pagedTable(queueResultCache.active, "activeQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"], "queueActive");
+ if(doneTarget) doneTarget.innerHTML = pagedTable(queueResultCache.done, "completedQueuePage", ["file_id","path","size","chunk_count","state"], "queueCompleted");
 }
 function pagedTable(result, pageVar, cols, scope){
+ if(!validPagedResult(result)) return holdTableMessage(null);
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || queuePageSize)));
  const pageNo = Number(result.page || 1);
  return table(result.rows || [], cols, { scope, pageVar, updateFn:"updateQueuePage" }) + paginationControls(result, pageVar, "updateQueuePage", "queuePageSize");
@@ -2186,10 +2229,12 @@ function setVerificationStatus(message, tone="warn", transient=false){
   if(target.innerHTML === statusMessageHtml(message, tone)) target.innerHTML = "";
  }, 3500);
 }
-async function updateTasksPage(){
+async function updateTasksPage(options={}){
  const rows = await api("/api/tasks");
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Tasks")) return;
+ if(Array.isArray(rows)) tasksRowsCache = rows;
  const target = document.getElementById("taskRows");
- if(target) target.innerHTML = tasksTable(rows);
+ if(target) target.innerHTML = Array.isArray(rows) || tasksRowsCache.length ? tasksTable(tasksRowsCache) : holdTableMessage(null);
  updateNextRunLabels();
 }
 function taskActionButtons(kind, refresh="updateTasksPage"){
@@ -2211,6 +2256,7 @@ function tasksTable(rows){
  "</tbody></table>";
 }
 async function updateVerificationPage(options={}){
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Verification")) return;
  if(verificationRefreshRunning){
   clearTimeout(updateVerificationPage.retryTimer);
   updateVerificationPage.retryTimer = setTimeout(() => updateVerificationPage(options), 350);
@@ -2227,8 +2273,9 @@ async function updateVerificationPage(options={}){
   if(stale.length && Date.now() >= apiRateLimitedUntil){
    const item = stale[0];
    const result = await api(item.url);
-   if(!result.rate_limited) cacheVerificationResult(item.state, result, item.signature);
+   if(!result.rate_limited && validVerificationResult(result)) cacheVerificationResult(item.state, result, item.signature);
   }
+  if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Verification")) return;
   if(seq !== verificationRefreshSeq) return;
   renderVerificationTables();
   const remaining = verificationStateConfigs().some(item => verificationTableCache[item.state]?.signature !== item.signature);
@@ -2240,13 +2287,15 @@ async function updateVerificationPage(options={}){
   verificationRefreshRunning = false;
  }
 }
-async function updateStatisticsPage(){
+async function updateStatisticsPage(options={}){
  const data = await api("/api/statistics");
  if(!settingsCache) settingsCache = await api("/api/settings");
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Statistics")) return;
+ if(data?.error) return;
  const target = document.getElementById("statisticsPanel");
  if(target) target.innerHTML = statisticsDashboard(data);
 }
-async function updateOperationsPage(){
+async function updateOperationsPage(options={}){
  await refreshOperationProgress();
  const [tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts, failover, readiness, schedule, history] = await Promise.all([
   api("/api/tasks"),
@@ -2264,16 +2313,20 @@ async function updateOperationsPage(){
   api("/api/maintenance/schedule"),
   api("/api/config/history")
  ]);
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Operations")) return;
+ if(!Array.isArray(tasks)) return;
  const target = document.getElementById("operationsPanel");
  if(target) target.innerHTML = operationsDashboard(tasks, plan, benchmark, recovery, health.hosts || [], maintenance || [], drills || [], runs || [], setup, alerts.alerts || [], failover, readiness, schedule, history.rows || []);
 }
-async function updateSecurityPage(){
+async function updateSecurityPage(options={}){
  const [model, setup, recovery, settings] = await Promise.all([
   api("/api/threat-model"),
   api("/api/setup-health"),
   api("/api/disaster-recovery"),
   api("/api/settings")
  ]);
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Security")) return;
+ if(model?.error || setup?.error || recovery?.error || settings?.error) return;
  const target = document.getElementById("securityPanel");
  if(target) target.innerHTML = securityDashboard(model, setup, recovery, settings);
 }
@@ -2943,6 +2996,7 @@ function canUpdateLogIncrementally(signature){
  return logPage === 1 && (!sort.col || sort.col === "id") && (!sort.dir || sort.dir === "desc") && signature === logSignature && logResultCache && logNewestId > 0;
 }
 async function updateLogPage(options={}){
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Log")) return;
  logLevelSelection = Array.from(document.querySelectorAll(".logLevel:checked")).map(input => input.value);
  logEventTypeSelection = Array.from(document.querySelectorAll(".logEventType:checked")).map(input => input.value);
  logTextFilter = document.getElementById("logSearch")?.value || logTextFilter;
@@ -2950,6 +3004,7 @@ async function updateLogPage(options={}){
  const signature = currentLogSignature();
  if(options.incremental && canUpdateLogIncrementally(signature)){
   const delta = await api(`/api/log?page=1&page_size=${logPageSize}&after_id=${logNewestId}&q=${encodeURIComponent(logTextFilter)}&${levels}&${eventTypes}`);
+  if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Log")) return;
   if(delta.rate_limited){
    renderLogRows(logResultCache);
    updateLogFilterLabels();
@@ -2970,6 +3025,7 @@ async function updateLogPage(options={}){
   return;
  }
  const result = await api(`/api/log?page=${logPage}&page_size=${logPageSize}&q=${encodeURIComponent(logTextFilter)}&${levels}&${eventTypes}${sortQuery("log")}`);
+ if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Log")) return;
  if(!result.error && Array.isArray(result.rows)){
   logRowsCache = result.rows;
   logResultCache = result;
