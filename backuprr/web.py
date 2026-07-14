@@ -1420,6 +1420,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.87":["Verification rate limits and temporary provider failures are now treated as retryable deferrals instead of missing chunks."],
  "0.2.86":["Verification tables now keep their last valid payload during live refreshes, preventing flicker while verification is running."],
  "0.2.85":["Settings field descriptions now include clearer purpose, tuning guidance, possible settings, examples, and defaults."],
  "0.2.84":["Added PAR2 executable auto-discovery and optional hidden Settings field descriptions."],

@@ -1,5 +1,6 @@
 import io
 import json
+import nntplib
 import os
 import email.message
 import hashlib
@@ -121,6 +122,11 @@ class FakeReadClient:
         return True
 
 
+class RateLimitedReadClient(FakeReadClient):
+    def article_exists(self, message_id):
+        raise nntplib.NNTPTemporaryError("480 rate limit exceeded")
+
+
 class FakeSocketPermissionError(OSError):
     @property
     def winerror(self):
@@ -188,7 +194,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.86")
+        self.assertEqual(__version__, "0.2.87")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -2180,6 +2186,35 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(compact["verified_count"], 2)
         self.assertEqual(compact["missing_count"], 0)
         self.assertIsNotNone(file_row["last_verify_at"])
+
+    def test_verification_rate_limit_does_not_mark_chunks_missing(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"movie")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='backed_up' WHERE id=?", (file_id,))
+        self.db.add_chunk(file_id, 0, "<rate-limited@example.test>", 3, "abc", "[hidden]")
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+        progress = []
+
+        with patch("backuprr.backup.UsenetClient", RateLimitedReadClient):
+            self.assertEqual(verify_file_chunks(self.db, self.config, [file_id], progress=lambda done, total: progress.append((done, total))), 0)
+
+        self.assertEqual(progress, [(1, 1)])
+        with self.db.connect() as conn:
+            chunk = conn.execute("SELECT status, verified_at FROM chunks WHERE file_id=?", (file_id,)).fetchone()
+            file_row = conn.execute("SELECT state, last_verify_at FROM files WHERE id=?", (file_id,)).fetchone()
+            event = conn.execute("SELECT level, event_type, message FROM events ORDER BY id DESC LIMIT 1").fetchone()
+        self.assertEqual(chunk["status"], "posted")
+        self.assertIsNone(chunk["verified_at"])
+        self.assertEqual(file_row["state"], "backed_up")
+        self.assertIsNone(file_row["last_verify_at"])
+        self.assertEqual(event["event_type"], "verify.retry")
+        self.assertIn("rate limit", event["message"])
 
     def test_automatic_verification_uses_per_file_due_dates_and_batch_limit(self):
         media = self.root / "media"

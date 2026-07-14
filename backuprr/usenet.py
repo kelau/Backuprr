@@ -62,9 +62,12 @@ class UsenetClient:
             self.conn.stat(message_id)
             return True
         except nntplib.NNTPTemporaryError:
-            return False
-        except nntplib.NNTPPermanentError:
-            return False
+            raise
+        except nntplib.NNTPPermanentError as exc:
+            message = str(exc).lower()
+            if message.startswith("430") or "no such article" in message or "not found" in message:
+                return False
+            raise
 
 
 def obfuscated_subject(file_id: int, chunk_index: int, sha256_hex: str) -> str:

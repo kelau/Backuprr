@@ -1,8 +1,10 @@
 import hashlib
 import math
+import nntplib
 import os
 import platform
 import shutil
+import socket
 import subprocess
 import tempfile
 import time
@@ -20,6 +22,19 @@ from .usenet import UsenetClient, obfuscated_subject, select_host
 
 
 NETWORK_BLOCKED_RETRY_SECONDS = 300
+VERIFY_RETRYABLE_PATTERNS = (
+    "rate",
+    "limit",
+    "too many",
+    "temporar",
+    "try again",
+    "timeout",
+    "timed out",
+    "busy",
+    "unavailable",
+    "connection reset",
+    "connection aborted",
+)
 COMPRESSED_EXTENSIONS = {
     ".7z",
     ".avi",
@@ -57,6 +72,15 @@ def is_socket_permission_error(exc: Exception) -> bool:
         or "WinError 10013" in text
         or "forbidden by its access permissions" in text
     )
+
+
+def is_retryable_verification_error(exc: Exception) -> bool:
+    if is_socket_permission_error(exc):
+        return True
+    if isinstance(exc, (nntplib.NNTPTemporaryError, TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    text = str(exc).lower()
+    return any(pattern in text for pattern in VERIFY_RETRYABLE_PATTERNS)
 
 
 def iter_chunks(path: Path, size: int) -> Iterator[bytes]:
@@ -528,25 +552,35 @@ def verify_chunks(db: Database, config: Config, chunks: Iterable[Any], progress:
         return 0
     host = select_host(config, "read")
 
-    def verify_chunk(chunk) -> tuple[int, int, str, bool]:
-        with UsenetClient(host) as client:
-            exists = client.article_exists(chunk["message_id"])
-        return chunk["id"], int(chunk["file_id"]), chunk["message_id"], exists
+    def verify_chunk(chunk) -> tuple[int, int, str, Optional[bool], str]:
+        try:
+            with UsenetClient(host) as client:
+                exists = client.article_exists(chunk["message_id"])
+            return chunk["id"], int(chunk["file_id"]), chunk["message_id"], exists, ""
+        except Exception as exc:
+            if is_retryable_verification_error(exc):
+                return chunk["id"], int(chunk["file_id"]), chunk["message_id"], None, str(exc)
+            raise
 
     count = 0
+    completed = 0
     max_workers = max(1, int(config.nntp_threads))
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="backuprr-verify") as executor:
         futures = [executor.submit(verify_chunk, chunk) for chunk in chunks]
         for future in as_completed(futures):
-            chunk_id, file_id, message_id, exists = future.result()
-            db.mark_chunk_verified(chunk_id, exists)
-            if exists:
-                db.record_transfer_sample("download", 1)
-            if not exists or getattr(config, "log_chunk_events", False):
-                db.log("debug" if exists else "warning", "verify.chunk", f"Chunk {message_id} exists={exists}", file_id)
-            count += 1
+            chunk_id, file_id, message_id, exists, retry_reason = future.result()
+            if exists is None:
+                db.log("warning", "verify.retry", f"Verification deferred for {message_id}: {retry_reason}", file_id)
+            else:
+                db.mark_chunk_verified(chunk_id, exists)
+                if exists:
+                    db.record_transfer_sample("download", 1)
+                if not exists or getattr(config, "log_chunk_events", False):
+                    db.log("debug" if exists else "warning", "verify.chunk", f"Chunk {message_id} exists={exists}", file_id)
+                count += 1
+            completed += 1
             if progress:
-                progress(count, len(chunks))
+                progress(completed, len(chunks))
     return count
 
 
