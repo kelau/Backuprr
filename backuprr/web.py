@@ -1439,6 +1439,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.91":["Manual and forced verification can now recheck missing chunks and recover stale failed missing-chunk rows when all chunks exist."],
  "0.2.90":["PAR2 creation now uses MultiPar par2j syntax when needed and reports captured tool output on failures."],
  "0.2.89":["The Log table now fetches only newly matching rows during live updates when the current view can be updated incrementally."],
  "0.2.88":["Verification table data now refreshes incrementally with request backoff to reduce internal API 429s during active runs."],

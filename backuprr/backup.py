@@ -617,7 +617,7 @@ def verify_due_chunks(db: Database, config: Config, force: bool = False, progres
     cutoff = datetime.now(timezone.utc) - timedelta(days=config.verification_interval_days)
     older_than = datetime.max.replace(tzinfo=timezone.utc).isoformat() if force else cutoff.replace(microsecond=0).isoformat()
     chunks = (
-        db.chunks_due_for_verification(older_than)
+        db.chunks_due_for_verification(older_than, include_missing=force)
         if force
         else db.chunks_due_for_file_verification(older_than, config.verification_files_per_run)
     )
@@ -630,4 +630,4 @@ def verify_file_chunks(
     file_ids: Iterable[int],
     progress: Optional[Callable[[int, int], None]] = None,
 ) -> int:
-    return verify_chunks(db, config, db.chunks_for_file_ids(file_ids), progress=progress)
+    return verify_chunks(db, config, db.chunks_for_file_ids(file_ids, include_missing=True), progress=progress)

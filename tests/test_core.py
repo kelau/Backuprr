@@ -196,7 +196,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.90")
+        self.assertEqual(__version__, "0.2.91")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -1303,6 +1303,37 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             self.assertIsNotNone(conn.execute("SELECT last_verify_at FROM files WHERE id=?", (file_id,)).fetchone()["last_verify_at"])
 
+    def test_missing_chunk_recheck_recovers_failed_file_and_queue(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.add_chunk(file_id, 0, "<missing@example.test>", 3, "abc", "[hidden]")
+        self.db.add_chunk(file_id, 1, "<ok@example.test>", 3, "def", "[hidden]")
+        with self.db.connect() as conn:
+            chunk_ids = [row["id"] for row in conn.execute("SELECT id FROM chunks ORDER BY id").fetchall()]
+        self.db.mark_chunk_verified(chunk_ids[0], exists=False)
+        with self.db.connect() as conn:
+            conn.execute("UPDATE files SET state='failed' WHERE id=?", (file_id,))
+            conn.execute("UPDATE queue SET status='failed', reason='missing-chunks' WHERE file_id=?", (file_id,))
+
+        self.db.mark_chunk_verified(chunk_ids[0], exists=True)
+        self.db.mark_chunk_verified(chunk_ids[1], exists=True)
+
+        with self.db.connect() as conn:
+            file_row = conn.execute("SELECT state, last_verify_at FROM files WHERE id=?", (file_id,)).fetchone()
+            queue_row = conn.execute("SELECT status, reason FROM queue WHERE file_id=?", (file_id,)).fetchone()
+            missing = conn.execute("SELECT COUNT(*) FROM chunks WHERE file_id=? AND status='missing'", (file_id,)).fetchone()[0]
+        self.assertEqual(missing, 0)
+        self.assertEqual(file_row["state"], "backed_up")
+        self.assertIsNotNone(file_row["last_verify_at"])
+        self.assertEqual(queue_row["status"], "done")
+        self.assertEqual(queue_row["reason"], "verified-recovered")
+
     def test_queue_hides_completed_backed_up_files_by_default(self):
         media = self.root / "media"
         media.mkdir()
@@ -2235,6 +2266,36 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(file_row["last_verify_at"])
         self.assertEqual(event["event_type"], "verify.retry")
         self.assertIn("rate limit", event["message"])
+
+    def test_force_verification_rechecks_missing_chunks(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"movie")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='failed' WHERE id=?", (file_id,))
+        self.db.add_chunk(file_id, 0, "<missing@example.test>", 3, "abc", "[hidden]")
+        with self.db.connect() as conn:
+            chunk_id = conn.execute("SELECT id FROM chunks WHERE file_id=?", (file_id,)).fetchone()["id"]
+        self.db.mark_chunk_verified(chunk_id, exists=False)
+        with self.db.connect() as conn:
+            conn.execute("UPDATE queue SET status='failed', reason='missing-chunks' WHERE file_id=?", (file_id,))
+        self.config.usenet_hosts.append(UsenetHost(name="read", mode="read", host="example.test", port=563, tls="implicit"))
+
+        with patch("backuprr.backup.UsenetClient", FakeReadClient):
+            self.assertEqual(verify_due_chunks(self.db, self.config, force=True), 1)
+
+        with self.db.connect() as conn:
+            chunk = conn.execute("SELECT status FROM chunks WHERE id=?", (chunk_id,)).fetchone()
+            file_row = conn.execute("SELECT state FROM files WHERE id=?", (file_id,)).fetchone()
+            queue_row = conn.execute("SELECT status, reason FROM queue WHERE file_id=?", (file_id,)).fetchone()
+        self.assertEqual(chunk["status"], "verified")
+        self.assertEqual(file_row["state"], "backed_up")
+        self.assertEqual(queue_row["status"], "done")
+        self.assertEqual(queue_row["reason"], "verified-recovered")
 
     def test_automatic_verification_uses_per_file_due_dates_and_batch_limit(self):
         media = self.root / "media"

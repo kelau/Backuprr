@@ -1232,23 +1232,25 @@ class Database:
                 (now, file_id),
             )
 
-    def chunks_due_for_verification(self, older_than: str) -> List[sqlite3.Row]:
+    def chunks_due_for_verification(self, older_than: str, include_missing: bool = False) -> List[sqlite3.Row]:
+        status_clause = "1=1" if include_missing else "c.status != 'missing'"
+        manifest_clause = "1=1" if include_missing else "cm.missing_count = 0"
         with self.connect() as conn:
             live = conn.execute(
-                """
+                f"""
                 SELECT c.*, f.path FROM chunks c
                 JOIN files f ON f.id = c.file_id
-                WHERE c.status != 'missing'
+                WHERE {status_clause}
                   AND (c.verified_at IS NULL OR c.verified_at <= ?)
                 ORDER BY c.verified_at IS NULL DESC, c.verified_at ASC
                 """,
                 (older_than,),
             ).fetchall()
             compact_files = conn.execute(
-                """
+                f"""
                 SELECT cm.*, f.path FROM chunk_manifests cm
                 JOIN files f ON f.id = cm.file_id
-                WHERE cm.missing_count = 0
+                WHERE {manifest_clause}
                   AND EXISTS (
                     SELECT 1 FROM files ff
                     WHERE ff.id=cm.file_id AND (ff.last_verify_at IS NULL OR ff.last_verify_at <= ?)
@@ -1260,7 +1262,7 @@ class Database:
         manifest_chunks: List[Dict[str, Any]] = []
         for row in compact_files:
             for entry in self._manifest_entries(row):
-                if entry.get("status") != "missing":
+                if include_missing or entry.get("status") != "missing":
                     entry["path"] = row["path"]
                     manifest_chunks.append(entry)
         return list(live) + manifest_chunks
@@ -1290,18 +1292,20 @@ class Database:
             ).fetchall()
         return self.chunks_for_file_ids(row["id"] for row in due_files)
 
-    def chunks_for_file_ids(self, file_ids: Iterable[int]) -> List[sqlite3.Row]:
+    def chunks_for_file_ids(self, file_ids: Iterable[int], include_missing: bool = False) -> List[sqlite3.Row]:
         ids = [int(file_id) for file_id in file_ids]
         if not ids:
             return []
         placeholders = ",".join("?" for _ in ids)
+        status_clause = "1=1" if include_missing else "c.status != 'missing'"
+        manifest_clause = "1=1" if include_missing else "cm.missing_count=0"
         with self.connect() as conn:
             live = conn.execute(
                 f"""
                 SELECT c.*, f.path FROM chunks c
                 JOIN files f ON f.id = c.file_id
                 WHERE c.file_id IN ({placeholders})
-                  AND c.status != 'missing'
+                  AND {status_clause}
                 ORDER BY c.file_id, c.chunk_index
                 """,
                 ids,
@@ -1311,7 +1315,7 @@ class Database:
                 SELECT cm.*, f.path FROM chunk_manifests cm
                 JOIN files f ON f.id = cm.file_id
                 WHERE cm.file_id IN ({placeholders})
-                  AND cm.missing_count=0
+                  AND {manifest_clause}
                 ORDER BY cm.file_id
                 """,
                 ids,
@@ -1319,7 +1323,7 @@ class Database:
         manifest_chunks: List[Dict[str, Any]] = []
         for row in compact_rows:
             for entry in self._manifest_entries(row):
-                if entry.get("status") != "missing":
+                if include_missing or entry.get("status") != "missing":
                     entry["path"] = row["path"]
                     manifest_chunks.append(entry)
         return list(live) + manifest_chunks
@@ -1355,7 +1359,19 @@ class Database:
                     conn.execute("UPDATE files SET state='missing_chunks', updated_at=? WHERE id=?", (now, file_id))
                     missing_file_id = file_id
                 elif missing_count == 0 and verified_count == len(entries):
-                    conn.execute("UPDATE files SET last_verify_at=?, updated_at=? WHERE id=?", (now, now, file_id))
+                    conn.execute(
+                        """
+                        UPDATE files
+                        SET state=CASE WHEN state IN ('missing_chunks','failed','queued') THEN 'backed_up' ELSE state END,
+                            last_verify_at=?, updated_at=?
+                        WHERE id=?
+                        """,
+                        (now, now, file_id),
+                    )
+                    conn.execute(
+                        "UPDATE queue SET status='done', reason='verified-recovered', updated_at=? WHERE file_id=? AND reason='missing-chunks'",
+                        (now, file_id),
+                    )
             if missing_file_id is not None:
                 self.queue_file(missing_file_id, priority=10, reason="missing-chunks")
             return
@@ -1372,7 +1388,19 @@ class Database:
                     (row["file_id"],),
                 ).fetchone()[0]
                 if incomplete == 0:
-                    conn.execute("UPDATE files SET last_verify_at=?, updated_at=? WHERE id=?", (now, now, row["file_id"]))
+                    conn.execute(
+                        """
+                        UPDATE files
+                        SET state=CASE WHEN state IN ('missing_chunks','failed','queued') THEN 'backed_up' ELSE state END,
+                            last_verify_at=?, updated_at=?
+                        WHERE id=?
+                        """,
+                        (now, now, row["file_id"]),
+                    )
+                    conn.execute(
+                        "UPDATE queue SET status='done', reason='verified-recovered', updated_at=? WHERE file_id=? AND reason='missing-chunks'",
+                        (now, row["file_id"]),
+                    )
         if missing_file_id is not None:
             self.queue_file(missing_file_id, priority=10, reason="missing-chunks")
 
