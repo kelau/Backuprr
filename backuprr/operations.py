@@ -303,19 +303,29 @@ def threat_model_report(db: Database, config: Config) -> Dict[str, Any]:
 def backup_readiness_report(db: Database, config: Config) -> Dict[str, Any]:
     stats = db.stats()
     total = max(1, int(stats.get("files_total", 0) or 0))
+    files_total = int(stats.get("files_total", 0) or 0)
     backed = int(stats.get("files_backed_up", 0) or 0)
     missing = int(stats.get("chunks_missing", 0) or 0)
     attention = int(stats.get("queue_attention_count", 0) or 0)
     verified_chunks = int(stats.get("chunks_verified", 0) or 0)
     chunks = max(1, int(stats.get("chunks_total", 0) or 0))
-    score = int((backed / total) * 55) + int((verified_chunks / chunks) * 25)
+    protection_coverage = 100 if files_total == 0 else int((backed / total) * 100)
+    protection_coverage -= min(100, missing * 5 + attention * 3)
+    hardening_score = int((backed / total) * 55) + int((verified_chunks / chunks) * 25)
+    hardening_gaps = []
     if config.par2.get("enabled"):
-        score += 10
+        hardening_score += 10
+    else:
+        hardening_gaps.append("PAR2 recovery files are disabled")
     if config.cloud_backups:
-        score += 5
+        hardening_score += 5
+    else:
+        hardening_gaps.append("Config/database cloud backup is not configured")
     if config.restore_sandbox_enabled:
-        score += 5
-    score -= min(40, missing * 5 + attention * 3)
+        hardening_score += 5
+    else:
+        hardening_gaps.append("Restore sandbox is disabled")
+    hardening_score -= min(40, missing * 5 + attention * 3)
     folders = []
     for row in db.folder_rollups(25):
         item = dict(row)
@@ -325,8 +335,11 @@ def backup_readiness_report(db: Database, config: Config) -> Dict[str, Any]:
         folder_score -= min(30, int(item.get("attention_files") or 0) * 5)
         folders.append({**item, "readiness_score": max(0, min(100, folder_score))})
     return {
-        "score": max(0, min(100, score)),
-        "files_total": int(stats.get("files_total", 0) or 0),
+        "score": max(0, min(100, protection_coverage)),
+        "protection_coverage": max(0, min(100, protection_coverage)),
+        "hardening_score": max(0, min(100, hardening_score)),
+        "hardening_gaps": hardening_gaps,
+        "files_total": files_total,
         "files_backed_up": backed,
         "chunks_total": int(stats.get("chunks_total", 0) or 0),
         "chunks_verified": verified_chunks,

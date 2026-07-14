@@ -187,7 +187,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.82")
+        self.assertEqual(__version__, "0.2.83")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -1879,9 +1879,14 @@ class CoreTests(unittest.TestCase):
         scan_all(self.db)
         with self.db.connect() as conn:
             file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+            conn.execute("UPDATE files SET state='backed_up' WHERE id=?", (file_id,))
         self.db.add_chunk(file_id, 0, "<chunk@example.test>", 3, "abc", "[hidden]")
         readiness = backup_readiness_report(self.db, self.config)
         self.assertIn("score", readiness)
+        self.assertEqual(readiness["protection_coverage"], 100)
+        self.assertEqual(readiness["score"], readiness["protection_coverage"])
+        self.assertLess(readiness["hardening_score"], readiness["protection_coverage"])
+        self.assertTrue(readiness["hardening_gaps"])
         schedule = maintenance_schedule_report(self.db, self.config)
         self.assertIn("estimated_reclaimable_hint_bytes", schedule)
         record_config_history(self.db, "tester", ["read_only_mode", "web_ui_role"])

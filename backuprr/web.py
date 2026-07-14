@@ -1404,6 +1404,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.83":["Backup readiness now separates protection coverage from optional operational hardening so fully protected libraries show as 100% covered."],
  "0.2.82":["Added a dedicated read-only safety escape hatch and live reduced-motion toggle feedback."],
  "0.2.81":["Added scoped external API keys, read-only safety mode, optional TOTP admin step-up, global health bar, command palette, readiness scoring, provider capability cards, restore preflight warnings, maintenance visibility, and config change history."],
  "0.2.80":["GitHub update checks can use a token environment variable for private repositories."],
@@ -1643,7 +1644,7 @@ async function updateHealthBar(){
    <span class="health-chip ${attention ? "warn" : ""}"><span class="ui-icon">&#128230;</span>${attention ? `${attention} need attention` : "Queue ok"}</span>
    <span class="health-chip ${missing ? "bad" : ""}"><span class="ui-icon">&#10003;</span>${missing ? `${missing} missing chunks` : "Chunks ok"}</span>
    <span class="health-chip ${paused ? "warn" : ""}"><span class="ui-icon">&#9208;</span>${paused ? `${paused} paused` : "Workers active"}</span>
-   <span class="health-chip"><span class="ui-icon">&#128737;</span>Readiness ${Number(readiness.score || 0)}%</span>
+   <span class="health-chip"><span class="ui-icon">&#128737;</span>Coverage ${Number(readiness.protection_coverage ?? readiness.score ?? 0)}%</span>
    ${readOnly ? `<span class="health-chip warn"><span class="ui-icon">&#128274;</span>Read-only</span>` : ""}
    <button onclick="openCommandPalette()" title="Command palette">Ctrl+K</button>`;
  } catch {
@@ -2264,12 +2265,15 @@ function setupHealthPanel(setup){
 }
 function readinessPanel(readiness){
  if(!readiness || readiness.score == null) return "";
- const score = Number(readiness.score || 0);
+ const coverage = Number(readiness.protection_coverage ?? readiness.score ?? 0);
+ const hardening = Number(readiness.hardening_score ?? readiness.score ?? 0);
+ const gaps = (readiness.hardening_gaps || []).slice(0, 3);
  return `<div class="chart-card">
-  <h3><span class="ui-icon">&#128737;</span>Backup readiness</h3>
-  <div class="thread-meter"><b>${score}%</b><span class="muted">${Number(readiness.files_backed_up || 0)} of ${Number(readiness.files_total || 0)} files backed up</span></div>
-  <div class="progress-track"><div class="progress-fill" style="width:${score}%"></div></div>
+  <h3><span class="ui-icon">&#128737;</span>Protection coverage</h3>
+  <div class="thread-meter"><b>${coverage}%</b><span class="muted">${Number(readiness.files_backed_up || 0)} of ${Number(readiness.files_total || 0)} files backed up</span></div>
+  <div class="progress-track"><div class="progress-fill" style="width:${coverage}%"></div></div>
   <div class="muted">${Number(readiness.chunks_verified || 0)} verified chunks / ${Number(readiness.queue_attention || 0)} queue attention / ${Number(readiness.chunks_missing || 0)} missing</div>
+  <div class="muted">Operational hardening: ${hardening}%${gaps.length ? ` / optional improvements: ${gaps.map(esc).join(", ")}` : ""}</div>
  </div>`;
 }
 function alertsPanel(alerts){
