@@ -4,6 +4,7 @@ import nntplib
 import os
 import email.message
 import hashlib
+import subprocess
 import tempfile
 import unittest
 import zipfile
@@ -20,6 +21,7 @@ from backuprr.backup import (
     discover_par2_command,
     encode_chunk,
     iter_compressed_chunks,
+    par2_create_args,
     post_next,
     prepare_payload,
     resolve_par2_command,
@@ -194,7 +196,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.89")
+        self.assertEqual(__version__, "0.2.90")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -1147,9 +1149,11 @@ class CoreTests(unittest.TestCase):
 
         calls = []
 
-        def fake_run(args, check, cwd):
-            calls.append((args, check, cwd))
+        def fake_run(args, **kwargs):
+            calls.append((args, kwargs))
+            cwd = kwargs["cwd"]
             Path(cwd, "movie.mkv.par2").write_bytes(b"par2")
+            return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
 
         with patch("backuprr.backup.shutil.which", return_value="C:/tools/fake-par2.exe"):
             with patch("backuprr.backup.subprocess.run", side_effect=fake_run):
@@ -1160,13 +1164,19 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(payload.exists())
             self.assertEqual(payload.read_bytes(), b"0123456789abcdef")
             self.assertEqual(len(calls), 1)
-            args, check, cwd = calls[0]
-            self.assertEqual(args, ["C:/tools/fake-par2.exe", "create", "-r17", str(payload)])
-            self.assertTrue(check)
+            args, kwargs = calls[0]
+            self.assertEqual(args, ["C:/tools/fake-par2.exe", "create", "-r17", str(payload.with_name("movie.mkv.par2")), str(payload)])
+            cwd = kwargs["cwd"]
             self.assertEqual(cwd, str(payload.parent))
+            self.assertTrue(kwargs["capture_output"])
             self.assertTrue(Path(cwd, "movie.mkv.par2").exists())
         finally:
             cleanup_payload(payload, path)
+
+    def test_par2_create_args_support_multipar_par2j(self):
+        payload = self.root / "payload.iso"
+        args = par2_create_args("C:/Program Files (x86)/MultiPar/par2j.exe", payload, "10")
+        self.assertEqual(args, ["C:/Program Files (x86)/MultiPar/par2j.exe", "c", "/rr10", "/uo", str(payload.with_name("payload.iso.par2")), str(payload)])
 
     def test_resolve_par2_command_uses_bundled_candidate(self):
         bundled = self.root / "bin" / "par2.exe"

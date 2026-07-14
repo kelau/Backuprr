@@ -181,13 +181,14 @@ def par2_search_candidates(config: Config) -> list[tuple[str, Path]]:
     candidates = [(f"bundled {path.name}", path) for path in bundled_par2_candidates(config)]
     names = ["par2", "par2cmdline"]
     if platform.system().lower() == "windows":
-        names.extend(["par2.exe", "par2j.exe", "MultiPar.exe", "QuickPar.exe"])
+        names.extend(["par2.exe", "par2j64.exe", "par2j.exe", "MultiPar.exe", "QuickPar.exe"])
         program_roots = [
             os.environ.get("ProgramFiles"),
             os.environ.get("ProgramFiles(x86)"),
             os.environ.get("LOCALAPPDATA"),
         ]
         relative_paths = [
+            ("MultiPar par2j64", Path("MultiPar") / "par2j64.exe"),
             ("MultiPar par2j", Path("MultiPar") / "par2j.exe"),
             ("MultiPar GUI", Path("MultiPar") / "MultiPar.exe"),
             ("QuickPar", Path("QuickPar") / "QuickPar.exe"),
@@ -242,6 +243,34 @@ def resolve_par2_command(command: str, config: Config) -> str | None:
     return None
 
 
+def par2_create_args(command: str, payload: Path, redundancy: str) -> list[str]:
+    exe = Path(command).name.lower()
+    par_file = payload.with_name(f"{payload.name}.par2")
+    if exe in {"par2j.exe", "par2j64.exe"}:
+        return [command, "c", f"/rr{redundancy}", "/uo", str(par_file), str(payload)]
+    return [command, "create", f"-r{redundancy}", str(par_file), str(payload)]
+
+
+def run_par2_create(command: str, payload: Path, redundancy: str) -> None:
+    args = par2_create_args(command, payload, redundancy)
+    result = subprocess.run(
+        args,
+        cwd=str(payload.parent),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"PAR2 command failed with exit code {result.returncode}: {args}. "
+            f"Output: {output or '(no output)'}"
+        )
+    if not list(payload.parent.glob(f"{payload.name}*.par2")):
+        raise RuntimeError(f"PAR2 command completed but did not create recovery files for {payload.name}. Output: {output or '(no output)'}")
+
+
 def prepare_payload(path: Path, config: Config) -> Path:
     if not config.par2.get("enabled"):
         return path
@@ -260,7 +289,7 @@ def prepare_payload(path: Path, config: Config) -> Path:
                 f"PAR2 command not found: {command}. Install PAR2, place a bundled par2 executable in backuprr/bin or ./bin, "
                 "or disable PAR2 recovery files in Settings."
             )
-        subprocess.run([resolved_command, "create", f"-r{redundancy}", str(payload)], check=True, cwd=str(payload.parent))
+        run_par2_create(resolved_command, payload, redundancy)
     return payload
 
 
