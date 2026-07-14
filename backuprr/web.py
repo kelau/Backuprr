@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from . import __version__
-from .backup import verify_due_chunks, verify_file_chunks
+from .backup import discover_par2_command, verify_due_chunks, verify_file_chunks
 from .cloud_backup import backup_config_and_database
 from .config import Config, update_config
 from .db import Database
@@ -295,7 +295,7 @@ class Handler(BaseHTTPRequestHandler):
         return bool(supplied) and secrets.compare_digest(supplied, CSRF_TOKEN)
 
     def action_for_post_path(self, path: str) -> str:
-        if path in {"/api/settings", "/api/settings/validate", "/api/settings/profile/import", "/api/maintenance/run", "/api/update-check/run"}:
+        if path in {"/api/settings", "/api/settings/validate", "/api/settings/profile/import", "/api/settings/par2/discover", "/api/maintenance/run", "/api/update-check/run"}:
             return "admin"
         if path.startswith("/api/restore"):
             return "restore"
@@ -849,6 +849,16 @@ class Handler(BaseHTTPRequestHandler):
                         }
                     )
                 self.send_json({"hosts": results})
+            elif parsed.path == "/api/settings/par2/discover":
+                result = discover_par2_command(self.config)
+                if data.get("apply") and result.get("found"):
+                    par2 = dict(self.config.par2 or {})
+                    par2["command"] = result["command"]
+                    self.config.par2 = par2
+                    self.config.save(self.config_path)
+                    record_config_history(self.db, self.config.web_ui_username, ["par2.command"])
+                    self.db.log("info", "settings.par2", f"Detected PAR2 command: {result['command']}")
+                self.send_json({**result, "settings": self.config.public_dict() if data.get("apply") and result.get("found") else None})
             elif parsed.path == "/api/maintenance/run":
                 self.send_json(run_maintenance(self.db, self.config, vacuum=bool(data.get("vacuum"))))
             elif parsed.path == "/api/restore-drill/run":
@@ -1283,6 +1293,9 @@ tr:hover td { background:var(--row-hover); }
 .form-grid { display:grid; grid-template-columns:minmax(0,720px); gap:12px; margin-bottom:12px; align-items:start; }
 .field { display:grid; gap:5px; }
 .field span { color:var(--muted); font-size:12px; font-weight:700; }
+.settings-help-toggle { white-space:nowrap; font-weight:700; }
+.settings-help { display:none; color:var(--muted); font-size:12px; line-height:1.35; font-weight:500; }
+.settings-show-help .settings-help { display:block; }
 .range-field { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; }
 .range-field span { min-width:74px; text-align:right; color:var(--muted); font-size:12px; font-weight:700; }
 .range-field input { padding:0; }
@@ -1404,6 +1417,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.84":["Added PAR2 executable auto-discovery and optional hidden Settings field descriptions."],
  "0.2.83":["Backup readiness now separates protection coverage from optional operational hardening so fully protected libraries show as 100% covered."],
  "0.2.82":["Added a dedicated read-only safety escape hatch and live reduced-motion toggle feedback."],
  "0.2.81":["Added scoped external API keys, read-only safety mode, optional TOTP admin step-up, global health bar, command palette, readiness scoring, provider capability cards, restore preflight warnings, maintenance visibility, and config change history."],
@@ -1812,7 +1826,7 @@ async function render(){
   c.innerHTML = `<div id="securityPanel"></div>`;
   await updateSecurityPage();
  }
- if(page==="Settings"){ settingsCache = await loadSettings(); c.innerHTML = settingsForm(settingsCache); initSettingsDirtyTracking(); }
+ if(page==="Settings"){ settingsCache = await loadSettings(); c.innerHTML = settingsForm(settingsCache); addSettingsHelpText(); applySettingsHelpPreference(); initSettingsDirtyTracking(); }
  if(page==="About"){ c.innerHTML = aboutPage(); const s=await api("/api/status"); appVersion = s.version; updateVersionPillText(); maybeShowVersionNotice(appVersion); document.getElementById("aboutVersion").textContent=s.version; }
 }
 async function refreshCurrentLivePage(){
@@ -3212,7 +3226,7 @@ async function restore(){ const out = await post("/api/restore",{path:restorePat
 function settingsForm(s){
  return `<div class="settings-header"><div class="tabs">
   ${["General","Usenet","Protection","Schedules","Endpoints","Logging","Security","Cloud"].map((name,index)=>`<button class="${index===0?"primary":""}" onclick="showSettingsTab('${name}', this)">${name}</button>`).join("")}
- </div><div class="toolbar-right"><button id="saveSettingsButton" class="primary" onclick="saveSettings()" disabled><span class="ui-icon">&#128190;</span>Save Settings</button><button id="resetSettingsButton" onclick="render()" disabled><span class="ui-icon">&#8635;</span>Reset</button></div></div>
+ </div><div class="toolbar-right"><label class="settings-help-toggle"><input id="showSettingsHelp" data-no-dirty="true" type="checkbox" onchange="toggleSettingsHelp(this.checked)"> Show field descriptions</label><button id="saveSettingsButton" class="primary" onclick="saveSettings()" disabled><span class="ui-icon">&#128190;</span>Save Settings</button><button id="resetSettingsButton" onclick="render()" disabled><span class="ui-icon">&#8635;</span>Reset</button></div></div>
  <div id="tabGeneral" class="tab-panel active"><h2 class="section-title"><span class="ui-icon">&#10003;</span>Basic</h2><div class="form-grid">
   <label class="field"><span><span class="ui-icon">&#127912;</span>UI template</span><select id="setUiTheme" onchange="applyTheme(this.value)">${themeOptions(s.ui_theme || "harbor_light")}</select></label>
   <label><input id="setReducedMotion" type="checkbox" ${s.ui_reduced_motion?"checked":""} onchange="document.documentElement.dataset.reducedMotion=this.checked ? 'true' : 'false'"> <span class="ui-icon">&#128065;</span>Reduce motion</label>
@@ -3248,7 +3262,7 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#128200;</span>Minimum compression gain percent</span><input id="setCompressionMinGainPercent" type="number" min="0" max="95" value="${esc(s.compression_min_gain_percent ?? 5)}"></label>
   <label><input id="setEncrypt" type="checkbox" ${s.encrypt_bodies?"checked":""}> <span class="ui-icon">&#128274;</span>Encrypt article bodies</label>
   <label><input id="setPar2" type="checkbox" ${s.par2?.enabled?"checked":""}> <span class="ui-icon">&#128737;</span>Generate PAR2 recovery files</label>
-  <label class="field"><span><span class="ui-icon">&#9881;</span>PAR2 command</span><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"></label>
+  <label class="field"><span><span class="ui-icon">&#9881;</span>PAR2 command</span><div class="range-field"><input id="setPar2Command" value="${esc(s.par2?.command || "par2")}"><button type="button" onclick="detectPar2Command()"><span class="ui-icon">&#128269;</span>Locate</button></div></label>
   <label class="field"><span><span class="ui-icon">&#128737;</span>PAR2 redundancy</span><div class="range-field"><input id="setPar2Redundancy" type="range" min="1" max="50" step="1" value="${esc(s.par2?.redundancy_percent ?? 10)}" oninput="setPar2RedundancyLabel.textContent=this.value + '%'"><span id="setPar2RedundancyLabel">${esc(s.par2?.redundancy_percent ?? 10)}%</span></div></label>
   <h2 class="section-title full"><span class="ui-icon">&#9881;</span>Advanced</h2>
   <label><input id="setCompactChunkMetadata" type="checkbox" ${s.compact_chunk_metadata === false ? "" : "checked"}> <span class="ui-icon">&#128451;</span>Compact stored chunk metadata</label>
@@ -3319,6 +3333,117 @@ function showSettingsTab(name, button){
  document.querySelectorAll(".tabs button").forEach(tab => tab.classList.remove("primary"));
  button.classList.add("primary");
 }
+const settingsHelpDescriptions = {
+ "UI template":"Changes the visual template used by the Web UI.",
+ "Reduce motion":"Disables UI animations and transitions for a calmer interface.",
+ "Newsgroup":"The Usenet group Backuprr posts backup articles to.",
+ "Article size":"Target size of each posted article chunk. Larger chunks reduce metadata but must be accepted by the provider.",
+ "NNTP threads":"Maximum number of parallel NNTP worker threads for read and post operations.",
+ "Post limit per hour":"Optional hourly upload cap. Set to 0 for unlimited posting.",
+ "Default queue strategy":"How automatically queued files are prioritized when no manual priority has been set.",
+ "NNTP retry attempts":"How many times a failed NNTP operation is retried before it is marked failed.",
+ "NNTP retry backoff seconds":"Delay between NNTP retry attempts.",
+ "Retry policy JSON":"Per-provider retry overrides for advanced troubleshooting.",
+ "Auto-pause auth failures":"Pause workers after repeated authentication failures. Use 0 to disable this safety pause.",
+ "Auto-pause provider failures":"Pause workers after repeated provider/network failures. Use 0 to disable this safety pause.",
+ "Verify interval":"How often each backed-up file should be rechecked on Usenet.",
+ "Verification task interval seconds":"How often the verification worker wakes up to find due files.",
+ "Files verified per task run":"Number of files the verification worker checks per run.",
+ "Catalog scan interval seconds":"How often endpoints are scanned for new, changed, moved, deleted, or unreadable files.",
+ "Backup task interval seconds":"How often the backup worker wakes up to post queued files.",
+ "Cloud backup interval seconds":"How often config/database cloud backups are considered.",
+ "Maintenance interval seconds":"How often cleanup, compaction, and maintenance tasks are considered.",
+ "Auto-vacuum after compacted chunk rows":"Run database vacuum after this many chunk rows are compacted. Use 0 to disable automatic vacuum.",
+ "Restore drill task interval seconds":"How often restore drill scheduling wakes up.",
+ "Update check interval seconds":"How often Backuprr checks GitHub for a newer version.",
+ "File stability seconds before posting":"A file must remain unchanged for this long before automatic posting begins.",
+ "Encryption passphrase env":"Environment variable that contains the body encryption passphrase.",
+ "Compress files":"Compress eligible files before posting when compression is expected to save space.",
+ "Compression sample bytes":"Number of bytes sampled to estimate whether a file is worth compressing.",
+ "Minimum compression gain percent":"Minimum expected saving before compression is used.",
+ "Encrypt article bodies":"Encrypt posted article bodies using the configured passphrase environment variable.",
+ "Generate PAR2 recovery files":"Create recovery data that can help restore files if some Usenet articles disappear.",
+ "PAR2 command":"Path or command name for a PAR2-compatible executable such as par2, par2cmdline, MultiPar par2j, or QuickPar.",
+ "PAR2 redundancy":"Percentage of recovery data created when PAR2 is enabled.",
+ "Compact stored chunk metadata":"Store completed chunk metadata in a compact manifest form when safe.",
+ "Compact completed chunk rows":"Remove redundant per-chunk rows after successful manifest compaction.",
+ "Restore drill interval days":"How often a backed-up file should be sampled by restore drills.",
+ "Restore drill sample bytes":"How much data a restore drill reads for validation.",
+ "Critical verification interval days":"Verification interval for files matched by retention policy patterns.",
+ "Retention policy patterns. Format: label:glob:days, for example critical:*.iso:30":"Optional per-pattern verification policies for more important file classes.",
+ "Restore to sandbox before replacing origin":"Restore into a temporary sandbox first when replacing files in their original location.",
+ "Restore sandbox path":"Optional path for restore sandbox files. Empty means Backuprr chooses a nearby sandbox.",
+ "Endpoints, one path per line":"Root folders Backuprr catalogs recursively.",
+ "Auto-queue exclude patterns, one per line. Examples: MP4, .mp4, *.sample, regex:\\.partial$, /Season \\d+/":"Files matching these patterns are cataloged but not automatically queued.",
+ "Queue pause patterns, one per line. Matching files stay cataloged but are not queued automatically.":"Temporary queue suppression patterns for files that should wait.",
+ "Usenet hosts":"Read and post providers used for backup, verification, and restore.",
+ "Local log retention days":"How long normal local log rows are kept.",
+ "Verbose log retention days":"How long verbose/debug local log rows are kept.",
+ "Log web access requests":"Record Web UI access events in the event log.",
+ "Log successful per-chunk events":"Record successful chunk events. Useful for diagnostics but high volume.",
+ "Log aggregation destinations":"External logging platforms that receive forwarded events.",
+ "Web UI username":"Username for optional browser Basic Auth.",
+ "Web UI role":"Permission level for the Web UI account.",
+ "Web UI password":"Password for optional browser Basic Auth. Leave blank to keep the stored password.",
+ "Disable Web UI password":"Remove the stored Web UI password and allow unauthenticated local browser access.",
+ "Read-only mode":"Blocks write actions until explicitly disabled.",
+ "TOTP secret env":"Environment variable containing a TOTP secret for admin step-up prompts.",
+ "Config secret key environment variable":"Environment variable used to encrypt selected secrets in the config file.",
+ "Enable signed audit events":"Adds signatures to audit events so changes are easier to verify later.",
+ "Audit secret env":"Environment variable containing the audit signing secret.",
+ "Internal API rate limit per minute":"Rate limit for browser AJAX endpoints.",
+ "External API rate limit per minute":"Rate limit for API-key endpoints used by automations.",
+ "Enable manifest export":"Allow exporting backup manifests for disaster recovery.",
+ "Encrypt manifest export":"Encrypt exported manifests using the manifest export secret.",
+ "Manifest export secret env":"Environment variable containing the manifest export encryption secret.",
+ "Manifest export interval seconds":"How often manifest exports are considered.",
+ "Replace external API keys, one per line. Leave blank to keep existing keys.":"New API keys for external integrations such as Home Assistant.",
+ "External API key scopes JSON. Keys are full API keys, values are scopes: read, backup, scan, verify, restore, admin.":"Optional per-key permissions for external API keys.",
+ "Clear all stored external API keys":"Remove every external API key from the config.",
+ "Enable GitHub update checks":"Check GitHub releases/tags for newer Backuprr versions.",
+ "GitHub repository":"Repository used by the update checker, in owner/repo format.",
+ "GitHub token env":"Environment variable containing a GitHub token for private repositories or higher rate limits.",
+ "Update check timeout seconds":"Network timeout for GitHub update checks.",
+ "Cloud backup targets":"Destinations for periodic config and database safety backups.",
+ "Name":"Friendly display name.",
+ "Mode":"Whether the host is used for reading, posting, or both through separate entries.",
+ "Priority":"Lower numbers are preferred first when choosing a host.",
+ "Server":"NNTP server hostname.",
+ "Port":"NNTP server port.",
+ "TLS mode":"Implicit TLS, STARTTLS, or plain NNTP connection mode.",
+ "Username":"Provider username for authentication.",
+ "Password":"Provider password. Leave blank to keep the stored value where supported.",
+ "Enabled":"Whether this configured item is active.",
+ "Platform":"External logging platform type.",
+ "URL":"Endpoint URL for the external service.",
+ "Minimum level":"Lowest event level forwarded to this destination.",
+ "API token":"Optional API token for the external service.",
+ "Timeout seconds":"HTTP timeout for this integration.",
+ "Provider":"Cloud/sync target type.",
+ "Target path":"Folder path where backup archives should be written.",
+ "Command":"Command template for custom cloud backup or tool execution."
+};
+function settingHelpFor(label){
+ return settingsHelpDescriptions[label] || `Configures ${label.charAt(0).toLowerCase()}${label.slice(1)}.`;
+}
+function addSettingsHelpText(root=document.getElementById("content")){
+ if(!root) return;
+ root.querySelectorAll("label").forEach(label => {
+  if(label.querySelector(".settings-help")) return;
+  const title = label.querySelector(":scope > span")?.textContent.trim() || label.textContent.trim().replace(/\s+/g, " ");
+  if(!title) return;
+  label.insertAdjacentHTML("beforeend", `<small class="settings-help">${esc(settingHelpFor(title))}</small>`);
+ });
+}
+function toggleSettingsHelp(show){
+ localStorage.setItem("backuprr-settings-help", show ? "1" : "0");
+ document.getElementById("content")?.classList.toggle("settings-show-help", Boolean(show));
+ const checkbox = document.getElementById("showSettingsHelp");
+ if(checkbox) checkbox.checked = Boolean(show);
+}
+function applySettingsHelpPreference(){
+ toggleSettingsHelp(localStorage.getItem("backuprr-settings-help") === "1");
+}
 function setSettingsDirty(value){
  settingsDirty = Boolean(value);
  const save = document.getElementById("saveSettingsButton");
@@ -3331,6 +3456,7 @@ function initSettingsDirtyTracking(){
  const content = document.getElementById("content");
  if(!content) return;
  content.querySelectorAll("input, textarea, select").forEach(input => {
+  if(input.dataset.noDirty === "true") return;
   input.addEventListener("input", () => setSettingsDirty(true));
   input.addEventListener("change", () => setSettingsDirty(true));
  });
@@ -3392,6 +3518,8 @@ function addHost(){
  const index = list.querySelectorAll(".host-row").length;
  list.insertAdjacentHTML("beforeend", hostRow({ name:"", mode:"read", host:"", port:563, tls:"implicit", username:"", password:"", priority:100 }, index));
  renumberHosts();
+ addSettingsHelpText(list);
+ applySettingsHelpPreference();
  initSettingsDirtyTracking();
  setSettingsDirty(true);
 }
@@ -3400,6 +3528,8 @@ function addCloudTarget(){
  const index = list.querySelectorAll(".cloud-row").length;
  list.insertAdjacentHTML("beforeend", cloudRow({ name:"", provider:"local", target:"", command:"", enabled:true }, index));
  renumberCloudTargets();
+ addSettingsHelpText(list);
+ applySettingsHelpPreference();
  initSettingsDirtyTracking();
  setSettingsDirty(true);
 }
@@ -3408,6 +3538,8 @@ function addLogDestination(){
  const index = list.querySelectorAll(".log-destination-row").length;
  list.insertAdjacentHTML("beforeend", logDestinationRow({ name:"", platform:"loki", url:"", api_key:"", username:"", password:"", min_level:"info", timeout_seconds:5, enabled:false }, index));
  renumberLogDestinations();
+ addSettingsHelpText(list);
+ applySettingsHelpPreference();
  initSettingsDirtyTracking();
  setSettingsDirty(true);
 }
@@ -3500,6 +3632,17 @@ async function importSettingsProfile(file){
  if(out.ok){
   settingsCache = out.settings;
   render();
+ }
+}
+async function detectPar2Command(){
+ const out = await post("/api/settings/par2/discover", {apply:true});
+ settingsOut.textContent = JSON.stringify(out, null, 2);
+ if(out.found){
+  setPar2Command.value = out.command;
+  settingsCache = out.settings || settingsCache;
+  setSettingsDirty(false);
+ } else {
+  settingsOut.textContent = `No PAR2-compatible executable found. Checked ${Number(out.checked?.length || 0)} candidate locations.`;
  }
 }
 async function saveSettings(){

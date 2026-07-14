@@ -152,6 +152,57 @@ def bundled_par2_candidates(config: Config) -> list[Path]:
     return [root / name for root in roots for name in names]
 
 
+def par2_search_candidates(config: Config) -> list[tuple[str, Path]]:
+    """Return likely PAR2-compatible executables in priority order."""
+    candidates = [(f"bundled {path.name}", path) for path in bundled_par2_candidates(config)]
+    names = ["par2", "par2cmdline"]
+    if platform.system().lower() == "windows":
+        names.extend(["par2.exe", "par2j.exe", "MultiPar.exe", "QuickPar.exe"])
+        program_roots = [
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ]
+        relative_paths = [
+            ("MultiPar par2j", Path("MultiPar") / "par2j.exe"),
+            ("MultiPar GUI", Path("MultiPar") / "MultiPar.exe"),
+            ("QuickPar", Path("QuickPar") / "QuickPar.exe"),
+            ("PAR2", Path("par2") / "par2.exe"),
+            ("PAR2cmdline", Path("par2cmdline") / "par2.exe"),
+        ]
+        for root in [Path(item) for item in program_roots if item]:
+            for label, relpath in relative_paths:
+                candidates.append((label, root / relpath))
+    else:
+        names.extend(["par2create"])
+        for root in [Path("/usr/bin"), Path("/usr/local/bin"), Path("/opt/homebrew/bin"), Path("/opt/local/bin")]:
+            for name in names:
+                candidates.append((name, root / name))
+    for name in names:
+        found = shutil.which(name)
+        if found:
+            candidates.insert(0, (f"PATH {name}", Path(found)))
+    seen: set[str] = set()
+    unique = []
+    for label, path in candidates:
+        key = str(path).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append((label, path))
+    return unique
+
+
+def discover_par2_command(config: Config) -> dict[str, Any]:
+    """Find the best available PAR2-compatible executable for Settings auto-fill."""
+    checked = []
+    for label, candidate in par2_search_candidates(config):
+        exists = candidate.exists()
+        checked.append({"label": label, "path": str(candidate), "exists": exists})
+        if exists:
+            return {"found": True, "command": str(candidate), "label": label, "checked": checked}
+    return {"found": False, "command": "", "label": "", "checked": checked}
+
+
 def resolve_par2_command(command: str, config: Config) -> str | None:
     raw = str(command or "par2").strip() or "par2"
     candidate = Path(raw)
@@ -161,9 +212,9 @@ def resolve_par2_command(command: str, config: Config) -> str | None:
     if found:
         return found
     if raw == "par2":
-        for bundled in bundled_par2_candidates(config):
-            if bundled.exists():
-                return str(bundled)
+        discovered = discover_par2_command(config)
+        if discovered["found"]:
+            return str(discovered["command"])
     return None
 
 

@@ -16,6 +16,7 @@ from backuprr.backup import (
     cleanup_payload,
     compression_enabled_for,
     decode_chunk,
+    discover_par2_command,
     encode_chunk,
     iter_compressed_chunks,
     post_next,
@@ -187,7 +188,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.83")
+        self.assertEqual(__version__, "0.2.84")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
@@ -1158,6 +1159,25 @@ class CoreTests(unittest.TestCase):
         self.config.base_dir = self.root
         with patch("backuprr.backup.shutil.which", return_value=None):
             self.assertEqual(resolve_par2_command("par2", self.config), str(bundled))
+
+    def test_discover_par2_command_prefers_path_candidate(self):
+        path_candidate = self.root / "tools" / "par2.exe"
+        path_candidate.parent.mkdir()
+        path_candidate.write_bytes(b"fake")
+        with patch("backuprr.backup.shutil.which", return_value=str(path_candidate)):
+            result = discover_par2_command(self.config)
+        self.assertTrue(result["found"])
+        self.assertEqual(result["command"], str(path_candidate))
+        self.assertIn("PATH", result["label"])
+
+    def test_discover_par2_command_finds_multipar_candidate(self):
+        multipar = self.root / "Program Files" / "MultiPar" / "par2j.exe"
+        multipar.parent.mkdir(parents=True)
+        multipar.write_bytes(b"fake")
+        with patch("backuprr.backup.platform.system", return_value="Windows"), patch("backuprr.backup.shutil.which", return_value=None), patch.dict(os.environ, {"ProgramFiles": str(self.root / "Program Files")}, clear=False):
+            result = discover_par2_command(self.config)
+        self.assertTrue(result["found"])
+        self.assertEqual(result["command"], str(multipar))
 
     def test_post_next_requeues_when_socket_access_is_blocked(self):
         media = self.root / "media"
