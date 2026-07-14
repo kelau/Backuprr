@@ -1382,6 +1382,9 @@ let verificationRowsCache = new Map();
 let verificationTableCache = {};
 let verificationRefreshSeq = 0;
 let verificationRefreshRunning = false;
+let verificationProgressFetchedAt = 0;
+let apiRateLimitedUntil = 0;
+let healthBarFetchedAt = 0;
 let appVersion = "";
 let logLevelSelection = ["error","warning","info"];
 let logEventTypeSelection = [];
@@ -1420,6 +1423,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.88":["Verification table data now refreshes incrementally with request backoff to reduce internal API 429s during active runs."],
  "0.2.87":["Verification rate limits and temporary provider failures are now treated as retryable deferrals instead of missing chunks."],
  "0.2.86":["Verification tables now keep their last valid payload during live refreshes, preventing flicker while verification is running."],
  "0.2.85":["Settings field descriptions now include clearer purpose, tuning guidance, possible settings, examples, and defaults."],
@@ -1444,16 +1448,27 @@ const releaseNotes = {
  "0.2.66":["Retryable failed queue items recover after settings fixes.","Completed network-blocked rows no longer need attention."]
 };
 async function api(url, opts={}){
+ if(Date.now() < apiRateLimitedUntil){
+  return {error:"rate limit cooldown", rate_limited:true};
+ }
  const headers = {"Content-Type":"application/json","X-Backuprr-Internal-Token":internalApiToken,"X-Backuprr-CSRF":csrfToken, ...(opts.headers || {})};
  if(cachedTotpCode) headers["X-Backuprr-TOTP"] = cachedTotpCode;
  let response = await fetch(url, {...opts, headers});
  let data = await response.json();
+ if(response.status === 429){
+  apiRateLimitedUntil = Date.now() + 2000;
+  return {...data, rate_limited:true};
+ }
  if(response.status === 403 && String(data.error || "").includes("TOTP")){
   cachedTotpCode = prompt("Admin action requires a 6-digit TOTP code") || "";
   if(cachedTotpCode){
    headers["X-Backuprr-TOTP"] = cachedTotpCode;
    response = await fetch(url, {...opts, headers});
    data = await response.json();
+   if(response.status === 429){
+    apiRateLimitedUntil = Date.now() + 2000;
+    return {...data, rate_limited:true};
+   }
   }
  }
  return data;
@@ -1653,6 +1668,9 @@ function nav(){
 async function updateHealthBar(){
  const target = document.getElementById("healthBar");
  if(!target) return;
+ const now = Date.now();
+ if(now - healthBarFetchedAt < 2500) return;
+ healthBarFetchedAt = now;
  try{
   const [status, readiness] = await Promise.all([api("/api/status"), api("/api/readiness")]);
   const stats = status.stats || {};
@@ -1817,8 +1835,8 @@ async function render(){
   await updateTasksPage();
  }
  if(page==="Verification"){
-  c.innerHTML = `<div class="toolbar"><input id="verificationSearch" placeholder="Filter verification files" value="${esc(verificationTextFilter)}" oninput="verificationTextFilter=this.value;verificationMissingPage=verificationUnverifiedPage=verificationVerifiedPage=verificationNoChunksPage=1;updateVerificationPage()"><button class="primary" onclick="verifySelectedFiles()"><span class="ui-icon">&#10003;</span>Verify selected</button><button onclick="verifyAllFiles()"><span class="ui-icon">&#10003;</span>Verify all</button>${pushLabel()}</div><div id="verificationStatus" class="async-status"></div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Missing chunks</h2><div id="verificationMissingRows"></div><h2 class="section-title"><span class="ui-icon">&#128269;</span>Unverified</h2><div id="verificationUnverifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Verified</h2><div id="verificationVerifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#128230;</span>No chunks</h2><div id="verificationNoChunksRows"></div>`;
-  await updateVerificationPage();
+  c.innerHTML = `<div class="toolbar"><input id="verificationSearch" placeholder="Filter verification files" value="${esc(verificationTextFilter)}" oninput="verificationTextFilter=this.value;verificationMissingPage=verificationUnverifiedPage=verificationVerifiedPage=verificationNoChunksPage=1;updateVerificationPage({invalidate:true})"><button class="primary" onclick="verifySelectedFiles()"><span class="ui-icon">&#10003;</span>Verify selected</button><button onclick="verifyAllFiles()"><span class="ui-icon">&#10003;</span>Verify all</button>${pushLabel()}</div><div id="verificationStatus" class="async-status"></div><h2 class="section-title"><span class="ui-icon">&#9888;</span>Missing chunks</h2><div id="verificationMissingRows"></div><h2 class="section-title"><span class="ui-icon">&#128269;</span>Unverified</h2><div id="verificationUnverifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#10003;</span>Verified</h2><div id="verificationVerifiedRows"></div><h2 class="section-title"><span class="ui-icon">&#128230;</span>No chunks</h2><div id="verificationNoChunksRows"></div>`;
+  await updateVerificationPage({invalidate:true});
  }
  if(page==="Statistics"){
   c.innerHTML = `<div id="statisticsPanel"></div>`;
@@ -1859,7 +1877,7 @@ async function refreshPageForChanges(previous, token){
  if(page==="Log" && eventsChanged) await updateLogPage(false);
  if(page==="Queue" && (queueChanged || filesChanged || transferChanged)) await updateQueuePage();
  if(page==="Tasks" && (eventsChanged || tasksChanged)) await updateTasksPage();
- if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged || operationsChanged)) await updateVerificationPage();
+ if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged || operationsChanged)) await updateVerificationPage({invalidate:chunksChanged || filesChanged});
  if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged || transferChanged)) await updateStatisticsPage();
  if(page==="Operations" && (eventsChanged || tasksChanged || transferChanged)) await updateOperationsPage();
  if(page==="Security" && eventsChanged) await updateSecurityPage();
@@ -1951,7 +1969,9 @@ async function updateFilesPage(){
 }
 async function refreshOperationProgress(){
  const result = await api("/api/operations/progress");
- operationRowsCache = result.operations || [];
+ if(result && !result.error && Array.isArray(result.operations)){
+  operationRowsCache = result.operations;
+ }
 }
 async function updateQueuePage(){
  const attention = await api(`/api/queue?status=attention&page=${attentionQueuePage}&page_size=${queuePageSize}${sortQuery("queueAttention")}`);
@@ -1992,20 +2012,64 @@ function verificationPagedTable(result, pageVar, state){
  const pageNo = Number(result.page || 1);
  return verificationTable(result.rows || [], state) + paginationControls(result, pageVar, "updateVerificationPage", "verificationPageSize", `${Number(result.total || 0)} ${labelize(state)}`);
 }
+function verificationStateConfigs(){
+ const q = encodeURIComponent(verificationTextFilter);
+ return [
+  {state:"missing", pageVar:"verificationMissingPage", scope:"verificationMissing", page:verificationMissingPage},
+  {state:"unverified", pageVar:"verificationUnverifiedPage", scope:"verificationUnverified", page:verificationUnverifiedPage},
+  {state:"verified", pageVar:"verificationVerifiedPage", scope:"verificationVerified", page:verificationVerifiedPage},
+  {state:"no_chunks", pageVar:"verificationNoChunksPage", scope:"verificationNoChunks", page:verificationNoChunksPage}
+ ].map(item => ({
+  ...item,
+  url:`/api/verification?state=${item.state}&page=${item.page}&page_size=${verificationPageSize}&q=${q}${sortQuery(item.scope)}`,
+  signature:`${item.state}|${item.page}|${verificationPageSize}|${verificationTextFilter}|${sortQuery(item.scope)}`
+ }));
+}
 function validVerificationResult(result){
  return Boolean(result && !result.error && Array.isArray(result.rows) && Number.isFinite(Number(result.total)));
 }
-function cacheVerificationResult(state, result){
+function emptyVerificationResult(state){
+ return {rows:[], page:1, page_size:verificationPageSize, total:0, state};
+}
+function invalidateVerificationTableCache(){
+ for(const key of Object.keys(verificationTableCache)){
+  verificationTableCache[key] = {...verificationTableCache[key], signature:""};
+ }
+}
+function cacheVerificationResult(state, result, signature=""){
  if(validVerificationResult(result)){
   verificationTableCache[state] = {
    ...result,
+   signature,
    rows:(result.rows || []).map(row => ({...row}))
   };
   return result;
  }
  const cached = verificationTableCache[state];
  if(cached) return {...cached, rows:(cached.rows || []).map(row => ({...row}))};
- return {rows:[], page:1, page_size:verificationPageSize, total:0, state};
+ return emptyVerificationResult(state);
+}
+function renderVerificationTables(){
+ let missing = cacheVerificationResult("missing", null);
+ let unverified = cacheVerificationResult("unverified", null);
+ let verified = cacheVerificationResult("verified", null);
+ let noChunks = cacheVerificationResult("no_chunks", null);
+ ({missing, unverified, verified, noChunks} = normalizeVerificationResults(missing, unverified, verified, noChunks));
+ const missingTarget = document.getElementById("verificationMissingRows");
+ const unverifiedTarget = document.getElementById("verificationUnverifiedRows");
+ const verifiedTarget = document.getElementById("verificationVerifiedRows");
+ const noChunksTarget = document.getElementById("verificationNoChunksRows");
+ if(missingTarget) missingTarget.innerHTML = verificationPagedTable(missing, "verificationMissingPage", "missing");
+ if(unverifiedTarget) unverifiedTarget.innerHTML = verificationPagedTable(unverified, "verificationUnverifiedPage", "unverified");
+ if(verifiedTarget) verifiedTarget.innerHTML = verificationPagedTable(verified, "verificationVerifiedPage", "verified");
+ if(noChunksTarget) noChunksTarget.innerHTML = verificationPagedTable(noChunks, "verificationNoChunksPage", "no_chunks");
+ updateVerificationSelectionState([...(missing.rows || []), ...(unverified.rows || []), ...(verified.rows || []), ...(noChunks.rows || [])]);
+}
+async function refreshVerificationProgress(){
+ const now = Date.now();
+ if(now - verificationProgressFetchedAt < 1000) return;
+ await refreshOperationProgress();
+ verificationProgressFetchedAt = now;
 }
 function setVerificationSelected(fileId, checked){
  if(checked) selectedVerificationFiles.add(Number(fileId));
@@ -2127,41 +2191,32 @@ function tasksTable(rows){
  }).join("")+
  "</tbody></table>";
 }
-async function updateVerificationPage(){
+async function updateVerificationPage(options={}){
  if(verificationRefreshRunning){
   clearTimeout(updateVerificationPage.retryTimer);
-  updateVerificationPage.retryTimer = setTimeout(updateVerificationPage, 250);
+  updateVerificationPage.retryTimer = setTimeout(() => updateVerificationPage(options), 350);
   return;
  }
  verificationRefreshRunning = true;
  const seq = ++verificationRefreshSeq;
  try{
-  await refreshOperationProgress();
+  if(options.invalidate) invalidateVerificationTableCache();
+  await refreshVerificationProgress();
   verificationTextFilter = document.getElementById("verificationSearch")?.value || verificationTextFilter;
-  const q = encodeURIComponent(verificationTextFilter);
-  const requests = await Promise.allSettled([
-   api(`/api/verification?state=missing&page=${verificationMissingPage}&page_size=${verificationPageSize}&q=${q}${sortQuery("verificationMissing")}`),
-   api(`/api/verification?state=unverified&page=${verificationUnverifiedPage}&page_size=${verificationPageSize}&q=${q}${sortQuery("verificationUnverified")}`),
-   api(`/api/verification?state=verified&page=${verificationVerifiedPage}&page_size=${verificationPageSize}&q=${q}${sortQuery("verificationVerified")}`),
-   api(`/api/verification?state=no_chunks&page=${verificationNoChunksPage}&page_size=${verificationPageSize}&q=${q}${sortQuery("verificationNoChunks")}`)
-  ]);
+  const configs = verificationStateConfigs();
+  const stale = configs.filter(item => verificationTableCache[item.state]?.signature !== item.signature);
+  if(stale.length && Date.now() >= apiRateLimitedUntil){
+   const item = stale[0];
+   const result = await api(item.url);
+   if(!result.rate_limited) cacheVerificationResult(item.state, result, item.signature);
+  }
   if(seq !== verificationRefreshSeq) return;
-  let [missing, unverified, verified, noChunks] = [
-   cacheVerificationResult("missing", requests[0].status === "fulfilled" ? requests[0].value : null),
-   cacheVerificationResult("unverified", requests[1].status === "fulfilled" ? requests[1].value : null),
-   cacheVerificationResult("verified", requests[2].status === "fulfilled" ? requests[2].value : null),
-   cacheVerificationResult("no_chunks", requests[3].status === "fulfilled" ? requests[3].value : null)
-  ];
-  ({missing, unverified, verified, noChunks} = normalizeVerificationResults(missing, unverified, verified, noChunks));
-  const missingTarget = document.getElementById("verificationMissingRows");
-  const unverifiedTarget = document.getElementById("verificationUnverifiedRows");
-  const verifiedTarget = document.getElementById("verificationVerifiedRows");
-  const noChunksTarget = document.getElementById("verificationNoChunksRows");
-  if(missingTarget) missingTarget.innerHTML = verificationPagedTable(missing, "verificationMissingPage", "missing");
-  if(unverifiedTarget) unverifiedTarget.innerHTML = verificationPagedTable(unverified, "verificationUnverifiedPage", "unverified");
-  if(verifiedTarget) verifiedTarget.innerHTML = verificationPagedTable(verified, "verificationVerifiedPage", "verified");
-  if(noChunksTarget) noChunksTarget.innerHTML = verificationPagedTable(noChunks, "verificationNoChunksPage", "no_chunks");
-  updateVerificationSelectionState([...(missing.rows || []), ...(unverified.rows || []), ...(verified.rows || []), ...(noChunks.rows || [])]);
+  renderVerificationTables();
+  const remaining = verificationStateConfigs().some(item => verificationTableCache[item.state]?.signature !== item.signature);
+  if(remaining){
+   clearTimeout(updateVerificationPage.nextTimer);
+   updateVerificationPage.nextTimer = setTimeout(() => updateVerificationPage(), Date.now() < apiRateLimitedUntil ? 2200 : 300);
+  }
  } finally {
   verificationRefreshRunning = false;
  }
