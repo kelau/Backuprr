@@ -1417,6 +1417,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.85":["Settings field descriptions now include clearer purpose, tuning guidance, possible settings, examples, and defaults."],
  "0.2.84":["Added PAR2 executable auto-discovery and optional hidden Settings field descriptions."],
  "0.2.83":["Backup readiness now separates protection coverage from optional operational hardening so fully protected libraries show as 100% covered."],
  "0.2.82":["Added a dedicated read-only safety escape hatch and live reduced-motion toggle feedback."],
@@ -3334,105 +3335,182 @@ function showSettingsTab(name, button){
  button.classList.add("primary");
 }
 const settingsHelpDescriptions = {
- "UI template":"Changes the visual template used by the Web UI.",
- "Reduce motion":"Disables UI animations and transitions for a calmer interface.",
- "Newsgroup":"The Usenet group Backuprr posts backup articles to.",
- "Article size":"Target size of each posted article chunk. Larger chunks reduce metadata but must be accepted by the provider.",
- "NNTP threads":"Maximum number of parallel NNTP worker threads for read and post operations.",
- "Post limit per hour":"Optional hourly upload cap. Set to 0 for unlimited posting.",
- "Default queue strategy":"How automatically queued files are prioritized when no manual priority has been set.",
- "NNTP retry attempts":"How many times a failed NNTP operation is retried before it is marked failed.",
- "NNTP retry backoff seconds":"Delay between NNTP retry attempts.",
- "Retry policy JSON":"Per-provider retry overrides for advanced troubleshooting.",
- "Auto-pause auth failures":"Pause workers after repeated authentication failures. Use 0 to disable this safety pause.",
- "Auto-pause provider failures":"Pause workers after repeated provider/network failures. Use 0 to disable this safety pause.",
- "Verify interval":"How often each backed-up file should be rechecked on Usenet.",
- "Verification task interval seconds":"How often the verification worker wakes up to find due files.",
- "Files verified per task run":"Number of files the verification worker checks per run.",
- "Catalog scan interval seconds":"How often endpoints are scanned for new, changed, moved, deleted, or unreadable files.",
- "Backup task interval seconds":"How often the backup worker wakes up to post queued files.",
- "Cloud backup interval seconds":"How often config/database cloud backups are considered.",
- "Maintenance interval seconds":"How often cleanup, compaction, and maintenance tasks are considered.",
- "Auto-vacuum after compacted chunk rows":"Run database vacuum after this many chunk rows are compacted. Use 0 to disable automatic vacuum.",
- "Restore drill task interval seconds":"How often restore drill scheduling wakes up.",
- "Update check interval seconds":"How often Backuprr checks GitHub for a newer version.",
- "File stability seconds before posting":"A file must remain unchanged for this long before automatic posting begins.",
- "Encryption passphrase env":"Environment variable that contains the body encryption passphrase.",
- "Compress files":"Compress eligible files before posting when compression is expected to save space.",
- "Compression sample bytes":"Number of bytes sampled to estimate whether a file is worth compressing.",
- "Minimum compression gain percent":"Minimum expected saving before compression is used.",
- "Encrypt article bodies":"Encrypt posted article bodies using the configured passphrase environment variable.",
- "Generate PAR2 recovery files":"Create recovery data that can help restore files if some Usenet articles disappear.",
- "PAR2 command":"Path or command name for a PAR2-compatible executable such as par2, par2cmdline, MultiPar par2j, or QuickPar.",
- "PAR2 redundancy":"Percentage of recovery data created when PAR2 is enabled.",
- "Compact stored chunk metadata":"Store completed chunk metadata in a compact manifest form when safe.",
- "Compact completed chunk rows":"Remove redundant per-chunk rows after successful manifest compaction.",
- "Restore drill interval days":"How often a backed-up file should be sampled by restore drills.",
- "Restore drill sample bytes":"How much data a restore drill reads for validation.",
- "Critical verification interval days":"Verification interval for files matched by retention policy patterns.",
- "Retention policy patterns. Format: label:glob:days, for example critical:*.iso:30":"Optional per-pattern verification policies for more important file classes.",
- "Restore to sandbox before replacing origin":"Restore into a temporary sandbox first when replacing files in their original location.",
- "Restore sandbox path":"Optional path for restore sandbox files. Empty means Backuprr chooses a nearby sandbox.",
- "Endpoints, one path per line":"Root folders Backuprr catalogs recursively.",
- "Auto-queue exclude patterns, one per line. Examples: MP4, .mp4, *.sample, regex:\\.partial$, /Season \\d+/":"Files matching these patterns are cataloged but not automatically queued.",
- "Queue pause patterns, one per line. Matching files stay cataloged but are not queued automatically.":"Temporary queue suppression patterns for files that should wait.",
- "Usenet hosts":"Read and post providers used for backup, verification, and restore.",
- "Local log retention days":"How long normal local log rows are kept.",
- "Verbose log retention days":"How long verbose/debug local log rows are kept.",
- "Log web access requests":"Record Web UI access events in the event log.",
- "Log successful per-chunk events":"Record successful chunk events. Useful for diagnostics but high volume.",
- "Log aggregation destinations":"External logging platforms that receive forwarded events.",
- "Web UI username":"Username for optional browser Basic Auth.",
- "Web UI role":"Permission level for the Web UI account.",
- "Web UI password":"Password for optional browser Basic Auth. Leave blank to keep the stored password.",
- "Disable Web UI password":"Remove the stored Web UI password and allow unauthenticated local browser access.",
- "Read-only mode":"Blocks write actions until explicitly disabled.",
- "TOTP secret env":"Environment variable containing a TOTP secret for admin step-up prompts.",
- "Config secret key environment variable":"Environment variable used to encrypt selected secrets in the config file.",
- "Enable signed audit events":"Adds signatures to audit events so changes are easier to verify later.",
- "Audit secret env":"Environment variable containing the audit signing secret.",
- "Internal API rate limit per minute":"Rate limit for browser AJAX endpoints.",
- "External API rate limit per minute":"Rate limit for API-key endpoints used by automations.",
- "Enable manifest export":"Allow exporting backup manifests for disaster recovery.",
- "Encrypt manifest export":"Encrypt exported manifests using the manifest export secret.",
- "Manifest export secret env":"Environment variable containing the manifest export encryption secret.",
- "Manifest export interval seconds":"How often manifest exports are considered.",
- "Replace external API keys, one per line. Leave blank to keep existing keys.":"New API keys for external integrations such as Home Assistant.",
- "External API key scopes JSON. Keys are full API keys, values are scopes: read, backup, scan, verify, restore, admin.":"Optional per-key permissions for external API keys.",
- "Clear all stored external API keys":"Remove every external API key from the config.",
- "Enable GitHub update checks":"Check GitHub releases/tags for newer Backuprr versions.",
- "GitHub repository":"Repository used by the update checker, in owner/repo format.",
- "GitHub token env":"Environment variable containing a GitHub token for private repositories or higher rate limits.",
- "Update check timeout seconds":"Network timeout for GitHub update checks.",
- "Cloud backup targets":"Destinations for periodic config and database safety backups.",
- "Name":"Friendly display name.",
- "Mode":"Whether the host is used for reading, posting, or both through separate entries.",
- "Priority":"Lower numbers are preferred first when choosing a host.",
- "Server":"NNTP server hostname.",
- "Port":"NNTP server port.",
- "TLS mode":"Implicit TLS, STARTTLS, or plain NNTP connection mode.",
- "Username":"Provider username for authentication.",
- "Password":"Provider password. Leave blank to keep the stored value where supported.",
- "Enabled":"Whether this configured item is active.",
- "Platform":"External logging platform type.",
- "URL":"Endpoint URL for the external service.",
- "Minimum level":"Lowest event level forwarded to this destination.",
- "API token":"Optional API token for the external service.",
- "Timeout seconds":"HTTP timeout for this integration.",
- "Provider":"Cloud/sync target type.",
- "Target path":"Folder path where backup archives should be written.",
- "Command":"Command template for custom cloud backup or tool execution."
+ "UI template":"Changes the visual style of the Web UI only. Pick the template that is easiest for you to scan during long-running backup and verification work.",
+ "Reduce motion":"Disables animations and transitions. Enable this if motion is distracting, if you use remote desktop, or if you prefer the most stable-looking UI.",
+ "Newsgroup":"The Usenet group where backup articles are posted. Use the private or agreed group for your archive; changing this affects future posts and lookups.",
+ "Article size":"Target size for each posted article chunk. Larger values reduce chunk count and database metadata, but the provider must accept the size; use the provider article-size test and stay below the largest passing value.",
+ "NNTP threads":"Maximum parallel NNTP workers used for posting, verification, and restore reads. Increase while throughput rises; reduce if the provider throttles, authentication errors increase, or the server/network feels saturated.",
+ "Post limit per hour":"Caps how much data Backuprr may post in a rolling hour. Use this to avoid provider rate limits, noisy WAN usage, or filling monthly quotas; 0 means no cap.",
+ "Default queue strategy":"Controls the order automatically queued files are posted. Use Older First for archival safety, Smaller First to clear many small files quickly, Larger First for bulk throughput testing, or Folder First to keep related paths together.",
+ "NNTP retry attempts":"Number of retry attempts after a transient NNTP failure. Raise slightly for flaky providers; keep modest so genuinely bad credentials or blocked sockets surface quickly.",
+ "NNTP retry backoff seconds":"Delay between NNTP retries. Increase when provider rate limits or temporary network failures occur; lower values make test runs recover faster.",
+ "Retry policy JSON":"Advanced per-provider retry overrides. Leave empty unless you need host-specific behavior after observing logs.",
+ "Auto-pause auth failures":"Automatically pauses workers after repeated authentication failures. Keep enabled to avoid hammering a provider with bad credentials; use 0 only during deliberate auth testing.",
+ "Auto-pause provider failures":"Automatically pauses workers after repeated provider or network failures. Increase for unreliable links; reduce if you want failures to stop workers quickly.",
+ "Verify interval":"How often each backed-up file becomes due for chunk verification. Shorter intervals give stronger confidence but more provider reads; longer intervals reduce traffic for stable archives.",
+ "Verification task interval seconds":"How often the verification worker wakes up to look for due files. Lower values make manual/test changes visible faster; higher values are quieter on large libraries.",
+ "Files verified per task run":"How many due files are verified each worker run. Increase for catch-up runs; keep low to spread verification over time for multi-TB archives.",
+ "Catalog scan interval seconds":"How often Backuprr scans endpoint folders. Lower values find new files quickly; higher values reduce disk activity on very large libraries.",
+ "Backup task interval seconds":"How often the backup worker wakes up and processes queued work. Lower values react faster; higher values batch work and reduce churn.",
+ "Cloud backup interval seconds":"How often Backuprr checks whether config/database backups should be copied to cloud targets. Use shorter intervals while actively changing settings.",
+ "Maintenance interval seconds":"How often cleanup, compaction, retention, and database maintenance are considered. Daily is usually enough unless you are doing heavy test posting.",
+ "Auto-vacuum after compacted chunk rows":"Runs database vacuum after enough chunk rows are compacted. Higher values vacuum less often; lower values return disk space sooner at the cost of more maintenance work.",
+ "Restore drill task interval seconds":"How often the restore-drill scheduler wakes up. Lower values make test drills happen sooner; production systems can keep this infrequent.",
+ "Update check interval seconds":"How often Backuprr checks GitHub for a newer version. Daily is a good balance between awareness and network noise.",
+ "File stability seconds before posting":"A file must remain unchanged for this long before it can be posted. Increase for large files still being copied; decrease only for controlled test folders.",
+ "Encryption passphrase env":"Environment variable containing the encryption passphrase. Use a strong secret managed outside the config file; changing it affects future encrypted posts.",
+ "Compress files":"Compresses eligible files before posting when sampling predicts a useful gain. Enable for documents/raw files; many media archives are already compressed and may be skipped automatically.",
+ "Compression sample bytes":"Bytes sampled to estimate compression benefit. Larger samples improve decisions on mixed files but add pre-post work.",
+ "Minimum compression gain percent":"Minimum expected size reduction before compression is used. Raise to avoid spending CPU on small savings; lower if storage/post volume is more important than CPU.",
+ "Encrypt article bodies":"Encrypts posted article payloads with the configured passphrase. Enable for privacy; make sure the passphrase is backed up because restore depends on it.",
+ "Generate PAR2 recovery files":"Adds recovery data to tolerate some missing Usenet articles. Enable for important archives once a PAR2 executable is installed and tested.",
+ "PAR2 command":"Path or command name for the PAR2-compatible executable. Use Locate to auto-fill; prefer command-line tools such as par2/par2cmdline/MultiPar par2j over GUI-only tools.",
+ "PAR2 redundancy":"Recovery data percentage. Higher values survive more missing chunks but post more data; 5-10% is typical, with 15-30% for high-value files.",
+ "Compact stored chunk metadata":"Stores completed chunk metadata more compactly. Keep enabled for large libraries because millions of chunks otherwise grow the database quickly.",
+ "Compact completed chunk rows":"Removes redundant per-chunk rows after safe manifest compaction. Keep enabled for multi-TB scale unless actively debugging chunk-level posting.",
+ "Restore drill interval days":"How often files should be sampled by restore drills. Shorter intervals improve confidence; longer intervals reduce provider reads.",
+ "Restore drill sample bytes":"Amount of data read during each restore drill. Larger samples provide stronger proof but use more read bandwidth.",
+ "Critical verification interval days":"Verification interval for files matched by critical retention patterns. Use shorter intervals for irreplaceable files.",
+ "Retention policy patterns. Format: label:glob:days, for example critical:*.iso:30":"Per-pattern verification policies. Add one line per class of file when some paths or extensions need more frequent checks than the global interval.",
+ "Restore to sandbox before replacing origin":"Restores into a sandbox before replacing original files. Enable this for safer restores, especially when restoring over existing files.",
+ "Restore sandbox path":"Optional folder for restore sandbox output. Leave empty to place the sandbox near the original file, or set a fast/safe scratch disk.",
+ "Endpoints, one path per line":"Root folders Backuprr catalogs recursively. Add only stable library roots; each endpoint is scanned and monitored for changes.",
+ "Auto-queue exclude patterns, one per line. Examples: MP4, .mp4, *.sample, regex:\\.partial$, /Season \\d+/":"Catalogs matching files but prevents automatic queueing. Use for temporary, sample, cache, or file types you do not want posted.",
+ "Queue pause patterns, one per line. Matching files stay cataloged but are not queued automatically.":"Temporarily holds matching files out of the automatic queue without excluding them from the catalog.",
+ "Usenet hosts":"Read and post providers used for backup, verification, and restore. Add separate entries for read and post endpoints when the provider uses different hosts.",
+ "Local log retention days":"How long normal local log rows are kept. Longer retention helps troubleshooting but grows the database.",
+ "Verbose log retention days":"How long debug/verbose rows are kept. Keep short in production because verbose logs can be high volume.",
+ "Log web access requests":"Records Web UI access events. Enable when auditing access; disable to keep logs quieter.",
+ "Log successful per-chunk events":"Records successful chunk-level events. Use only for diagnostics because successful posts can create many log rows.",
+ "Log aggregation destinations":"External log systems that receive Backuprr events. Use one if you already monitor your home lab with Loki, Seq, Graylog, Elastic, Logstash, or Splunk.",
+ "Web UI username":"Username for browser Basic Auth. Use a non-default name if the app is reachable beyond localhost.",
+ "Web UI role":"Permission level for the Web UI account. Use Read Only for dashboards, Operator for routine work, and Admin for settings/security changes.",
+ "Web UI password":"Password for browser Basic Auth. Leave blank to keep the existing value; set one before exposing the app to a LAN or reverse proxy.",
+ "Disable Web UI password":"Removes browser Basic Auth. Use only for local-only testing or when another trusted auth layer protects the app.",
+ "Read-only mode":"Blocks write actions such as posting, restore-to-origin, queue changes, and most settings writes. Use during audits or incident response.",
+ "TOTP secret env":"Environment variable containing a TOTP secret for admin step-up. Enable when the Web UI is reachable by other users or systems.",
+ "Config secret key environment variable":"Environment variable used to encrypt selected secrets in the config file. Set it before storing provider/API credentials long term.",
+ "Enable signed audit events":"Signs audit events so important actions can be checked later. Enable when you care about change traceability.",
+ "Audit secret env":"Environment variable containing the audit signing secret. Keep it stable and backed up if signed audit history matters.",
+ "Internal API rate limit per minute":"Rate limit for browser AJAX calls. Raise only if the UI reports rate limits during normal use.",
+ "External API rate limit per minute":"Rate limit for API-key integrations. Tune based on Home Assistant or automation polling frequency.",
+ "Enable manifest export":"Allows exporting backup manifests for disaster recovery. Keep enabled so catalog recovery has a second path.",
+ "Encrypt manifest export":"Encrypts exported manifests. Enable when exports leave the server or land in shared cloud storage.",
+ "Manifest export secret env":"Environment variable containing the manifest export encryption secret. Back it up with your disaster recovery material.",
+ "Manifest export interval seconds":"How often manifest exports are considered. Shorter intervals capture catalog changes faster.",
+ "Replace external API keys, one per line. Leave blank to keep existing keys.":"Replaces API keys used by automations. Leave blank unless rotating or adding keys.",
+ "External API key scopes JSON. Keys are full API keys, values are scopes: read, backup, scan, verify, restore, admin.":"Restricts each external key to specific capabilities. Give automations the smallest scope they need.",
+ "Clear all stored external API keys":"Removes every external API key. Use when rotating integrations or after a suspected key leak.",
+ "Enable GitHub update checks":"Checks GitHub releases/tags for newer Backuprr versions. Disable only on fully offline installs.",
+ "GitHub repository":"Repository used by the update checker. Keep owner/repo pointed at the upstream or your fork.",
+ "GitHub token env":"Environment variable containing a GitHub token. Useful for private forks or avoiding unauthenticated rate limits.",
+ "Update check timeout seconds":"Network timeout for GitHub checks. Increase on slow links; keep low so a stalled check does not linger.",
+ "Cloud backup targets":"Destinations for periodic config/database backups. Add at least one target outside the app directory for disaster recovery.",
+ "Name":"Friendly display name. Choose something that identifies the provider, purpose, or destination in logs.",
+ "Mode":"Selects whether this entry is used for reading or posting. Use separate entries when providers expose different read/post hosts.",
+ "Priority":"Lower numbers are preferred first. Give your fastest or most reliable host the lowest priority.",
+ "Server":"NNTP server hostname from the provider.",
+ "Port":"NNTP server port. Common values are 563 for implicit TLS, 119 for plain NNTP, and sometimes 119/443/563 for STARTTLS depending on provider.",
+ "TLS mode":"Connection security mode. Prefer implicit TLS when available, STARTTLS when required, and plain only on trusted networks/testing.",
+ "Username":"Provider username for authentication. Use the provider account created for this service.",
+ "Password":"Provider password. Leave blank to keep a stored password when editing an existing host.",
+ "Enabled":"Turns this item on or off without deleting it. Disable while testing or temporarily removing a destination.",
+ "Platform":"External logging platform type. Pick the system you already run so logs land in the expected format.",
+ "URL":"Endpoint URL for the external service. Use the platform-specific ingest URL, not the human dashboard URL.",
+ "Minimum level":"Lowest event severity forwarded. Use info for normal operations, warning/error for quieter production forwarding, or debug/verbose while diagnosing.",
+ "API token":"Optional API token for the external service. Leave blank to keep a stored token where supported.",
+ "Timeout seconds":"HTTP timeout for the integration. Increase for slow remote endpoints; keep short for local collectors.",
+ "Provider":"Cloud/sync target type. Pick local/sync folder for OneDrive/Google Drive clients mounted on the server, or command for tools like rclone.",
+ "Target path":"Folder where config/database backup archives are written. Put it on synced or remote-backed storage.",
+ "Command":"Command template for custom backup/export tools. Use placeholders shown by the target feature, such as {archive}, when supported."
 };
-function settingHelpFor(label){
- return settingsHelpDescriptions[label] || `Configures ${label.charAt(0).toLowerCase()}${label.slice(1)}.`;
+const settingsHelpDefaults = {
+ "UI template":"harbor_light",
+ "Reduce motion":"Off",
+ "Newsgroup":"alt.binaries.backup",
+ "Article size":"768 KiB",
+ "NNTP threads":"4",
+ "Post limit per hour":"0 GB, unlimited",
+ "Default queue strategy":"Older First",
+ "NNTP retry attempts":"2",
+ "NNTP retry backoff seconds":"5",
+ "Verify interval":"90 days",
+ "Verification task interval seconds":"3600",
+ "Files verified per task run":"1",
+ "Catalog scan interval seconds":"300",
+ "Backup task interval seconds":"300",
+ "Cloud backup interval seconds":"3600",
+ "Maintenance interval seconds":"86400",
+ "Restore drill task interval seconds":"86400",
+ "Update check interval seconds":"86400",
+ "File stability seconds before posting":"300",
+ "Compression sample bytes":"2097152",
+ "Minimum compression gain percent":"5",
+ "PAR2 command":"par2",
+ "PAR2 redundancy":"10%",
+ "Restore drill interval days":"30",
+ "Restore drill sample bytes":"1048576",
+ "Critical verification interval days":"30",
+ "Local log retention days":"30",
+ "Verbose log retention days":"7",
+ "Web UI username":"admin",
+ "Web UI role":"Admin",
+ "TOTP secret env":"BACKUPRR_TOTP_SECRET",
+ "Config secret key environment variable":"BACKUPRR_CONFIG_SECRET",
+ "Internal API rate limit per minute":"120",
+ "External API rate limit per minute":"60",
+ "Manifest export interval seconds":"86400",
+ "GitHub repository":"kelau/Backuprr",
+ "GitHub token env":"GITHUB_TOKEN",
+ "Update check timeout seconds":"10",
+ "Port":"563 for implicit TLS",
+ "TLS mode":"implicit",
+ "Minimum level":"info",
+ "Timeout seconds":"5",
+ "Provider":"local/sync folder"
+};
+function settingsLabelTitle(label){
+ const source = label.querySelector(":scope > span") || label;
+ const clone = source.cloneNode(true);
+ clone.querySelectorAll(".ui-icon,input,select,textarea,button,small,.settings-help").forEach(node => node.remove());
+ return clone.textContent.replace(/\s+/g, " ").trim();
+}
+function settingsControlDetails(label, title){
+ const control = label.querySelector("input:not([type='hidden']), select, textarea");
+ if(!control) return "";
+ const parts = [];
+ if(control.tagName === "SELECT"){
+  const options = Array.from(control.options || []).map(option => option.textContent.trim()).filter(Boolean);
+  if(options.length) parts.push(`Possible settings: ${options.join(", ")}.`);
+ } else if(control.type === "checkbox"){
+  parts.push("Possible settings: On or Off.");
+ } else if(control.tagName === "TEXTAREA"){
+  parts.push("Possible settings: one or more text lines, JSON, or an empty value depending on the field.");
+ } else if(control.type === "range" || control.type === "number"){
+  const range = [];
+  if(control.min !== "") range.push(`min ${control.min}`);
+  if(control.max !== "") range.push(`max ${control.max}`);
+  if(control.step && control.step !== "any") range.push(`step ${control.step}`);
+  if(range.length) parts.push(`Possible settings: numeric value (${range.join(", ")}).`);
+ } else {
+  parts.push("Possible settings: text value, path, hostname, command, or environment variable name as appropriate for the field.");
+ }
+ if(settingsHelpDefaults[title]) parts.push(`Default: ${settingsHelpDefaults[title]}.`);
+ if(control.placeholder) parts.push(`Example: ${control.placeholder}.`);
+ return parts.join(" ");
+}
+function settingHelpFor(label, labelElement){
+ const base = settingsHelpDescriptions[label] || `Controls ${label || "this setting"}. Start with the default, then adjust only when logs, provider limits, or your workflow point to a better value.`;
+ const details = settingsControlDetails(labelElement, label);
+ return [base, details].filter(Boolean).join(" ");
 }
 function addSettingsHelpText(root=document.getElementById("content")){
  if(!root) return;
  root.querySelectorAll("label").forEach(label => {
   if(label.querySelector(".settings-help")) return;
-  const title = label.querySelector(":scope > span")?.textContent.trim() || label.textContent.trim().replace(/\s+/g, " ");
+  const title = settingsLabelTitle(label);
   if(!title) return;
-  label.insertAdjacentHTML("beforeend", `<small class="settings-help">${esc(settingHelpFor(title))}</small>`);
+  label.insertAdjacentHTML("beforeend", `<small class="settings-help">${esc(settingHelpFor(title, label))}</small>`);
  });
 }
 function toggleSettingsHelp(show){
