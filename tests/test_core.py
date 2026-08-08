@@ -198,7 +198,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.94")
+        self.assertEqual(__version__, "0.2.95")
 
     def test_config_endpoints_are_synced_to_database_on_startup(self):
         media = self.root / "media"
@@ -209,6 +209,13 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(scan_all(self.db), 1)
         rows = self.db.list_rows("files")
         self.assertEqual(rows[0]["relative_path"], "sample.bin")
+
+    def test_clear_worker_error_keeps_resume_state_fresh(self):
+        self.db.save_worker_state("backup", "Backup", "", "", "", 1.0, "", "old auth failure", 1, 1)
+        self.db.clear_worker_error("backup")
+        state = self.db.worker_state("backup")
+        self.assertEqual(state["last_error"], "")
+        self.assertEqual(state["revision"], 2)
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)

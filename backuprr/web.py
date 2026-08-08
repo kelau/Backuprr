@@ -843,7 +843,11 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/worker/resume":
                 kind = str(data.get("kind", "all"))
                 self.db.set_paused(kind, False)
+                worker_kinds = ["catalog", "backup", "verification", "cloud_backup", "maintenance", "restore_drill", "update_check"] if kind == "all" else [kind]
+                for worker_kind in worker_kinds:
+                    self.db.clear_worker_error(worker_kind)
                 audit_event(self.db, self.config, self.config.web_ui_username, "worker.resume", {"kind": kind})
+                self.monitor.trigger()
                 self.send_json({"ok": True, "paused": self.db.paused_kinds()})
             elif parsed.path == "/api/operations/cancel":
                 operation_id = str(data.get("operation_id", ""))
@@ -1442,6 +1446,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.95":["Resuming workers now clears stale task errors and immediately nudges the worker so fixed configuration can retry without waiting for the next scheduled run."],
  "0.2.94":["Usenet host authentication is now explicit: missing or partial provider credentials are reported before posting instead of surfacing as a vague NNTP 480 response."],
  "0.2.93":["Docker and CLI startup now sync configured endpoints into the catalog database so first-boot scans start automatically."],
  "0.2.92":["Page navigation now ignores stale async renders and table views keep the last good data during temporary internal API cooldowns."],

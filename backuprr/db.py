@@ -208,6 +208,13 @@ class Database:
         with self.connect() as conn:
             return conn.execute("SELECT * FROM worker_state ORDER BY kind").fetchall()
 
+    def clear_worker_error(self, kind: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE worker_state SET last_error='', revision=revision+1, updated_at=? WHERE kind=?",
+                (utcnow(), kind),
+            )
+
     def save_worker_state(
         self,
         kind: str,
