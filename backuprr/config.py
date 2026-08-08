@@ -73,9 +73,17 @@ class UsenetHost:
     def resolved_password(self) -> Optional[str]:
         return self.password
 
+    def auth_state(self) -> str:
+        if self.username and self.password:
+            return "configured"
+        if self.username or self.password:
+            return "incomplete"
+        return "missing"
+
     def public_dict(self) -> Dict[str, Any]:
         data = self.__dict__.copy()
         data["has_password"] = bool(data.get("password"))
+        data["auth_state"] = self.auth_state()
         if data.get("password"):
             data["password"] = ""
         return data

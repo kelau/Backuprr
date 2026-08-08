@@ -1442,6 +1442,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.94":["Usenet host authentication is now explicit: missing or partial provider credentials are reported before posting instead of surfacing as a vague NNTP 480 response."],
  "0.2.93":["Docker and CLI startup now sync configured endpoints into the catalog database so first-boot scans start automatically."],
  "0.2.92":["Page navigation now ignores stale async renders and table views keep the last good data during temporary internal API cooldowns."],
  "0.2.91":["Manual and forced verification can now recheck missing chunks and recover stale failed missing-chunk rows when all chunks exist."],
@@ -1685,6 +1686,12 @@ function levelPill(value){
  const tone = ({error:"bad",warning:"warn",info:"info",debug:"debug",verbose:"verbose"}[key] || "");
  const icon = ({error:"&#10060;",warning:"&#9888;",info:"&#8505;",debug:"&#128027;",verbose:"&#128269;"}[key] || "&#8226;");
  return `<span class="pill ${tone}"><span class="ui-icon">${icon}</span>${esc(labelize(value))}</span>`;
+}
+function authPill(value){
+ const key = String(value || "missing");
+ const tone = ({configured:"ok",incomplete:"warn",missing:"bad"}[key] || "warn");
+ const icon = ({configured:"&#128274;",incomplete:"&#9888;",missing:"&#128273;"}[key] || "&#9888;");
+ return `<span class="pill ${tone}" title="Provider authentication is ${esc(labelize(key))}"><span class="ui-icon">${icon}</span>${esc(labelize(key))}</span>`;
 }
 function kindIcon(value){
  return ({catalog:"&#128193;",backup:"&#128230;",verification:"&#10003;",cloud_backup:"&#9729;",maintenance:"&#128736;",restore_drill:"&#8635;",update_check:"&#128260;"}[String(value || "")] || "&#9881;");
@@ -3759,7 +3766,7 @@ function hostRows(hosts){
 }
 function hostRow(host, index){
  return `<div class="host-row" data-host-index="${index}">
-  <div class="toolbar"><h3><span class="ui-icon">&#128225;</span>Host ${index + 1}</h3><button class="danger" onclick="removeHost(this)"><span class="ui-icon">&#128465;</span>Remove</button></div>
+  <div class="toolbar"><h3><span class="ui-icon">&#128225;</span>Host ${index + 1}</h3>${authPill(host.auth_state || ((host.username && host.has_password) ? "configured" : (host.username || host.has_password ? "incomplete" : "missing")))}<button class="danger" onclick="removeHost(this)"><span class="ui-icon">&#128465;</span>Remove</button></div>
   <div class="host-grid">
    <label class="field"><span><span class="ui-icon">&#128278;</span>Name</span><input class="hostName" value="${esc(host.name)}" placeholder="eweka-read"></label>
    <label class="field"><span><span class="ui-icon">&#8644;</span>Mode</span><select class="hostMode"><option value="read" ${host.mode==="read"?"selected":""}>read</option><option value="post" ${host.mode==="post"?"selected":""}>post</option></select></label>

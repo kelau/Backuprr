@@ -25,6 +25,13 @@ class UsenetClient:
         self.conn: Optional[nntplib.NNTP] = None
 
     def __enter__(self) -> "UsenetClient":
+        username = self.host.resolved_username()
+        password = self.host.resolved_password()
+        if not username and not password:
+            raise RuntimeError(f"NNTP host {self.host.name} is missing username and password")
+        if bool(username) != bool(password):
+            missing = "password" if username else "username"
+            raise RuntimeError(f"NNTP host {self.host.name} has incomplete authentication: missing {missing}")
         if self.host.tls == "implicit":
             self.conn = nntplib.NNTP_SSL(self.host.host, self.host.port, timeout=self.timeout)
         else:
@@ -32,8 +39,6 @@ class UsenetClient:
             if self.host.tls == "starttls":
                 context = ssl.create_default_context()
                 self.conn.starttls(context=context)
-        username = self.host.resolved_username()
-        password = self.host.resolved_password()
         if username and password:
             self.conn.login(username, password)
         return self

@@ -66,6 +66,7 @@ from backuprr.operations import (
 from backuprr.queueing import enqueue_unbacked, excluded_by_auto_queue_filter, prioritize
 from backuprr.restore import restore_file, restore_sample, restored_payloads
 from backuprr.scanner import scan_all
+from backuprr.usenet import UsenetClient
 from backuprr.update_checker import check_for_updates, compare_versions, update_result
 from backuprr.web import Handler, ResponseZipWriter, hourly_post_budget, thread_usage_summary, throughput_summary, totp_valid
 
@@ -197,7 +198,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.93")
+        self.assertEqual(__version__, "0.2.94")
 
     def test_config_endpoints_are_synced_to_database_on_startup(self):
         media = self.root / "media"
@@ -2086,6 +2087,46 @@ class CoreTests(unittest.TestCase):
         public = host.public_dict()
         self.assertEqual(public["password"], "")
         self.assertTrue(public["has_password"])
+        self.assertEqual(public["auth_state"], "incomplete")
+
+    def test_public_host_dict_reports_auth_state(self):
+        self.assertEqual(
+            UsenetHost(name="post", mode="post", host="post.example.test", port=563).public_dict()["auth_state"],
+            "missing",
+        )
+        self.assertEqual(
+            UsenetHost(
+                name="post",
+                mode="post",
+                host="post.example.test",
+                port=563,
+                username="user",
+            ).public_dict()["auth_state"],
+            "incomplete",
+        )
+        self.assertEqual(
+            UsenetHost(
+                name="post",
+                mode="post",
+                host="post.example.test",
+                port=563,
+                username="user",
+                password="secret",
+            ).public_dict()["auth_state"],
+            "configured",
+        )
+
+    def test_usenet_client_rejects_missing_auth_before_connecting(self):
+        host = UsenetHost(name="post", mode="post", host="post.example.test", port=563, tls="implicit")
+        with self.assertRaisesRegex(RuntimeError, "missing username and password"):
+            with UsenetClient(host):
+                pass
+
+    def test_usenet_client_rejects_incomplete_auth_before_connecting(self):
+        host = UsenetHost(name="post", mode="post", host="post.example.test", port=563, tls="implicit", username="user")
+        with self.assertRaisesRegex(RuntimeError, "missing password"):
+            with UsenetClient(host):
+                pass
 
     def test_config_load_accepts_utf8_bom(self):
         config_path = self.root / "bom-config.json"
