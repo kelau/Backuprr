@@ -114,12 +114,15 @@ Build and run the container locally:
 ```bash
 mkdir -p data
 cp config.example.json data/config.json
+sudo chown -R 10001:10001 data
 docker compose up -d --build
 ```
 
 The compose file stores config and the SQLite database in `./data` and mounts
 media at `/media` inside the container. Add endpoints in the Web UI using the
 container path, for example `/media/movies`, not the host path.
+The container runs as UID `10001`; the `data` directory must be writable by
+that UID so SQLite can create and update `/data/backuprr.sqlite3`.
 
 For large catalog testing, bind a generated media tree into `/media` and keep
 the database on a persistent volume. Backuprr is designed to scan incrementally,
@@ -166,7 +169,12 @@ services:
 
 Create `/opt/backuprr/data/config.json` first, or bind a directory containing
 your existing `config.json`. Set `"database": "/data/backuprr.sqlite3"` in that
-config so the catalog persists across container upgrades.
+config so the catalog persists across container upgrades. Also make the bind
+mounted data directory writable by the container user:
+
+```bash
+sudo chown -R 10001:10001 /opt/backuprr/data
+```
 
 ## Updates
 

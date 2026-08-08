@@ -32,6 +32,11 @@ def load_db(config_path: str) -> tuple[Config, Database]:
     return config, db
 
 
+def sync_config_endpoints(db: Database, config: Config) -> None:
+    for endpoint in config.endpoints:
+        db.add_endpoint(endpoint)
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="backuprr")
     parser.add_argument("--config", default="config.json")
@@ -85,11 +90,13 @@ def main(argv=None) -> int:
 
     if args.command == "init":
         db.init()
+        sync_config_endpoints(db, config)
         if not Path(args.config).exists():
             config.save(args.config)
         print(f"Initialized {config.db_path()}")
         return 0
     db.init()
+    sync_config_endpoints(db, config)
     if args.command == "add-endpoint":
         db.add_endpoint(args.path)
         if str(Path(args.path).resolve()) not in config.endpoints:

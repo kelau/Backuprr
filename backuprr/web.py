@@ -1442,6 +1442,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.93":["Docker and CLI startup now sync configured endpoints into the catalog database so first-boot scans start automatically."],
  "0.2.92":["Page navigation now ignores stale async renders and table views keep the last good data during temporary internal API cooldowns."],
  "0.2.91":["Manual and forced verification can now recheck missing chunks and recover stale failed missing-chunk rows when all chunks exist."],
  "0.2.90":["PAR2 creation now uses MultiPar par2j syntax when needed and reports captured tool output on failures."],

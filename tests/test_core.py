@@ -29,6 +29,7 @@ from backuprr.backup import (
     verify_file_chunks,
 )
 from backuprr.cloud_backup import backup_config_and_database, backup_config_and_database_if_changed
+from backuprr.cli import sync_config_endpoints
 from backuprr.config import Config, LogDestination, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
 from backuprr.db import Database
@@ -196,7 +197,17 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.92")
+        self.assertEqual(__version__, "0.2.93")
+
+    def test_config_endpoints_are_synced_to_database_on_startup(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "sample.bin").write_bytes(b"sample")
+        self.config.endpoints = [str(media)]
+        sync_config_endpoints(self.db, self.config)
+        self.assertEqual(scan_all(self.db), 1)
+        rows = self.db.list_rows("files")
+        self.assertEqual(rows[0]["relative_path"], "sample.bin")
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
