@@ -236,6 +236,9 @@ class Config:
             config.compress_files = True
         config.base_dir = config_path.resolve().parent
         config.source_path = config_path.resolve()
+        if not config_path.exists():
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config.save(str(config_path))
         return config
 
     def save(self, path: str) -> None:

@@ -198,7 +198,16 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.97")
+        self.assertEqual(__version__, "0.2.98")
+
+    def test_config_load_creates_missing_default_config(self):
+        config_path = self.root / "new" / "config.json"
+        loaded = Config.load(str(config_path))
+        self.assertTrue(config_path.exists())
+        self.assertEqual(loaded.source_path, config_path.resolve())
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(saved["database"], "backuprr.sqlite3")
+        self.assertEqual(saved["endpoints"], [])
 
     def test_config_endpoints_are_synced_to_database_on_startup(self):
         media = self.root / "media"

@@ -97,7 +97,6 @@ flowchart LR
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
-cp config.example.json config.json
 backuprr --config config.json init
 backuprr --config config.json add-endpoint /srv/media/movies
 backuprr --config config.json scan
@@ -113,14 +112,14 @@ Build and run the container locally:
 
 ```bash
 mkdir -p data
-cp config.example.json data/config.json
 sudo chown -R 10001:10001 data
 docker compose up -d --build
 ```
 
-The compose file stores config and the SQLite database in `./data` and mounts
-media at `/media` inside the container. Add endpoints in the Web UI using the
-container path, for example `/media/movies`, not the host path.
+On first start, Backuprr creates `./data/config.json` if it does not already
+exist. The compose file stores config and the SQLite database in `./data` and
+mounts media at `/media` inside the container. Add endpoints in the Web UI using
+the container path, for example `/media/movies`, not the host path.
 The container runs as UID `10001`; the `data` directory must be writable by
 that UID so SQLite can create and update `/data/backuprr.sqlite3`.
 
@@ -153,76 +152,37 @@ Backuprr directly. Replace `/srv/media` with the folder that contains the media
 tree you want Backuprr to catalog, and replace `/opt/backuprr` if you prefer a
 different application directory.
 
-1. Install Docker, the Compose plugin, and `curl`.
+1. Install Docker and the Compose plugin.
 
    Debian/Ubuntu:
 
    ```bash
    sudo apt-get update
-   sudo apt-get install -y docker.io docker-compose-plugin curl
+   sudo apt-get install -y docker.io docker-compose-plugin
    sudo systemctl enable --now docker
    ```
 
    CentOS Stream/RHEL-compatible hosts:
 
    ```bash
-   sudo dnf install -y docker curl
+   sudo dnf install -y docker
    sudo systemctl enable --now docker
    ```
 
-2. Create the deployment folder and seed the config file.
+2. Create the deployment and media folders.
 
    ```bash
    sudo mkdir -p /opt/backuprr /srv/media
    sudo chown -R "$USER:$USER" /opt/backuprr
    cd /opt/backuprr
    mkdir -p data
-   curl -fsSL https://raw.githubusercontent.com/kelau/Backuprr/main/config.example.json -o data/config.json
    ```
 
-3. Edit `data/config.json`.
-
-   At minimum, set the database path and add your media endpoint. Endpoints must
-   use the container path, not the host path:
-
-   ```json
-   {
-     "database": "/data/backuprr.sqlite3",
-     "endpoints": ["/media"],
-     "usenet_hosts": [
-       {
-         "name": "provider-read",
-         "mode": "read",
-         "host": "news.example.net",
-         "port": 563,
-         "tls": "implicit",
-         "username": "your-provider-user",
-         "password": "your-provider-password",
-         "priority": 100
-       },
-       {
-         "name": "provider-post",
-         "mode": "post",
-         "host": "post.example.net",
-         "port": 563,
-         "tls": "implicit",
-         "username": "your-provider-user",
-         "password": "your-provider-password",
-         "priority": 100
-       }
-     ]
-   }
-   ```
-
-   Keep the existing settings from `config.example.json` unless you intentionally
-   want to change them. Set a Web UI password before exposing the app outside a
-   trusted local network.
-
-4. Create `docker-compose.yml`.
+3. Create `docker-compose.yml`.
 
    This Compose file keeps deployment settings minimal and builds the image
    directly from GitHub. Use `#main` for the latest `main` branch, or pin a
-   release tag such as `#v0.2.97` when you want repeatable upgrades.
+   release tag such as `#v0.2.98` when you want repeatable upgrades.
 
 ```yaml
 services:
@@ -241,7 +201,7 @@ services:
       - /srv/media:/media:rw
 ```
 
-5. Make the data directory writable by the container user and start the service.
+4. Make the data directory writable by the container user and start the service.
 
    The image runs as UID `10001`; this user must be able to write the config,
    SQLite database, and temporary catalog state in `/data`.
@@ -251,7 +211,12 @@ services:
    docker compose up -d --build
    ```
 
-6. Verify the deployment.
+   If `/opt/backuprr/data/config.json` does not exist, Backuprr creates it with
+   defaults during startup. In this container layout, the default relative
+   database path resolves to `/data/backuprr.sqlite3`, so the catalog persists in
+   `/opt/backuprr/data`.
+
+5. Verify the deployment.
 
    ```bash
    docker compose ps
@@ -262,6 +227,20 @@ services:
    Open `http://SERVER-IP:8080/` in a browser. In Settings, confirm each Usenet
    host shows `Configured` authentication, then use Status or Tasks to run a
    catalog scan and backup worker.
+
+6. Configure Backuprr.
+
+   Use the Settings page to add endpoints and Usenet hosts. Endpoints must use
+   the container path, for example `/media` or `/media/movies`, not the host path
+   `/srv/media`. Set a Web UI password before exposing the app outside a trusted
+   local network.
+
+   You can also edit `/opt/backuprr/data/config.json` directly. Restart the
+   container after manual edits:
+
+   ```bash
+   docker compose restart backuprr
+   ```
 
 7. Upgrade later without losing state.
 
@@ -275,7 +254,8 @@ services:
    major upgrades or host maintenance.
 
 For Portainer, use the same compose file in a Stack and create
-`/opt/backuprr/data/config.json` plus the UID `10001` ownership before deploying.
+`/opt/backuprr/data` with UID `10001` ownership before deploying. Backuprr will
+generate `/data/config.json` on first start if it is missing.
 
 ## Updates
 
