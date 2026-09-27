@@ -180,16 +180,33 @@ different application directory.
 
 3. Create `docker-compose.yml`.
 
-   This Compose file keeps deployment settings minimal and builds the image
-   directly from GitHub. Use `#main` for the latest `main` branch, or pin a
-   release tag such as `#v0.2.98` when you want repeatable upgrades.
+   This Compose file keeps deployment settings minimal and builds the image from
+   GitHub's HTTPS source archive. That avoids Docker Git build contexts, which
+   are not available in every stack manager. Use the `main.zip` URL for the
+   latest `main` branch, or replace it with a tag or commit archive URL when you
+   want repeatable upgrades.
 
 ```yaml
 services:
   backuprr:
     image: backuprr:github
     build:
-      context: https://github.com/kelau/Backuprr.git#main
+      context: .
+      dockerfile_inline: |
+        FROM python:3.12-slim
+        ENV PYTHONDONTWRITEBYTECODE=1 \
+            PYTHONUNBUFFERED=1 \
+            BACKUPRR_CONFIG=/data/config.json
+        RUN pip install --no-cache-dir https://github.com/kelau/Backuprr/archive/refs/heads/main.zip \
+            && useradd --system --uid 10001 --home-dir /app backuprr \
+            && mkdir -p /app /data /media \
+            && chown -R backuprr:backuprr /app /data /media
+        USER backuprr
+        WORKDIR /app
+        VOLUME ["/data", "/media"]
+        EXPOSE 8080
+        HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"
+        CMD ["sh", "-c", "backuprr --config \"$BACKUPRR_CONFIG\" init && backuprr --config \"$BACKUPRR_CONFIG\" web --host 0.0.0.0 --port 8080"]
     container_name: backuprr
     restart: unless-stopped
     ports:
