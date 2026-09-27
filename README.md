@@ -195,8 +195,7 @@ services:
       dockerfile_inline: |
         FROM python:3.12-slim
         ENV PYTHONDONTWRITEBYTECODE=1 \
-            PYTHONUNBUFFERED=1 \
-            BACKUPRR_CONFIG=/data/config.json
+            PYTHONUNBUFFERED=1
         RUN pip install --no-cache-dir https://github.com/kelau/Backuprr/archive/refs/heads/main.zip \
             && useradd --system --uid 10001 --home-dir /app backuprr \
             && mkdir -p /app /data /media \
@@ -205,14 +204,11 @@ services:
         WORKDIR /app
         VOLUME ["/data", "/media"]
         EXPOSE 8080
-        HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).read()"
-        CMD ["sh", "-c", "backuprr --config \"$BACKUPRR_CONFIG\" init && backuprr --config \"$BACKUPRR_CONFIG\" web --host 0.0.0.0 --port 8080"]
+        CMD ["sh", "-c", "backuprr --config /data/config.json init && backuprr --config /data/config.json web --host 0.0.0.0 --port 8080"]
     container_name: backuprr
     restart: unless-stopped
     ports:
       - "8080:8080"
-    environment:
-      BACKUPRR_CONFIG: /data/config.json
     volumes:
       - /opt/backuprr/data:/data
       - /srv/media:/media:rw
