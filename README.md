@@ -153,32 +153,31 @@ Backuprr directly. Replace `/srv/media` with the folder that contains the media
 tree you want Backuprr to catalog, and replace `/opt/backuprr` if you prefer a
 different application directory.
 
-1. Install Docker and the Compose plugin.
+1. Install Docker, the Compose plugin, and `curl`.
 
    Debian/Ubuntu:
 
    ```bash
    sudo apt-get update
-   sudo apt-get install -y docker.io docker-compose-plugin git
+   sudo apt-get install -y docker.io docker-compose-plugin curl
    sudo systemctl enable --now docker
    ```
 
    CentOS Stream/RHEL-compatible hosts:
 
    ```bash
-   sudo dnf install -y docker git
+   sudo dnf install -y docker curl
    sudo systemctl enable --now docker
    ```
 
-2. Fetch Backuprr and create the persistent folders.
+2. Create the deployment folder and seed the config file.
 
    ```bash
    sudo mkdir -p /opt/backuprr /srv/media
    sudo chown -R "$USER:$USER" /opt/backuprr
-   git clone https://github.com/kelau/Backuprr.git /opt/backuprr
    cd /opt/backuprr
    mkdir -p data
-   cp config.example.json data/config.json
+   curl -fsSL https://raw.githubusercontent.com/kelau/Backuprr/main/config.example.json -o data/config.json
    ```
 
 3. Edit `data/config.json`.
@@ -219,13 +218,18 @@ different application directory.
    want to change them. Set a Web UI password before exposing the app outside a
    trusted local network.
 
-4. Create or adjust `docker-compose.yml`.
+4. Create `docker-compose.yml`.
+
+   This Compose file keeps deployment settings minimal and builds the image
+   directly from GitHub. Use `#main` for the latest `main` branch, or pin a
+   release tag such as `#v0.2.97` when you want repeatable upgrades.
 
 ```yaml
 services:
   backuprr:
-    image: backuprr:local
-    build: .
+    image: backuprr:github
+    build:
+      context: https://github.com/kelau/Backuprr.git#main
     container_name: backuprr
     restart: unless-stopped
     ports:
@@ -263,12 +267,12 @@ services:
 
    ```bash
    cd /opt/backuprr
-   git pull
    docker compose up -d --build
    ```
 
-   The config and catalog remain in `/opt/backuprr/data`. Back up this directory
-   before major upgrades or host maintenance.
+   Compose fetches the GitHub build context again during the rebuild. The config
+   and catalog remain in `/opt/backuprr/data`. Back up this directory before
+   major upgrades or host maintenance.
 
 For Portainer, use the same compose file in a Stack and create
 `/opt/backuprr/data/config.json` plus the UID `10001` ownership before deploying.
