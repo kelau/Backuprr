@@ -198,7 +198,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.95")
+        self.assertEqual(__version__, "0.2.96")
 
     def test_config_endpoints_are_synced_to_database_on_startup(self):
         media = self.root / "media"

@@ -146,10 +146,80 @@ docker run -d \
   backuprr:local
 ```
 
-### Portainer
+### Docker Compose From Scratch
 
-In Portainer, create a new Stack and paste this compose template. Change the
-host media path before deploying:
+These instructions assume a fresh Linux host or VM where Docker will run
+Backuprr directly. Replace `/srv/media` with the folder that contains the media
+tree you want Backuprr to catalog, and replace `/opt/backuprr` if you prefer a
+different application directory.
+
+1. Install Docker and the Compose plugin.
+
+   Debian/Ubuntu:
+
+   ```bash
+   sudo apt-get update
+   sudo apt-get install -y docker.io docker-compose-plugin git
+   sudo systemctl enable --now docker
+   ```
+
+   CentOS Stream/RHEL-compatible hosts:
+
+   ```bash
+   sudo dnf install -y docker git
+   sudo systemctl enable --now docker
+   ```
+
+2. Fetch Backuprr and create the persistent folders.
+
+   ```bash
+   sudo mkdir -p /opt/backuprr /srv/media
+   sudo chown -R "$USER:$USER" /opt/backuprr
+   git clone https://github.com/kelau/Backuprr.git /opt/backuprr
+   cd /opt/backuprr
+   mkdir -p data
+   cp config.example.json data/config.json
+   ```
+
+3. Edit `data/config.json`.
+
+   At minimum, set the database path and add your media endpoint. Endpoints must
+   use the container path, not the host path:
+
+   ```json
+   {
+     "database": "/data/backuprr.sqlite3",
+     "endpoints": ["/media"],
+     "usenet_hosts": [
+       {
+         "name": "provider-read",
+         "mode": "read",
+         "host": "news.example.net",
+         "port": 563,
+         "tls": "implicit",
+         "username": "your-provider-user",
+         "password": "your-provider-password",
+         "priority": 100
+       },
+       {
+         "name": "provider-post",
+         "mode": "post",
+         "host": "post.example.net",
+         "port": 563,
+         "tls": "implicit",
+         "username": "your-provider-user",
+         "password": "your-provider-password",
+         "priority": 100
+       }
+     ]
+   }
+   ```
+
+   Keep the existing settings from `config.example.json` unless you intentionally
+   want to change them. Set a Web UI password before exposing the app outside a
+   trusted local network.
+
+4. Create or adjust `docker-compose.yml`.
 
 ```yaml
 services:
@@ -167,14 +237,41 @@ services:
       - /srv/media:/media:rw
 ```
 
-Create `/opt/backuprr/data/config.json` first, or bind a directory containing
-your existing `config.json`. Set `"database": "/data/backuprr.sqlite3"` in that
-config so the catalog persists across container upgrades. Also make the bind
-mounted data directory writable by the container user:
+5. Make the data directory writable by the container user and start the service.
 
-```bash
-sudo chown -R 10001:10001 /opt/backuprr/data
-```
+   The image runs as UID `10001`; this user must be able to write the config,
+   SQLite database, and temporary catalog state in `/data`.
+
+   ```bash
+   sudo chown -R 10001:10001 /opt/backuprr/data
+   docker compose up -d --build
+   ```
+
+6. Verify the deployment.
+
+   ```bash
+   docker compose ps
+   curl -fsS http://127.0.0.1:8080/healthz
+   docker compose logs -f backuprr
+   ```
+
+   Open `http://SERVER-IP:8080/` in a browser. In Settings, confirm each Usenet
+   host shows `Configured` authentication, then use Status or Tasks to run a
+   catalog scan and backup worker.
+
+7. Upgrade later without losing state.
+
+   ```bash
+   cd /opt/backuprr
+   git pull
+   docker compose up -d --build
+   ```
+
+   The config and catalog remain in `/opt/backuprr/data`. Back up this directory
+   before major upgrades or host maintenance.
+
+For Portainer, use the same compose file in a Stack and create
+`/opt/backuprr/data/config.json` plus the UID `10001` ownership before deploying.
 
 ## Updates
 

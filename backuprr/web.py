@@ -1446,6 +1446,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.96":["The README now has generic Docker Compose setup-from-scratch instructions, including config, permissions, health checks, and upgrade steps."],
  "0.2.95":["Resuming workers now clears stale task errors and immediately nudges the worker so fixed configuration can retry without waiting for the next scheduled run."],
  "0.2.94":["Usenet host authentication is now explicit: missing or partial provider credentials are reported before posting instead of surfacing as a vague NNTP 480 response."],
  "0.2.93":["Docker and CLI startup now sync configured endpoints into the catalog database so first-boot scans start automatically."],
