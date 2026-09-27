@@ -214,7 +214,7 @@ services:
         WORKDIR /app
         VOLUME ["/data", "/media"]
         EXPOSE 8080
-        CMD ["sh", "-c", "backuprr --config /data/config.json init && backuprr --config /data/config.json web --host 0.0.0.0 --port 8080"]
+        CMD ["sh", "-c", "backuprr --config /data/config.json init && backuprr --config /data/config.json add-endpoint /media && backuprr --config /data/config.json web --host 0.0.0.0 --port 8080"]
     container_name: backuprr
     restart: unless-stopped
     ports:
@@ -243,7 +243,10 @@ services:
    If `/opt/backuprr/data/config.json` does not exist, Backuprr creates it with
    defaults during startup. In this container layout, the default relative
    database path resolves to `/data/backuprr.sqlite3`, so the catalog persists in
-   `/opt/backuprr/data`.
+   `/opt/backuprr/data`. The startup command also registers `/media` as a
+   catalog endpoint so files mounted from `/srv/media` can be discovered
+   immediately; narrow this endpoint later in Settings if you only want selected
+   subfolders.
 
 5. Verify the deployment.
 
