@@ -191,6 +191,7 @@ class CoreTests(unittest.TestCase):
             file_stability_seconds=0,
             newsgroup="alt.binaries.backup",
             usenet_hosts=[UsenetHost(name="post", mode="post", host="example.test", port=563, tls="implicit")],
+            auto_queue_include_patterns=["*"],
             base_dir=self.root,
         )
 
@@ -198,7 +199,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.98")
+        self.assertEqual(__version__, "0.2.99")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -480,6 +481,18 @@ class CoreTests(unittest.TestCase):
                 """
             ).fetchall()
         self.assertEqual([row["relative_path"] for row in queued], ["movie.mkv"])
+
+    def test_configured_auto_queue_requires_selected_include_patterns(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        config = Config(database=str(self.root / "test.sqlite3"), file_stability_seconds=0, base_dir=self.root)
+        self.assertEqual(config.auto_queue_include_patterns, [])
+        self.assertEqual(enqueue_unbacked(self.db, config), 0)
+        config.auto_queue_include_patterns = ["*.mkv"]
+        self.assertEqual(enqueue_unbacked(self.db, config), 1)
 
     def test_auto_queue_exclude_patterns_accept_extension_shorthand_and_regex(self):
         self.assertTrue(excluded_by_auto_queue_filter("C:/media/trailer.mp4", "trailer.mp4", ["MP4"]))
@@ -1725,6 +1738,7 @@ class CoreTests(unittest.TestCase):
                 "usenet_retry_backoff_seconds": 8,
                 "provider_retry_policy": {"network": {"attempts": 3, "backoff_seconds": 30}},
                 "queue_strategy": "folder-first",
+                "auto_queue_include_patterns": ["Movies/*", "Series/*"],
                 "ui_theme": "nordic_mint",
                 "ui_reduced_motion": True,
                 "log_retention_days": 40,
@@ -1817,6 +1831,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.config.usenet_retry_backoff_seconds, 8)
         self.assertEqual(self.config.provider_retry_policy["network"]["attempts"], 3)
         self.assertEqual(self.config.queue_strategy, "folder-first")
+        self.assertEqual(self.config.auto_queue_include_patterns, ["Movies/*", "Series/*"])
         self.assertEqual(self.config.ui_theme, "nordic_mint")
         self.assertTrue(self.config.ui_reduced_motion)
         self.assertEqual(self.config.log_retention_days, 40)

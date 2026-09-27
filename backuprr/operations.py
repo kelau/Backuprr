@@ -583,6 +583,9 @@ def test_post_host_article_size(
     return best
 
 
+test_post_host_article_size.__test__ = False
+
+
 def post_article_size_probe(host, newsgroup: str, size: int) -> None:
     token = hashlib.sha256(f"{host.name}:{size}:{time.time()}:{os.urandom(8).hex()}".encode()).hexdigest()[:32]
     subject = f"[backuprr-size-probe-{token}] ({size})"

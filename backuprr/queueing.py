@@ -65,9 +65,11 @@ def file_is_stable(path: str, size: int, mtime_ns: int, stability_seconds: int) 
 
 def enqueue_unbacked(db: Database, config: Optional[Config] = None) -> int:
     count = 0
+    not_selected = 0
     skipped = 0
     paused = 0
     unstable = 0
+    include_patterns = list(getattr(config, "auto_queue_include_patterns", []) or [])
     patterns = list(getattr(config, "auto_queue_exclude_patterns", []) or [])
     pause_patterns = list(getattr(config, "queue_pause_patterns", []) or [])
     stability_seconds = int(getattr(config, "file_stability_seconds", 0) or 0)
@@ -81,13 +83,19 @@ def enqueue_unbacked(db: Database, config: Optional[Config] = None) -> int:
     with db.connect() as conn:
         rows = conn.execute(
             f"""
-            SELECT id, path, relative_path, size, mtime_ns FROM files
+            SELECT id, path, relative_path, size, mtime_ns, state FROM files
             WHERE state IN ('discovered', 'changed', 'missing_chunks')
               AND id NOT IN (SELECT file_id FROM queue WHERE status IN ('queued', 'posting'))
             ORDER BY {order}, created_at ASC
             """
         ).fetchall()
     for row in rows:
+        if include_patterns and not excluded_by_auto_queue_filter(str(row["path"]), str(row["relative_path"]), include_patterns):
+            not_selected += 1
+            continue
+        if config is not None and not include_patterns and str(row["state"]) != "missing_chunks":
+            not_selected += 1
+            continue
         if patterns and excluded_by_auto_queue_filter(str(row["path"]), str(row["relative_path"]), patterns):
             skipped += 1
             continue
@@ -99,7 +107,8 @@ def enqueue_unbacked(db: Database, config: Optional[Config] = None) -> int:
             continue
         db.queue_file(int(row["id"]), priority=100, reason="unbacked")
         count += 1
-    suffix = f", skipped {skipped} by auto-queue filter" if skipped else ""
+    suffix = f", {not_selected} waiting for explicit backup selection" if not_selected else ""
+    suffix += f", skipped {skipped} by auto-queue filter" if skipped else ""
     suffix += f", paused {paused} by queue pause pattern" if paused else ""
     suffix += f", waiting for {unstable} unstable file(s)" if unstable else ""
     db.log("info" if count else "debug", "queue", f"Queued {count} unbacked files{suffix}")

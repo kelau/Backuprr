@@ -1,8 +1,37 @@
 import hashlib
+import json
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .db import Database
+
+
+def update_scan_progress(
+    db: Database,
+    root: Path,
+    phase: str,
+    files_seen: int,
+    hashed: int,
+    unchanged: int,
+    current_path: str = "",
+    finished: bool = False,
+) -> None:
+    db.set_meta(
+        "scan.progress",
+        json.dumps(
+            {
+                "root": str(root),
+                "phase": phase,
+                "files_seen": files_seen,
+                "hashed": hashed,
+                "unchanged": unchanged,
+                "current_path": current_path,
+                "finished": finished,
+                "updated_at": time.time(),
+            }
+        ),
+    )
 
 
 def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
@@ -28,6 +57,8 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
     if not root.exists():
         db.log("error", "scan", f"Endpoint does not exist: {root}")
         return 0
+    update_scan_progress(db, root, "starting", 0, 0, 0)
+    last_progress_at = 0.0
     snapshot = db.endpoint_file_snapshot(endpoint_id)
     metadata_index: Dict[tuple[int, int], List[Dict[str, Any]]] = {}
     for row in snapshot.values():
@@ -59,6 +90,10 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
         if not is_file:
             continue
         resolved = str(path.resolve())
+        now = time.monotonic()
+        if now - last_progress_at >= 1.0:
+            update_scan_progress(db, root, "scanning", count, hashed, unchanged, resolved)
+            last_progress_at = now
         try:
             stat = path.stat()
         except OSError as exc:
@@ -82,6 +117,7 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
             digest = candidate["sha256"]
         else:
             try:
+                update_scan_progress(db, root, "hashing", count, hashed, unchanged, resolved)
                 digest = sha256_file(path)
             except OSError as exc:
                 db.log("warning", "scan.file_error", f"Skipped unreadable file content {resolved}: {exc}")
@@ -111,6 +147,7 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
         "scan",
         f"Scanned {root}: {count} files, {unchanged} unchanged, {hashed} hashed, {missing} missing, {moved} moved",
     )
+    update_scan_progress(db, root, "finished", count, hashed, unchanged, finished=True)
     return count
 
 

@@ -5,6 +5,7 @@ import hmac
 import json
 import math
 import os
+import re
 import secrets
 import struct
 import threading
@@ -820,6 +821,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "changed": changed})
             elif parsed.path == "/api/folders/priority":
                 self.send_json({"changed": self.db.boost_folder_priority(data["path"], amount=int(data.get("amount", 10)))})
+            elif parsed.path == "/api/folders/select-backup":
+                folder = str(data["path"]).strip().strip("\\/")
+                normalized = folder.replace("\\", "/")
+                pattern = "*" if not normalized else rf"regex:^{re.escape(normalized)}([/\\]|$)"
+                if pattern not in self.config.auto_queue_include_patterns:
+                    self.config.auto_queue_include_patterns.append(pattern)
+                    self.config.save(self.config_path)
+                    record_config_history(self.db, self.config.web_ui_username, ["auto_queue_include_patterns"])
+                changed = self.db.boost_folder_priority(folder, amount=int(data.get("amount", 10)))
+                self.db.log("info", "queue.selection", f"Selected folder for automatic backup: {folder or '/'}")
+                self.send_json({"ok": True, "changed": changed, "pattern": pattern, "settings": self.config.public_dict()})
             elif parsed.path == "/api/post-next":
                 self.send_json({"file_id": self.backup_monitor.post_once()})
             elif parsed.path == "/api/backup/run":
@@ -957,7 +969,17 @@ class Handler(BaseHTTPRequestHandler):
             "setup_health": setup_health_check(self.db, self.config),
             "alerts": notification_alerts(self.db, self.config),
             "provider_confidence": provider_confidence_report(self.db),
+            "scan_progress": self.scan_progress_payload(),
         }
+
+    def scan_progress_payload(self) -> dict[str, Any]:
+        raw = self.db.get_meta("scan.progress")
+        if not raw:
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
 
     def handle_external_get(self, parsed: Any, query: dict[str, list[str]]) -> None:
         suffix = parsed.path.removeprefix("/external-api")
@@ -1446,6 +1468,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.99":["Catalog scans now publish live progress, and automatic backup queueing only picks up files under explicitly selected include folders or patterns."],
  "0.2.98":["Backuprr now generates a default config file automatically when the configured path does not exist, simplifying fresh Docker deployments."],
  "0.2.97":["Docker Compose setup docs now use a minimal compose file that builds Backuprr directly from GitHub while keeping app settings in the persistent config file."],
  "0.2.96":["The README now has generic Docker Compose setup-from-scratch instructions, including config, permissions, health checks, and upgrade steps."],
@@ -2379,6 +2402,7 @@ function statusDashboard(status, tasks, speed, readiness={}){
   const setup = status.setup_health || {};
   const alerts = status.alerts || [];
   const providerConfidence = status.provider_confidence || [];
+  const scanProgress = status.scan_progress || {};
   const protectedPct = total ? Math.round((backed / total) * 100) : 0;
  const activeTask = tasks.find(task => task.status === "running");
  const nextTask = tasks
@@ -2393,6 +2417,7 @@ function statusDashboard(status, tasks, speed, readiness={}){
    <div>${pushLabel()}</div>
   </div>
    <div class="task-strip">${tasks.map(taskCard).join("")}</div>
+   ${scanProgressPanel(scanProgress, activeTask)}
    ${setupHealthPanel(setup)}
    ${alertsPanel(alerts)}
    ${queueAttentionPanel(attention)}
@@ -2437,6 +2462,23 @@ function statusDashboard(status, tasks, speed, readiness={}){
     ["unchecked", Math.max(0, chunks - verifiedChunks - missingChunks), "warn"]
    ])}
   </div>
+ </div>`;
+}
+function scanProgressPanel(progress, activeTask){
+ if(!progress || !progress.phase) return "";
+ const ageMs = Date.now() - (Number(progress.updated_at || 0) * 1000);
+ const running = activeTask && activeTask.kind === "catalog" && ageMs < 15000 && !progress.finished;
+ if(!running && progress.finished) return "";
+ const files = Number(progress.files_seen || 0);
+ const hashed = Number(progress.hashed || 0);
+ const unchanged = Number(progress.unchanged || 0);
+ const current = progress.current_path ? `<div class="muted">${esc(progress.current_path)}</div>` : "";
+ return `<div class="chart-card">
+  <h3><span class="ui-icon">&#128269;</span>Catalog scan progress</h3>
+  <div>${statePill(running ? progress.phase : "recent")}</div>
+  <div class="muted">${files} files seen / ${hashed} hashed / ${unchanged} unchanged</div>
+  <div class="progress-track"><div class="progress-fill indeterminate" style="width:42%"></div></div>
+  ${current}
  </div>`;
 }
 function providerConfidencePanel(rows){
@@ -3082,7 +3124,7 @@ function treeNode(node, prefix, showDeleted){
   const canRestore = folderChunkCount(node.dirs[name]) > 0;
   const canPrioritize = folderCanPrioritize(node.dirs[name]);
   const ids = collectNodeFiles(node.dirs[name]).map(file => Number(file.id));
-  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row folder-row"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span></span><span class="tree-meta">${countFiles(node.dirs[name])} files / ${formatBytes(node.dirs[name].total_size || 0)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span class="tree-actions">${canPrioritize ? `<button class="icon-btn" title="Increase folder queue priority" onclick="event.preventDefault();boostFolder(${jsString(path)})">&#8593;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
+  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row folder-row"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span></span><span class="tree-meta">${countFiles(node.dirs[name])} files / ${formatBytes(node.dirs[name].total_size || 0)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span class="tree-actions">${canPrioritize ? `<button class="icon-btn" title="Select folder for backup" onclick="event.preventDefault();selectFolderForBackup(${jsString(path)})">&#10003;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
  }).join("");
  const fileHtml = node.files.sort(compareFileRows).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
@@ -3316,9 +3358,10 @@ async function boostFile(fileId){
  if(!out.ok) alert(out.error || "Unable to prioritize file");
  await updateFilesPage();
 }
-async function boostFolder(path){
- const out = await post("/api/folders/priority", { path:path, amount:10 });
+async function selectFolderForBackup(path){
+ const out = await post("/api/folders/select-backup", { path:path, amount:10 });
  if(out.error) alert(out.error);
+ if(out.settings) settingsCache = out.settings;
  await updateFilesPage();
 }
 async function boostSelectedFiles(){
@@ -3507,6 +3550,7 @@ function settingsForm(s){
  </div></div>
  <div id="tabEndpoints" class="tab-panel"><div class="form-grid">
  <label class="field full"><span><span class="ui-icon">&#128193;</span>Endpoints, one path per line</span><textarea id="setEndpoints">${esc((s.endpoints || []).join("\n"))}</textarea></label>
+  <label class="field full"><span><span class="ui-icon">&#10003;</span>Auto-queue include patterns, one per line. Empty means catalog-only until files or folders are selected for backup.</span><textarea id="setAutoQueueIncludePatterns">${esc((s.auto_queue_include_patterns || []).join("\n"))}</textarea></label>
   <label class="field full"><span><span class="ui-icon">&#128683;</span>Auto-queue exclude patterns, one per line. Examples: MP4, .mp4, *.sample, regex:\\.partial$, /Season \\d+/</span><textarea id="setAutoQueueExcludePatterns">${esc((s.auto_queue_exclude_patterns || []).join("\n"))}</textarea></label>
   <label class="field full"><span><span class="ui-icon">&#9208;</span>Queue pause patterns, one per line. Matching files stay cataloged but are not queued automatically.</span><textarea id="setQueuePausePatterns">${esc((s.queue_pause_patterns || []).join("\n"))}</textarea></label>
  </div></div>
@@ -3605,6 +3649,7 @@ const settingsHelpDescriptions = {
  "Restore to sandbox before replacing origin":"Restores into a sandbox before replacing original files. Enable this for safer restores, especially when restoring over existing files.",
  "Restore sandbox path":"Optional folder for restore sandbox output. Leave empty to place the sandbox near the original file, or set a fast/safe scratch disk.",
  "Endpoints, one path per line":"Root folders Backuprr catalogs recursively. Add only stable library roots; each endpoint is scanned and monitored for changes.",
+ "Auto-queue include patterns, one per line. Empty means catalog-only until files or folders are selected for backup.":"Controls which cataloged files may be queued automatically. Leave empty for catalog-only scanning; selecting a folder in Files adds a regex include for that folder so current and future files below it can be backed up.",
  "Auto-queue exclude patterns, one per line. Examples: MP4, .mp4, *.sample, regex:\\.partial$, /Season \\d+/":"Catalogs matching files but prevents automatic queueing. Use for temporary, sample, cache, or file types you do not want posted.",
  "Queue pause patterns, one per line. Matching files stay cataloged but are not queued automatically.":"Temporarily holds matching files out of the automatic queue without excluding them from the catalog.",
  "Usenet hosts":"Read and post providers used for backup, verification, and restore. Add separate entries for read and post endpoints when the provider uses different hosts.",
@@ -3681,6 +3726,7 @@ const settingsHelpDefaults = {
  "Restore drill interval days":"30",
  "Restore drill sample bytes":"1048576",
  "Critical verification interval days":"30",
+ "Auto-queue include patterns, one per line. Empty means catalog-only until files or folders are selected for backup.":"Empty, catalog-only",
  "Local log retention days":"30",
  "Verbose log retention days":"7",
  "Web UI username":"admin",
@@ -4015,6 +4061,7 @@ async function saveSettings(){
   encrypt_bodies: setEncrypt.checked,
   encryption_passphrase_env: setPassEnv.value,
   endpoints: setEndpoints.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
+  auto_queue_include_patterns: setAutoQueueIncludePatterns.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   auto_queue_exclude_patterns: setAutoQueueExcludePatterns.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   queue_pause_patterns: setQueuePausePatterns.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   usenet_hosts: collectHosts(),

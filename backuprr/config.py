@@ -173,6 +173,7 @@ class Config:
     compression_sample_bytes: int = 2 * 1024 * 1024
     compression_min_gain_percent: int = 5
     queue_strategy: str = "older-first"
+    auto_queue_include_patterns: List[str] = field(default_factory=list)
     auto_queue_exclude_patterns: List[str] = field(default_factory=list)
     queue_pause_patterns: List[str] = field(default_factory=list)
     retention_policy_patterns: List[str] = field(default_factory=list)
@@ -291,6 +292,7 @@ class Config:
             "compression_sample_bytes": self.compression_sample_bytes,
             "compression_min_gain_percent": self.compression_min_gain_percent,
             "queue_strategy": self.queue_strategy,
+            "auto_queue_include_patterns": self.auto_queue_include_patterns,
             "auto_queue_exclude_patterns": self.auto_queue_exclude_patterns,
             "queue_pause_patterns": self.queue_pause_patterns,
             "retention_policy_patterns": self.retention_policy_patterns,
@@ -484,6 +486,8 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         if strategy not in {"older-first", "larger-first", "smaller-first", "folder-first"}:
             raise ValueError("queue_strategy must be older-first, larger-first, smaller-first, or folder-first")
         config.queue_strategy = strategy
+    if "auto_queue_include_patterns" in data:
+        config.auto_queue_include_patterns = [str(item).strip() for item in data["auto_queue_include_patterns"] if str(item).strip()]
     if "auto_queue_exclude_patterns" in data:
         config.auto_queue_exclude_patterns = [str(item).strip() for item in data["auto_queue_exclude_patterns"] if str(item).strip()]
     if "queue_pause_patterns" in data:
