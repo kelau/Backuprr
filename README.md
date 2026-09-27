@@ -186,17 +186,27 @@ different application directory.
    latest `main` branch, or replace it with a tag or commit archive URL when you
    want repeatable upgrades.
 
+   If the GitHub repository is private, the Docker builder cannot download the
+   archive anonymously and GitHub will return `404`. Create a fine-grained
+   GitHub token with read-only Contents access to this repository, then define
+   `GITHUB_TOKEN` in Dockhand/Portainer/the shell before deploying. If the
+   repository is public, you can remove the `args` line and use the unauthenticated
+   archive URL in the `RUN` command.
+
 ```yaml
 services:
   backuprr:
     image: backuprr:github
     build:
       context: .
+      args:
+        GITHUB_TOKEN: ${GITHUB_TOKEN:?GitHub token with read access is required while this repository is private}
       dockerfile_inline: |
         FROM python:3.12-slim
+        ARG GITHUB_TOKEN
         ENV PYTHONDONTWRITEBYTECODE=1 \
             PYTHONUNBUFFERED=1
-        RUN pip install --no-cache-dir https://github.com/kelau/Backuprr/archive/refs/heads/main.zip \
+        RUN pip install --no-cache-dir "https://x-access-token:$${GITHUB_TOKEN}@github.com/kelau/Backuprr/archive/refs/heads/main.zip" \
             && useradd --system --uid 10001 --home-dir /app backuprr \
             && mkdir -p /app /data /media \
             && chown -R backuprr:backuprr /app /data /media
