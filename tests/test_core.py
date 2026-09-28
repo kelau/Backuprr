@@ -199,7 +199,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.99")
+        self.assertEqual(__version__, "0.2.100")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -1218,6 +1218,11 @@ class CoreTests(unittest.TestCase):
         payload = self.root / "payload.iso"
         args = par2_create_args("C:/Program Files (x86)/MultiPar/par2j.exe", payload, "10")
         self.assertEqual(args, ["C:/Program Files (x86)/MultiPar/par2j.exe", "c", "/rr10", "/uo", str(payload.with_name("payload.iso.par2")), str(payload)])
+
+    def test_par2_create_args_support_par2create_binary(self):
+        payload = self.root / "payload.iso"
+        args = par2_create_args("/usr/bin/par2create", payload, "10")
+        self.assertEqual(args, ["/usr/bin/par2create", "-r10", str(payload.with_name("payload.iso.par2")), str(payload)])
 
     def test_resolve_par2_command_uses_bundled_candidate(self):
         bundled = self.root / "bin" / "par2.exe"

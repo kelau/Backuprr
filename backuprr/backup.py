@@ -248,6 +248,8 @@ def par2_create_args(command: str, payload: Path, redundancy: str) -> list[str]:
     par_file = payload.with_name(f"{payload.name}.par2")
     if exe in {"par2j.exe", "par2j64.exe"}:
         return [command, "c", f"/rr{redundancy}", "/uo", str(par_file), str(payload)]
+    if exe in {"par2create", "par2create.exe"}:
+        return [command, f"-r{redundancy}", str(par_file), str(payload)]
     return [command, "create", f"-r{redundancy}", str(par_file), str(payload)]
 
 

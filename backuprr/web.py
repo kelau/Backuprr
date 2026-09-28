@@ -1468,6 +1468,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.100":["Docker Compose installs PAR2 tooling in the image, and Backuprr now invokes par2create-compatible binaries without the extra par2 wrapper subcommand."],
  "0.2.99":["Catalog scans now publish live progress, and automatic backup queueing only picks up files under explicitly selected include folders or patterns."],
  "0.2.98":["Backuprr now generates a default config file automatically when the configured path does not exist, simplifying fresh Docker deployments."],
  "0.2.97":["Docker Compose setup docs now use a minimal compose file that builds Backuprr directly from GitHub while keeping app settings in the persistent config file."],

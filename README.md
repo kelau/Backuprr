@@ -206,7 +206,10 @@ services:
         ARG GITHUB_TOKEN
         ENV PYTHONDONTWRITEBYTECODE=1 \
             PYTHONUNBUFFERED=1
-        RUN pip install --no-cache-dir "https://x-access-token:$${GITHUB_TOKEN}@github.com/kelau/Backuprr/archive/refs/heads/main.zip" \
+        RUN apt-get update \
+            && (apt-get install -y --no-install-recommends par2cmdline || apt-get install -y --no-install-recommends par2) \
+            && rm -rf /var/lib/apt/lists/* \
+            && pip install --no-cache-dir "https://x-access-token:$${GITHUB_TOKEN}@github.com/kelau/Backuprr/archive/refs/heads/main.zip" \
             && useradd --system --uid 10001 --home-dir /app backuprr \
             && mkdir -p /app /data /media \
             && chown -R backuprr:backuprr /app /data /media
