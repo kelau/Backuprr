@@ -586,6 +586,23 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(self.db.speed_samples(int(query.get("minutes", ["30"])[0]), int(query.get("bucket", ["60"])[0])))
         elif parsed.path == "/api/events/stream":
             self.stream_changes()
+        elif parsed.path == "/api/files/tree":
+            search = query.get("q", [""])[0]
+            include_deleted = query.get("include_deleted", ["0"])[0] in {"1", "true", "yes"}
+            unbacked_only = query.get("unbacked", ["0"])[0] in {"1", "true", "yes"}
+            sort_by = query.get("sort", ["relative_path"])[0]
+            sort_dir = query.get("dir", ["asc"])[0]
+            folder = query.get("folder", [""])[0]
+            self.send_json(self.db.folder_children(folder, search, include_deleted, unbacked_only, sort_by, sort_dir))
+        elif parsed.path == "/api/files/folder-ids":
+            search = query.get("q", [""])[0]
+            include_deleted = query.get("include_deleted", ["0"])[0] in {"1", "true", "yes"}
+            unbacked_only = query.get("unbacked", ["0"])[0] in {"1", "true", "yes"}
+            folder = query.get("folder", [""])[0]
+            self.send_json({"folder": folder, "file_ids": self.db.file_ids_for_folder(folder, include_deleted, unbacked_only, search)})
+        elif parsed.path == "/api/files/rows":
+            ids = [int(item) for item in query.get("ids", [""])[0].split(",") if item.strip().isdigit()]
+            self.send_json({"rows": rowdicts(self.db.file_rows_by_ids(ids)), "total": len(ids)})
         elif parsed.path == "/api/files":
             search = query.get("q", [""])[0]
             include_deleted = query.get("include_deleted", ["0"])[0] in {"1", "true", "yes"}
@@ -1424,6 +1441,9 @@ let settingsCache = null;
 let fileRowsCache = [];
 let filesTreeSignature = "";
 let filesOpenFolders = new Set();
+let filesFolderCache = new Map();
+let filesFilterSignature = "";
+let filesLoadedFolders = new Set();
 let operationRowsCache = [];
 let verificationRowsCache = new Map();
 let verificationTableCache = {};
@@ -1431,6 +1451,7 @@ let verificationRefreshSeq = 0;
 let verificationRefreshRunning = false;
 let verificationProgressFetchedAt = 0;
 let apiRateLimitedUntil = 0;
+let performanceSamples = [];
 let healthBarFetchedAt = 0;
 let renderSeq = 0;
 let appVersion = "";
@@ -1475,6 +1496,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.106":["Files now loads folders incrementally, patches visible rows during live progress updates, adds UI timing samples, and creates indexes for large-library queries."],
  "0.2.105":["Catalog scans now record new files immediately without hashing content; file hashes are calculated later when a selected file is backed up."],
  "0.2.104":["Files no longer emits invalid summary markup and now renders folded folders lazily so large file browsers stay responsive."],
  "0.2.103":["Files now behaves like a true file browser without pagination, and Docker installs create a par2 compatibility command when only par2create is available."],
@@ -1522,8 +1544,10 @@ async function api(url, opts={}){
  }
  const headers = {"Content-Type":"application/json","X-Backuprr-Internal-Token":internalApiToken,"X-Backuprr-CSRF":csrfToken, ...(opts.headers || {})};
  if(cachedTotpCode) headers["X-Backuprr-TOTP"] = cachedTotpCode;
+ const startedAt = Date.now();
  let response = await fetch(url, {...opts, headers});
  let data = await response.json();
+ recordPerformanceSample("api", url, Date.now() - startedAt, data);
  if(response.status === 429){
   apiRateLimitedUntil = Date.now() + 2000;
   return {...data, rate_limited:true};
@@ -1532,8 +1556,10 @@ async function api(url, opts={}){
   cachedTotpCode = prompt("Admin action requires a 6-digit TOTP code") || "";
   if(cachedTotpCode){
    headers["X-Backuprr-TOTP"] = cachedTotpCode;
+   const retryStartedAt = Date.now();
    response = await fetch(url, {...opts, headers});
    data = await response.json();
+   recordPerformanceSample("api", `${url} retry`, Date.now() - retryStartedAt, data);
    if(response.status === 429){
     apiRateLimitedUntil = Date.now() + 2000;
     return {...data, rate_limited:true};
@@ -1543,6 +1569,12 @@ async function api(url, opts={}){
  return data;
 }
 const post = (url, body={}) => api(url, {method:"POST", body:JSON.stringify(body)});
+function recordPerformanceSample(kind, name, durationMs, data=null){
+ const sample = { kind, name, durationMs:Number(durationMs || 0), at:new Date().toISOString(), rows:Array.isArray(data?.rows) ? data.rows.length : undefined, total:data?.total };
+ performanceSamples.push(sample);
+ performanceSamples = performanceSamples.slice(-40);
+ if(sample.durationMs >= 500) console.debug("Backuprr slow operation", sample);
+}
 function esc(v){ return String(v ?? "").replace(/[&<>"']/g, s => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[s])); }
 function jsString(v){ return JSON.stringify(String(v ?? "")).replace(/</g, "\\u003c"); }
 function setCookie(name, value, maxAgeDays=365){
@@ -2005,7 +2037,8 @@ async function refreshPageForChanges(previous, token){
  const tasksChanged = previous.task_revision !== token.task_revision;
  const operationsChanged = previous.operation_revision !== token.operation_revision;
  if(page==="Status" && (filesChanged || queueChanged || chunksChanged || tasksChanged || transferChanged || operationsChanged)) await updateStatusPage();
- if(page==="Files" && (filesChanged || queueChanged || transferChanged || operationsChanged)) await updateFilesPage();
+ if(page==="Files" && filesChanged) await updateFilesPage();
+ else if(page==="Files" && (queueChanged || transferChanged || operationsChanged)) await updateVisibleFileRows();
  if(page==="Log" && eventsChanged) await updateLogPage({incremental:true});
  if(page==="Queue" && (queueChanged || filesChanged || transferChanged)) await updateQueuePage();
  if(page==="Tasks" && (eventsChanged || tasksChanged)) await updateTasksPage();
@@ -2081,23 +2114,33 @@ function dismissVersionNotice(){
  if(target) target.innerHTML = "";
 }
 async function updateFilesPage(options={}){
+ const renderStartedAt = Date.now();
  await refreshOperationProgress();
  if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Files")) return;
  const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
  const unbacked = !!document.getElementById("showUnbackedOnly")?.checked;
  const q = document.getElementById("filesSearch")?.value || "";
- const result = await api(`/api/files?all=1&include_deleted=${showDeleted ? 1 : 0}&unbacked=${unbacked ? 1 : 0}&q=${encodeURIComponent(q)}${sortQuery("files")}`);
+ const filterSignature = JSON.stringify({showDeleted, unbacked, q, sort:tableSorts.files || {}});
+ if(filterSignature !== filesFilterSignature){
+  filesFolderCache = new Map();
+  filesLoadedFolders = new Set();
+  filesTreeSignature = "";
+  filesFilterSignature = filterSignature;
+ }
+ const foldersToLoad = new Set(["", ...Array.from(filesOpenFolders)]);
+ for(const folder of foldersToLoad){
+  await loadFilesFolder(folder, {showDeleted, unbacked, q});
+ }
  if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Files")) return;
- const valid = validPagedResult(result);
- if(valid) fileRowsCache = result.rows || [];
+ fileRowsCache = visibleFileRows();
  for(const row of fileRowsCache){
   if(selectedFiles.has(Number(row.id))) selectedFileData.set(Number(row.id), row);
  }
  const target = document.getElementById("filesTree");
  if(target){
-  const filesResult = valid ? result : {rows:fileRowsCache, total:fileRowsCache.length};
-  const nextSignature = filesTreeStructureSignature(fileRowsCache, filesResult, showDeleted);
-  const nextHtml = holdTableMessage(valid ? filesResult : (fileRowsCache.length ? filesResult : null)) + fileTree(fileRowsCache, showDeleted);
+  const rootResult = filesFolderCache.get("") || {files:[], folders:[], total:fileRowsCache.length};
+  const nextSignature = filesTreeStructureSignature(rootResult, showDeleted);
+  const nextHtml = holdTableMessage(rootResult) + fileTree(rootResult, showDeleted);
   if(!target.querySelector(".tree") || filesTreeSignature !== nextSignature){
    target.innerHTML = nextHtml;
    filesTreeSignature = nextSignature;
@@ -2107,36 +2150,79 @@ async function updateFilesPage(options={}){
   updateFolderCheckboxStates();
   updateFilesSelectionSummary();
  }
+ recordPerformanceSample("render", "Files", Date.now() - renderStartedAt, {rows:fileRowsCache, total:(filesFolderCache.get("") || {}).total});
 }
 function renderFilesTreeFromCache(){
  const target = document.getElementById("filesTree");
  if(!target) return;
  const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
- const result = {rows:fileRowsCache, total:fileRowsCache.length};
- target.innerHTML = holdTableMessage(result) + fileTree(fileRowsCache, showDeleted);
- filesTreeSignature = filesTreeStructureSignature(fileRowsCache, result, showDeleted);
+ fileRowsCache = visibleFileRows();
+ const result = filesFolderCache.get("") || {files:[], folders:[], total:fileRowsCache.length};
+ target.innerHTML = holdTableMessage(result) + fileTree(result, showDeleted);
+ filesTreeSignature = filesTreeStructureSignature(result, showDeleted);
  updateFolderCheckboxStates();
  updateFilesSelectionSummary();
 }
-function toggleFolderOpen(path){
+async function toggleFolderOpen(path){
  const key = String(path || "");
  if(!key) return;
- if(filesOpenFolders.has(key)) filesOpenFolders.delete(key);
- else filesOpenFolders.add(key);
+ if(filesOpenFolders.has(key)){
+  filesOpenFolders.delete(key);
+ } else {
+  filesOpenFolders.add(key);
+  const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
+  const unbacked = !!document.getElementById("showUnbackedOnly")?.checked;
+  const q = document.getElementById("filesSearch")?.value || "";
+  await loadFilesFolder(key, {showDeleted, unbacked, q});
+ }
  renderFilesTreeFromCache();
 }
-function filesTreeStructureSignature(rows, result, showDeleted){
- const folders = new Set();
- for(const row of rows){
-  const parts = String(row.relative_path || row.path || "").split(/[\\/]+/).filter(Boolean);
-  for(let index=1; index<parts.length; index++) folders.add(parts.slice(0, index).join("/"));
+async function loadFilesFolder(folder, filters){
+ const key = String(folder || "");
+ const q = filters.q || "";
+ const result = await api(`/api/files/tree?folder=${encodeURIComponent(key)}&include_deleted=${filters.showDeleted ? 1 : 0}&unbacked=${filters.unbacked ? 1 : 0}&q=${encodeURIComponent(q)}${sortQuery("files")}`);
+ if(result && !result.error){
+  filesFolderCache.set(key, result);
+  filesLoadedFolders.add(key);
+ }
+ return result;
+}
+function visibleFileRows(){
+ const rows = [];
+ const seen = new Set();
+ for(const result of filesFolderCache.values()){
+  for(const row of result.files || []){
+   const id = Number(row.id);
+   if(!seen.has(id)){
+    seen.add(id);
+    rows.push(row);
+   }
+  }
+ }
+ return rows;
+}
+async function updateVisibleFileRows(){
+ const ids = visibleFileRows().map(row => Number(row.id)).filter(Boolean);
+ if(!ids.length) return;
+ const result = await api(`/api/files/rows?ids=${encodeURIComponent(ids.join(","))}`);
+ if(!result || result.error || !Array.isArray(result.rows)) return;
+ const byId = new Map(result.rows.map(row => [Number(row.id), row]));
+ for(const [folder, payload] of filesFolderCache.entries()){
+  const files = (payload.files || []).map(row => byId.get(Number(row.id)) || row);
+  filesFolderCache.set(folder, {...payload, files});
+ }
+ renderFilesTreeFromCache();
+}
+function filesTreeStructureSignature(result, showDeleted){
+ const folderParts = [];
+ for(const [path, payload] of filesFolderCache.entries()){
+  folderParts.push([path, (payload.folders || []).map(row => [row.path, row.files, row.size, row.updated_at]), (payload.files || []).map(row => [Number(row.id), row.relative_path || row.path || "", row.state, row.queue_status, row.progress_chunks, row.progress_bytes, row.last_verify_at])]);
  }
  return JSON.stringify({
-  total:Number(result.total || rows.length),
+  total:Number(result.total || 0),
   deleted:!!showDeleted,
   sort:tableSorts.files || {},
-  folders:Array.from(folders).sort(),
-  files:rows.map(row => [Number(row.id), row.relative_path || row.path || "", row.state === "deleted"]).sort((a,b)=>String(a[1]).localeCompare(String(b[1]))),
+  folders:folderParts.sort((a,b)=>String(a[0]).localeCompare(String(b[0]))),
   open:Array.from(filesOpenFolders).sort()
  });
 }
@@ -3196,38 +3282,26 @@ async function updateLogPage(options={}){
  updateLogFilterLabels();
 }
 async function loadLog(){ await updateLogPage(); }
-function fileTree(rows, showDeleted=false){
- const root = { dirs:{}, files:[] };
- for(const row of rows.filter(row => showDeleted || row.state !== "deleted")){
-  const parts = String(row.relative_path || row.path || "").split(/[\\/]+/).filter(Boolean);
-  let node = root;
-  node.total_size = (node.total_size || 0) + Number(row.size || 0);
-  for(const part of parts.slice(0, -1)){
-   node.dirs[part] = node.dirs[part] || { dirs:{}, files:[], total_size:0 };
-   node = node.dirs[part];
-   node.total_size = (node.total_size || 0) + Number(row.size || 0);
-  }
-  node.files.push({...row, display_name: parts[parts.length - 1] || row.path});
- }
- return `<div class="tree"><div class="tree-header"><span><input id="selectAllFiles" type="checkbox" title="Select all visible files" onchange="toggleSelectAllFiles(this.checked)"></span><span></span>${fileSortHeader("relative_path", "Name")}${fileSortHeader("progress", "Progress")}${fileSortHeader("size", "Size")}${fileSortHeader("state", "State")}${fileSortHeader("last_verify_at", "Verification")}<span>Actions</span></div><ul>${treeNode(root, "", showDeleted)}</ul></div>`;
+function fileTree(result, showDeleted=false){
+ return `<div class="tree"><div class="tree-header"><span><input id="selectAllFiles" type="checkbox" title="Select visible loaded files" onchange="toggleSelectAllFiles(this.checked)"></span><span></span>${fileSortHeader("relative_path", "Name")}${fileSortHeader("progress", "Progress")}${fileSortHeader("size", "Size")}${fileSortHeader("state", "State")}${fileSortHeader("last_verify_at", "Verification")}<span>Actions</span></div><ul>${treeNode(result || {folders:[], files:[]})}</ul></div>`;
 }
 function fileSortHeader(col, label){
  const sort = tableSorts.files || {};
  const cls = sort.col === col ? ` sort-${sort.dir === "desc" ? "desc" : "asc"}` : "";
  return `<span class="tree-sort${cls}"><button class="sort-header" type="button" onclick="${esc(`sortFilesBy(${jsString(col)})`)}">${esc(label)}</button></span>`;
 }
-function treeNode(node, prefix, showDeleted){
- const dirs = Object.keys(node.dirs).sort((a,b)=>a.localeCompare(b));
- const dirHtml = dirs.map(name => {
-  const path = prefix ? prefix+"/"+name : name;
+function treeNode(result){
+ const dirHtml = (result.folders || []).map(folder => {
+  const path = String(folder.path || folder.name || "");
   const open = filesOpenFolders.has(path);
-  const state = folderState(node.dirs[name]);
-  const canRestore = folderChunkCount(node.dirs[name]) > 0;
-  const canPrioritize = folderCanPrioritize(node.dirs[name]);
-  const ids = collectNodeFiles(node.dirs[name]).map(file => Number(file.id));
-  return `<li class="folder ${open ? "open" : ""}" data-folder-path="${esc(path)}"><div class="tree-row folder-row" data-folder-row-path="${esc(path)}"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="selectFolderFiles(this.dataset.fileIds, this.checked)"><button class="icon-btn folder-toggle" type="button" title="${open ? "Collapse folder" : "Expand folder"}" data-path="${esc(path)}" onclick="toggleFolderOpen(this.dataset.path)">&#9654;</button><span class="tree-name"><span class="ui-icon">&#128193;</span>${esc(name)}</span><span></span><span class="tree-meta">${countFiles(node.dirs[name])} files / ${formatBytes(node.dirs[name].total_size || 0)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span class="tree-actions">${canPrioritize ? `<button class="icon-btn" title="Select folder for backup" data-path="${esc(path)}" onclick="selectFolderForBackup(this.dataset.path)">&#10003;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></div><ul>${open ? treeNode(node.dirs[name], path, showDeleted) : ""}</ul></li>`;
+  const childResult = filesFolderCache.get(path) || {folders:[], files:[]};
+  const state = folderStateFromRollup(folder);
+  const canRestore = Number(folder.restorable_files || 0) > 0;
+  const canPrioritize = Number(folder.unbacked_files || 0) > 0;
+  const loaded = filesLoadedFolders.has(path);
+  return `<li class="folder ${open ? "open" : ""}" data-folder-path="${esc(path)}"><div class="tree-row folder-row" data-folder-row-path="${esc(path)}"><input type="checkbox" class="folderSelect" data-folder-path="${esc(path)}" onchange="selectFolderFiles(this.dataset.folderPath, this.checked)"><button class="icon-btn folder-toggle" type="button" title="${open ? "Collapse folder" : "Expand folder"}" data-path="${esc(path)}" onclick="toggleFolderOpen(this.dataset.path)">&#9654;</button><span class="tree-name"><span class="ui-icon">&#128193;</span>${esc(folder.name || path)}</span><span></span><span class="tree-meta">${Number(folder.files || 0)} files / ${formatBytes(folder.size || 0)}${open && !loaded ? "<small>Loading...</small>" : ""}</span>${statePill(state)}${folderVerifiedPill(folder)}<span class="tree-actions">${canPrioritize ? `<button class="icon-btn" title="Select folder for backup" data-path="${esc(path)}" onclick="selectFolderForBackup(this.dataset.path)">&#10003;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></div><ul>${open ? treeNode(childResult) : ""}</ul></li>`;
  }).join("");
- const fileHtml = node.files.sort(compareFileRows).map(file => fileRow(file)).join("");
+ const fileHtml = (result.files || []).sort(compareFileRows).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
 }
 function compareFileRows(a, b){
@@ -3249,35 +3323,23 @@ function fileSortValue(file, col){
  if(col === "name") return file.display_name || file.relative_path || file.path || "";
  return file[col] ?? "";
 }
-function countFiles(node){
- return node.files.length + Object.values(node.dirs).reduce((total, child) => total + countFiles(child), 0);
-}
-function folderChunkCount(node){
- return node.files.reduce((total, file) => total + Number(file.chunk_count || 0), 0) + Object.values(node.dirs).reduce((total, child) => total + folderChunkCount(child), 0);
-}
-function folderState(node){
- const files = collectNodeFiles(node).filter(file => file.state !== "deleted");
- if(!files.length) return "empty";
- if(files.every(file => file.state === "backed_up")) return "backed_up";
- if(files.some(file => ["failed","missing_chunks"].includes(file.state))) return "missing_chunks";
- if(files.some(file => ["queued","posting"].includes(file.state))) return "queued";
+function folderStateFromRollup(folder){
+ const files = Number(folder.files || 0);
+ if(!files) return "empty";
+ if(Number(folder.failed_files || 0) > 0 || Number(folder.missing_chunks || 0) > 0) return "missing_chunks";
+ if(Number(folder.queued_files || 0) > 0) return "queued";
+ if(Number(folder.backed_up_files || 0) === files) return "backed_up";
  return "discovered";
 }
-function folderCanPrioritize(node){
- return collectNodeFiles(node).filter(file => file.state !== "deleted").some(file => file.state !== "backed_up");
-}
-function folderVerifiedPill(node){
- const files = collectNodeFiles(node).filter(file => file.state !== "deleted" && Number(file.chunk_count || 0) > 0);
- if(!files.length) return `<span class="pill warn" title="No chunk records"><span class="ui-icon">&#128230;</span>No chunks</span>`;
- const missing = files.filter(file => Number(file.missing_chunks || 0) > 0).length;
- if(missing) return `<span class="pill bad" title="${missing} file(s) have missing chunks"><span class="ui-icon">&#9888;</span>Missing</span>`;
- const verified = files.filter(file => file.last_verify_at).length;
- if(verified === files.length) return `<span class="pill ok" title="All files in this folder have been verified"><span class="ui-icon">&#10003;</span>Verified</span>`;
- if(verified > 0) return `<span class="pill warn" title="${verified} of ${files.length} restorable files verified"><span class="ui-icon">&#128269;</span>${verified}/${files.length}</span>`;
+function folderVerifiedPill(folder){
+ const files = Number(folder.restorable_files || 0);
+ if(!files) return `<span class="pill warn" title="No chunk records"><span class="ui-icon">&#128230;</span>No chunks</span>`;
+ const missing = Number(folder.missing_chunks || 0);
+ if(missing) return `<span class="pill bad" title="${missing} missing chunk(s) in this folder"><span class="ui-icon">&#9888;</span>Missing</span>`;
+ const verified = Number(folder.verified_files || 0);
+ if(verified === files) return `<span class="pill ok" title="All restorable files in this folder have been verified"><span class="ui-icon">&#10003;</span>Verified</span>`;
+ if(verified > 0) return `<span class="pill warn" title="${verified} of ${files} restorable files verified"><span class="ui-icon">&#128269;</span>${verified}/${files}</span>`;
  return `<span class="pill warn" title="Files have chunks but have not been verified yet"><span class="ui-icon">&#128269;</span>Unverified</span>`;
-}
-function collectNodeFiles(node){
- return node.files.concat(...Object.values(node.dirs).map(child => collectNodeFiles(child)));
 }
 function fileRow(file){
  const canQueue = !["backed_up", "deleted", "posting", "queued"].includes(file.state);
@@ -3394,8 +3456,12 @@ function setFileSelected(fileId, checked){
  updateFolderCheckboxStates();
  updateFilesSelectionSummary();
 }
-function selectFolderFiles(idList, checked){
- const ids = String(idList || "").split(",").map(Number).filter(Boolean);
+async function selectFolderFiles(folderPath, checked){
+ const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
+ const unbacked = !!document.getElementById("showUnbackedOnly")?.checked;
+ const q = document.getElementById("filesSearch")?.value || "";
+ const result = await api(`/api/files/folder-ids?folder=${encodeURIComponent(String(folderPath || ""))}&include_deleted=${showDeleted ? 1 : 0}&unbacked=${unbacked ? 1 : 0}&q=${encodeURIComponent(q)}`);
+ const ids = (result.file_ids || []).map(Number).filter(Boolean);
  for(const id of ids){
   if(checked){
    selectedFiles.add(id);
@@ -3406,7 +3472,8 @@ function selectFolderFiles(idList, checked){
    selectedFileData.delete(id);
   }
  }
- updateFilesPage();
+ updateFolderCheckboxStates();
+ updateFilesSelectionSummary();
 }
 function toggleSelectAllFiles(checked){
  for(const row of fileRowsCache){
@@ -3423,7 +3490,12 @@ function toggleSelectAllFiles(checked){
 }
 function updateFolderCheckboxStates(){
  document.querySelectorAll(".folderSelect").forEach(box => {
-  const ids = String(box.dataset.fileIds || "").split(",").map(Number).filter(Boolean);
+  const folderPath = String(box.dataset.folderPath || "");
+  const prefix = folderPath ? `${folderPath}/` : "";
+  const ids = fileRowsCache
+   .filter(row => String(row.relative_path || "").replace(/\\/g, "/").startsWith(prefix))
+   .map(row => Number(row.id))
+   .filter(Boolean);
   const selected = ids.filter(id => selectedFiles.has(id)).length;
   box.checked = ids.length > 0 && selected === ids.length;
   box.indeterminate = selected > 0 && selected < ids.length;

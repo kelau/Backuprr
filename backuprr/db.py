@@ -17,6 +17,10 @@ def utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+def normalize_folder_path(folder: str) -> str:
+    return str(folder or "").replace("\\", "/").strip("/")
+
+
 class Database:
     def __init__(self, path: Path, event_forwarder: Optional[Callable[[Dict[str, Any]], None]] = None):
         self.path = Path(path)
@@ -45,6 +49,7 @@ class Database:
             conn.execute("PRAGMA synchronous = NORMAL")
             conn.executescript(SCHEMA)
             self._migrate(conn)
+            self._create_indexes(conn)
             conn.execute(
                 "INSERT OR REPLACE INTO app_meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -82,6 +87,21 @@ class Database:
         if "backup_par2" not in file_columns:
             conn.execute("ALTER TABLE files ADD COLUMN backup_par2 INTEGER NOT NULL DEFAULT 0")
         self._create_operational_tables(conn)
+        self._create_indexes(conn)
+
+    def _create_indexes(self, conn: sqlite3.Connection) -> None:
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_files_endpoint_relative_path ON files(endpoint_id, relative_path);
+            CREATE INDEX IF NOT EXISTS idx_files_state_relative_path ON files(state, relative_path);
+            CREATE INDEX IF NOT EXISTS idx_files_endpoint_size_mtime ON files(endpoint_id, size, mtime_ns);
+            CREATE INDEX IF NOT EXISTS idx_files_updated_at ON files(updated_at);
+            CREATE INDEX IF NOT EXISTS idx_queue_status_updated_at ON queue(status, updated_at);
+            CREATE INDEX IF NOT EXISTS idx_queue_file_status ON queue(file_id, status);
+            CREATE INDEX IF NOT EXISTS idx_events_id_level_type ON events(id, level, event_type);
+            CREATE INDEX IF NOT EXISTS idx_chunks_file_status ON chunks(file_id, status);
+            """
+        )
 
     def _create_operational_tables(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -1558,6 +1578,33 @@ class Database:
                 (*params, limit, offset),
             ).fetchall()
 
+    def file_rows_by_ids(self, file_ids: Iterable[int]) -> List[sqlite3.Row]:
+        ids = [int(file_id) for file_id in file_ids if int(file_id) > 0]
+        if not ids:
+            return []
+        placeholders = ",".join("?" for _ in ids)
+        with self.connect() as conn:
+            return conn.execute(
+                f"""
+                SELECT f.*,
+                       COUNT(c.id) + COALESCE(cm.chunk_count, 0) AS chunk_count,
+                       COALESCE(SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END), 0) + COALESCE(cm.verified_count, 0) AS verified_chunks,
+                       COALESCE(SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END), 0) + COALESCE(cm.missing_count, 0) AS missing_chunks,
+                       COALESCE(SUM(c.size), 0) + COALESCE(cm.bytes_total, 0) AS chunk_bytes,
+                       q.status AS queue_status,
+                       q.progress_chunks AS progress_chunks,
+                       q.progress_bytes AS progress_bytes
+                FROM files f
+                LEFT JOIN chunks c ON c.file_id = f.id
+                LEFT JOIN chunk_manifests cm ON cm.file_id = f.id
+                LEFT JOIN queue q ON q.file_id = f.id
+                WHERE f.id IN ({placeholders})
+                GROUP BY f.id
+                ORDER BY f.relative_path ASC
+                """,
+                ids,
+            ).fetchall()
+
     def file_by_id(self, file_id: int) -> sqlite3.Row:
         with self.connect() as conn:
             row = conn.execute("SELECT * FROM files WHERE id=?", (file_id,)).fetchone()
@@ -1578,6 +1625,144 @@ class Database:
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.connect() as conn:
             return int(conn.execute(f"SELECT COUNT(*) FROM files {where}", params).fetchone()[0])
+
+    def folder_children(
+        self,
+        folder: str = "",
+        search: str = "",
+        include_deleted: bool = False,
+        unbacked_only: bool = False,
+        sort_by: str = "relative_path",
+        sort_dir: str = "asc",
+    ) -> Dict[str, Any]:
+        folder = normalize_folder_path(folder)
+        clauses = []
+        params: List[Any] = []
+        if not include_deleted:
+            clauses.append("f.state != 'deleted'")
+        if unbacked_only:
+            clauses.append("f.state != 'backed_up'")
+        if search:
+            clauses.append("(f.path LIKE ? OR f.relative_path LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        if folder:
+            clauses.append("replace(f.relative_path, '\\', '/') LIKE ?")
+            params.append(f"{folder}/%")
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        norm_expr = "replace(f.relative_path, '\\', '/')"
+        remainder_expr = f"substr({norm_expr}, ?)"
+        remainder_start = len(folder) + 2 if folder else 1
+        file_sort_columns = {
+            "id": "f.id",
+            "path": "f.path",
+            "relative_path": "f.relative_path",
+            "name": "display_name",
+            "size": "f.size",
+            "state": "f.state",
+            "verification": "f.last_verify_at",
+            "last_verify_at": "f.last_verify_at",
+            "last_backup_at": "f.last_backup_at",
+            "updated_at": "f.updated_at",
+            "chunk_count": "chunk_count",
+            "progress": "q.progress_chunks",
+        }
+        direction = "DESC" if str(sort_dir).lower() == "desc" else "ASC"
+        order_expr = file_sort_columns.get(sort_by, "display_name")
+        folder_params = [remainder_start, *params]
+        file_params = [remainder_start, *params]
+        with self.connect() as conn:
+            folders = conn.execute(
+                f"""
+                WITH scoped AS (
+                  SELECT f.*,
+                         COALESCE(cm.chunk_count, 0) AS manifest_chunk_count,
+                         COALESCE(cm.missing_count, 0) AS manifest_missing_count,
+                         {remainder_expr} AS remainder
+                  FROM files f
+                  LEFT JOIN chunk_manifests cm ON cm.file_id = f.id
+                  {where}
+                ),
+                children AS (
+                  SELECT *,
+                         CASE
+                           WHEN instr(remainder, '/') > 0 THEN substr(remainder, 1, instr(remainder, '/') - 1)
+                           ELSE ''
+                         END AS child
+                  FROM scoped
+                )
+                SELECT child AS name,
+                       CASE WHEN ? = '' THEN child ELSE ? || '/' || child END AS path,
+                       COUNT(*) AS files,
+                       COALESCE(SUM(size), 0) AS size,
+                       SUM(CASE WHEN state='backed_up' THEN 1 ELSE 0 END) AS backed_up_files,
+                       SUM(CASE WHEN state IN ('queued','posting') THEN 1 ELSE 0 END) AS queued_files,
+                       SUM(CASE WHEN state IN ('failed','missing_chunks','unreadable') THEN 1 ELSE 0 END) AS failed_files,
+                       SUM(CASE WHEN state != 'backed_up' AND state != 'deleted' THEN 1 ELSE 0 END) AS unbacked_files,
+                       SUM(CASE WHEN manifest_chunk_count > 0 THEN 1 ELSE 0 END) AS restorable_files,
+                       SUM(manifest_missing_count) AS missing_chunks,
+                       SUM(CASE WHEN last_verify_at IS NOT NULL AND last_verify_at != '' THEN 1 ELSE 0 END) AS verified_files,
+                       MAX(updated_at) AS updated_at
+                FROM children
+                WHERE child != ''
+                GROUP BY child
+                ORDER BY child COLLATE NOCASE ASC
+                """,
+                (*folder_params, folder, folder),
+            ).fetchall()
+            files = conn.execute(
+                f"""
+                WITH scoped AS (
+                  SELECT f.*,
+                         {remainder_expr} AS remainder
+                  FROM files f
+                  {where}
+                )
+                SELECT f.*,
+                       f.remainder AS display_name,
+                       COUNT(c.id) + COALESCE(cm.chunk_count, 0) AS chunk_count,
+                       COALESCE(SUM(CASE WHEN c.status='verified' THEN 1 ELSE 0 END), 0) + COALESCE(cm.verified_count, 0) AS verified_chunks,
+                       COALESCE(SUM(CASE WHEN c.status='missing' THEN 1 ELSE 0 END), 0) + COALESCE(cm.missing_count, 0) AS missing_chunks,
+                       COALESCE(SUM(c.size), 0) + COALESCE(cm.bytes_total, 0) AS chunk_bytes,
+                       q.status AS queue_status,
+                       q.progress_chunks AS progress_chunks,
+                       q.progress_bytes AS progress_bytes
+                FROM scoped f
+                LEFT JOIN chunks c ON c.file_id = f.id
+                LEFT JOIN chunk_manifests cm ON cm.file_id = f.id
+                LEFT JOIN queue q ON q.file_id = f.id
+                WHERE instr(f.remainder, '/') = 0
+                GROUP BY f.id
+                ORDER BY {order_expr} {direction}, display_name COLLATE NOCASE ASC
+                """,
+                file_params,
+            ).fetchall()
+            total = conn.execute(f"SELECT COUNT(*) FROM files f {where}", params).fetchone()[0]
+        return {
+            "folder": folder,
+            "folders": [dict(row) for row in folders],
+            "files": [dict(row) for row in files],
+            "total": int(total or 0),
+            "sort": sort_by,
+            "dir": sort_dir,
+        }
+
+    def file_ids_for_folder(self, folder: str = "", include_deleted: bool = False, unbacked_only: bool = False, search: str = "") -> List[int]:
+        folder = normalize_folder_path(folder)
+        clauses = []
+        params: List[Any] = []
+        if folder:
+            clauses.append("replace(relative_path, '\\', '/') LIKE ?")
+            params.append(f"{folder}/%")
+        if not include_deleted:
+            clauses.append("state != 'deleted'")
+        if unbacked_only:
+            clauses.append("state != 'backed_up'")
+        if search:
+            clauses.append("(path LIKE ? OR relative_path LIKE ?)")
+            params.extend([f"%{search}%", f"%{search}%"])
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self.connect() as conn:
+            return [int(row["id"]) for row in conn.execute(f"SELECT id FROM files {where} ORDER BY relative_path", params).fetchall()]
 
     def folder_rollups(self, limit: int = 100) -> List[Dict[str, Any]]:
         """Aggregate file safety metadata by top-level folder for large-library triage."""

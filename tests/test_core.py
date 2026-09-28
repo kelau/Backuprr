@@ -199,7 +199,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.105")
+        self.assertEqual(__version__, "0.2.106")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -694,6 +694,39 @@ class CoreTests(unittest.TestCase):
                 """
             ).fetchall()
         self.assertEqual([row["relative_path"] for row in rows], ["large.mkv", "small.mkv"])
+
+    def test_folder_children_returns_direct_files_and_folder_rollups(self):
+        media = self.root / "media"
+        (media / "Movies" / "Drama").mkdir(parents=True)
+        (media / "Movies" / "movie-a.mkv").write_bytes(b"a")
+        (media / "Movies" / "Drama" / "movie-b.mkv").write_bytes(b"bb")
+        (media / "Series").mkdir(parents=True)
+        (media / "Series" / "show.mkv").write_bytes(b"ccc")
+        self.db.add_endpoint(str(media))
+        self.assertEqual(scan_all(self.db), 3)
+        root = self.db.folder_children("")
+        self.assertEqual([row["name"] for row in root["folders"]], ["Movies", "Series"])
+        movies = self.db.folder_children("Movies")
+        self.assertEqual([row["name"] for row in movies["folders"]], ["Drama"])
+        self.assertEqual([row["display_name"] for row in movies["files"]], ["movie-a.mkv"])
+        self.assertEqual(movies["folders"][0]["files"], 1)
+        self.assertEqual(movies["folders"][0]["size"], 2)
+
+    def test_file_rows_by_ids_refreshes_visible_file_metadata(self):
+        media = self.root / "media"
+        media.mkdir()
+        movie = media / "movie.mkv"
+        movie.write_bytes(b"abc")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files WHERE path=?", (str(movie.resolve()),)).fetchone()["id"]
+            conn.execute("UPDATE queue SET progress_chunks=3, progress_bytes=99 WHERE file_id=?", (file_id,))
+        rows = self.db.file_rows_by_ids([file_id])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["progress_chunks"], 3)
+        self.assertEqual(rows[0]["progress_bytes"], 99)
 
     def test_scan_catalogs_without_hashing_file_content(self):
         media = self.root / "media"
