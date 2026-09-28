@@ -89,6 +89,14 @@ def iter_chunks(path: Path, size: int) -> Iterator[bytes]:
             yield block
 
 
+def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(block_size), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def file_is_already_compressed(path: Path) -> bool:
     suffixes = [suffix.lower() for suffix in path.suffixes]
     return any(suffix in COMPRESSED_EXTENSIONS for suffix in suffixes)
@@ -379,6 +387,22 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         db.requeue_file(file_id, "file-changing")
         db.log("debug", "post.stability", f"Waiting for stable file before posting: {original}", file_id)
         return None
+    file_sha256 = str(item["sha256"] or "")
+    if not file_sha256:
+        try:
+            before_hash = original.stat()
+            db.log("debug", "post.hash", f"Hashing {original} before posting", file_id)
+            file_sha256 = sha256_file(original)
+            after_hash = original.stat()
+        except OSError as exc:
+            db.mark_file_unreadable(str(original), str(exc))
+            db.log("warning", "post.hash", f"Unable to hash queued file before posting: {original}: {exc}", file_id)
+            return None
+        if before_hash.st_size != after_hash.st_size or before_hash.st_mtime_ns != after_hash.st_mtime_ns:
+            db.requeue_file(file_id, "file-changing")
+            db.log("warning", "post.stability", f"File changed while hashing; waiting before posting: {original}", file_id)
+            return None
+        db.update_file_hash(file_id, int(after_hash.st_size), int(after_hash.st_mtime_ns), file_sha256)
     db.set_queue_status(file_id, "posting")
     db.update_file_state(file_id, "posting")
     payload = original
@@ -538,7 +562,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
             {
                 "app_version": __version__,
                 "path": str(original),
-                "file_sha256": str(item["sha256"] or ""),
+                "file_sha256": file_sha256,
                 "article_size": article_size,
                 "chunk_count": final_chunks,
                 "bytes_total": payload_size,

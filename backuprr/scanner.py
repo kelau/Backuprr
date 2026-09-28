@@ -1,4 +1,3 @@
-import hashlib
 import json
 import time
 from pathlib import Path
@@ -32,14 +31,6 @@ def update_scan_progress(
             }
         ),
     )
-
-
-def sha256_file(path: Path, block_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(block_size), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 def ensure_readable(path: Path) -> None:
@@ -102,28 +93,41 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
         seen.append(resolved)
         existing = snapshot.get(resolved)
         if existing and existing["state"] != "deleted" and existing["size"] == stat.st_size and existing["mtime_ns"] == stat.st_mtime_ns:
-            if existing["state"] == "queued":
+            if existing["state"] in {"queued", "unreadable"}:
                 try:
                     ensure_readable(path)
                 except OSError as exc:
-                    db.log("warning", "scan.file_error", f"Skipped unreadable queued file {resolved}: {exc}")
+                    db.log("warning", "scan.file_error", f"Skipped unreadable {existing['state']} file {resolved}: {exc}")
                     db.mark_file_unreadable(resolved, str(exc))
                     continue
+                if existing["state"] == "unreadable":
+                    db.upsert_file(
+                        {
+                            "endpoint_id": endpoint_id,
+                            "path": resolved,
+                            "relative_path": str(path.resolve().relative_to(root)),
+                            "size": stat.st_size,
+                            "mtime_ns": stat.st_mtime_ns,
+                            "sha256": "",
+                            "state": "discovered",
+                        }
+                    )
             unchanged += 1
             count += 1
             continue
         candidate = None if existing else move_candidate(stat.st_size, stat.st_mtime_ns, resolved)
         if candidate:
-            digest = candidate["sha256"]
-        else:
-            try:
-                update_scan_progress(db, root, "hashing", count, hashed, unchanged, resolved)
-                digest = sha256_file(path)
-            except OSError as exc:
-                db.log("warning", "scan.file_error", f"Skipped unreadable file content {resolved}: {exc}")
-                db.mark_file_unreadable(resolved, str(exc))
-                continue
-        hashed += 0 if candidate else 1
+            db.update_moved_file(
+                int(candidate["id"]),
+                resolved,
+                str(path.resolve().relative_to(root)),
+                stat.st_mtime_ns,
+                "discovered",
+            )
+            moved_by_metadata += 1
+            db.log("verbose", "scan.file", f"Updated catalog record for {resolved}", file_id=int(candidate["id"]))
+            count += 1
+            continue
         file_id = db.upsert_file(
             {
                 "endpoint_id": endpoint_id,
@@ -131,12 +135,10 @@ def scan_endpoint(db: Database, endpoint_id: int, endpoint_path: str) -> int:
                 "relative_path": str(path.resolve().relative_to(root)),
                 "size": stat.st_size,
                 "mtime_ns": stat.st_mtime_ns,
-                "sha256": digest,
+                "sha256": "",
                 "state": "discovered",
             }
         )
-        if candidate:
-            moved_by_metadata += 1
         db.log("verbose", "scan.file", f"Updated catalog record for {resolved}", file_id=file_id)
         count += 1
     missing = db.mark_missing_files(seen, endpoint_id)

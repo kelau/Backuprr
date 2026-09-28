@@ -199,7 +199,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.104")
+        self.assertEqual(__version__, "0.2.105")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -623,8 +623,10 @@ class CoreTests(unittest.TestCase):
         movie.write_bytes(b"abc")
         self.db.add_endpoint(str(media))
         self.assertEqual(scan_all(self.db), 1)
-        with patch("backuprr.scanner.sha256_file", side_effect=AssertionError("unchanged file should not be rehashed")):
-            self.assertEqual(scan_all(self.db), 1)
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT sha256 FROM files WHERE path=?", (str(movie.resolve()),)).fetchone()
+        self.assertEqual(row["sha256"], "")
+        self.assertEqual(scan_all(self.db), 1)
 
     def test_scan_preserves_backed_up_state_when_only_mtime_changes(self):
         media = self.root / "media"
@@ -658,8 +660,7 @@ class CoreTests(unittest.TestCase):
         with self.db.connect() as conn:
             row = conn.execute("SELECT state FROM files WHERE path=?", (str(movie.resolve()),)).fetchone()
         self.assertEqual(row["state"], "discovered")
-        with patch("backuprr.scanner.sha256_file", side_effect=AssertionError("revived unchanged file should not be rehashed")):
-            self.assertEqual(scan_all(self.db), 1)
+        self.assertEqual(scan_all(self.db), 1)
 
     def test_auto_queue_waits_for_file_stability_window(self):
         media = self.root / "media"
@@ -694,17 +695,18 @@ class CoreTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual([row["relative_path"] for row in rows], ["large.mkv", "small.mkv"])
 
-    def test_scan_skips_unreadable_file_content(self):
+    def test_scan_catalogs_without_hashing_file_content(self):
         media = self.root / "media"
         media.mkdir()
-        movie = media / "locked.iso"
+        movie = media / "movie.iso"
         movie.write_bytes(b"abc")
         self.db.add_endpoint(str(media))
-        with patch("backuprr.scanner.sha256_file", side_effect=PermissionError("locked")):
-            self.assertEqual(scan_all(self.db), 0)
-        rows = self.db.list_events(["warning"], event_types=["scan.file_error"])
-        self.assertEqual(len(rows), 1)
-        self.assertIn("Skipped unreadable file content", rows[0]["message"])
+        with patch("pathlib.Path.open", side_effect=AssertionError("scan should not open file content")):
+            self.assertEqual(scan_all(self.db), 1)
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT state, sha256 FROM files WHERE path=?", (str(movie.resolve()),)).fetchone()
+        self.assertEqual(row["state"], "discovered")
+        self.assertEqual(row["sha256"], "")
 
     def test_scan_holds_queued_file_when_content_becomes_unreadable(self):
         media = self.root / "media"
@@ -715,8 +717,9 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(scan_all(self.db), 1)
         self.assertEqual(enqueue_unbacked(self.db), 1)
         movie.write_bytes(b"abcd")
-        with patch("backuprr.scanner.sha256_file", side_effect=PermissionError("locked")):
-            self.assertEqual(scan_all(self.db), 0)
+        self.assertEqual(scan_all(self.db), 1)
+        with patch("backuprr.backup.sha256_file", side_effect=PermissionError("locked")):
+            self.assertIsNone(post_next(self.db, self.config))
         with self.db.connect() as conn:
             file_row = conn.execute("SELECT id, state FROM files WHERE path=?", (str(movie.resolve()),)).fetchone()
             queue_row = conn.execute("SELECT status, reason FROM queue WHERE file_id=?", (file_row["id"],)).fetchone()
@@ -788,8 +791,7 @@ class CoreTests(unittest.TestCase):
         self.db.add_endpoint(str(media))
         scan_all(self.db)
         movie.write_bytes(b"abcd")
-        with patch("backuprr.scanner.sha256_file", side_effect=PermissionError("locked")):
-            scan_all(self.db)
+        self.db.mark_file_unreadable(str(movie.resolve()), "locked")
         self.assertEqual(scan_all(self.db), 1)
         self.assertEqual(enqueue_unbacked(self.db), 1)
         with self.db.connect() as conn:
@@ -817,8 +819,7 @@ class CoreTests(unittest.TestCase):
         subfolder.mkdir()
         moved = subfolder / "movie.mkv"
         original.rename(moved)
-        with patch("backuprr.scanner.sha256_file", side_effect=AssertionError("metadata-matched move should not be rehashed")):
-            self.assertEqual(scan_all(self.db), 1)
+        self.assertEqual(scan_all(self.db), 1)
         with self.db.connect() as conn:
             row = conn.execute("SELECT path, relative_path FROM files").fetchone()
         self.assertEqual(row["path"], str(moved.resolve()))
@@ -837,7 +838,7 @@ class CoreTests(unittest.TestCase):
         original.rename(moved)
         with self.db.connect() as conn:
             old = conn.execute("SELECT * FROM files WHERE relative_path='movie.mkv'").fetchone()
-            conn.execute("UPDATE files SET state='deleted' WHERE id=?", (old["id"],))
+            conn.execute("UPDATE files SET state='deleted', sha256=? WHERE id=?", ("knownhash", old["id"]))
             conn.execute(
                 """
                 INSERT INTO files(endpoint_id, path, relative_path, size, mtime_ns, sha256, state, created_at, updated_at)
@@ -849,7 +850,7 @@ class CoreTests(unittest.TestCase):
                     str(Path("subfolder") / "movie.mkv"),
                     old["size"],
                     moved.stat().st_mtime_ns,
-                    old["sha256"],
+                    "knownhash",
                     "discovered",
                     old["created_at"],
                     old["updated_at"],

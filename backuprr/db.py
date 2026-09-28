@@ -303,11 +303,17 @@ class Database:
 
     def upsert_file(self, record: Dict[str, Any]) -> int:
         now = utcnow()
+        incoming_sha = str(record.get("sha256") or "")
         with self.connect() as conn:
             row = conn.execute("SELECT id, size, mtime_ns, sha256, state FROM files WHERE path = ?", (record["path"],)).fetchone()
             if row:
-                content_changed = row["size"] != record["size"] or row["sha256"] != record["sha256"]
                 metadata_changed = row["mtime_ns"] != record["mtime_ns"]
+                if incoming_sha:
+                    content_changed = row["size"] != record["size"] or row["sha256"] != incoming_sha
+                elif row["state"] == "backed_up" and row["size"] == record["size"]:
+                    content_changed = False
+                else:
+                    content_changed = row["size"] != record["size"] or metadata_changed
                 revived = row["state"] in {"deleted", "unreadable"}
                 state = "changed" if content_changed else record.get("state", "discovered")
                 conn.execute(
@@ -322,7 +328,7 @@ class Database:
                         record["relative_path"],
                         record["size"],
                         record["mtime_ns"],
-                        record["sha256"],
+                        incoming_sha if content_changed or revived or incoming_sha else row["sha256"],
                         1 if content_changed or revived else 0,
                         state,
                         now,
@@ -373,7 +379,7 @@ class Database:
                         record["relative_path"],
                         record["size"],
                         record["mtime_ns"],
-                        record["sha256"],
+                        incoming_sha,
                         record.get("state", "discovered"),
                         now,
                         now,
@@ -382,7 +388,29 @@ class Database:
                 file_id = int(cur.lastrowid)
             return file_id
 
+    def update_moved_file(self, file_id: int, path: str, relative_path: str, mtime_ns: int, state: str = "discovered") -> None:
+        now = utcnow()
+        with self.connect() as conn:
+            row = conn.execute("SELECT path, state FROM files WHERE id=?", (file_id,)).fetchone()
+            if not row:
+                return
+            conn.execute(
+                """
+                UPDATE files
+                SET path=?, relative_path=?, mtime_ns=?, state=CASE WHEN state='deleted' THEN ? ELSE state END,
+                    updated_at=?
+                WHERE id=?
+                """,
+                (path, relative_path, mtime_ns, state, now, file_id),
+            )
+            conn.execute(
+                "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
+                (now, "info", "scan.move", f"Updated moved file path: {row['path']} -> {path}", file_id, ""),
+            )
+
     def _find_move_candidate(self, conn: sqlite3.Connection, record: Dict[str, Any]) -> Optional[sqlite3.Row]:
+        if not str(record.get("sha256") or ""):
+            return None
         rows = conn.execute(
             """
             SELECT id, path FROM files
@@ -423,6 +451,7 @@ class Database:
                   ON active.endpoint_id = deleted.endpoint_id
                  AND active.size = deleted.size
                  AND active.sha256 = deleted.sha256
+                 AND active.sha256 != ''
                  AND active.id != deleted.id
                 WHERE deleted.endpoint_id = ?
                   AND deleted.state = 'deleted'
@@ -1231,6 +1260,13 @@ class Database:
                 (now, "warning", "scan.file_error", f"Marked unreadable file on hold: {path}: {reason}", file_id, ""),
             )
             return file_id
+
+    def update_file_hash(self, file_id: int, size: int, mtime_ns: int, sha256: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE files SET size=?, mtime_ns=?, sha256=?, updated_at=? WHERE id=?",
+                (size, mtime_ns, sha256, utcnow(), file_id),
+            )
 
     def mark_restored_backed_up(self, file_id: int, size: int, mtime_ns: int, sha256: str) -> None:
         now = utcnow()

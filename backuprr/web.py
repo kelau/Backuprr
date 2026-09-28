@@ -1475,6 +1475,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.105":["Catalog scans now record new files immediately without hashing content; file hashes are calculated later when a selected file is backed up."],
  "0.2.104":["Files no longer emits invalid summary markup and now renders folded folders lazily so large file browsers stay responsive."],
  "0.2.103":["Files now behaves like a true file browser without pagination, and Docker installs create a par2 compatibility command when only par2create is available."],
  "0.2.102":["SQLite connections now wait longer for busy locks and initialize the catalog database in WAL mode to reduce worker/UI lock contention."],
