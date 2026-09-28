@@ -1367,6 +1367,10 @@ tr:hover td { background:var(--row-hover); }
 .tree-actions button, .tree-actions summary { min-width:0; }
 .icon-btn { width:28px; height:28px; display:inline-grid; place-items:center; padding:0; }
 .folder > .tree-row { font-weight:600; }
+.folder-toggle { transition:transform .12s ease; }
+.folder.open > .tree-row .folder-toggle { transform:rotate(90deg); }
+.folder > ul { display:none; }
+.folder.open > ul { display:block; }
 .hidden { display:none; }
 .muted { color:var(--muted); }
 .error { color:var(--bad); }
@@ -1419,6 +1423,7 @@ let page = pageFromPath(location.pathname);
 let settingsCache = null;
 let fileRowsCache = [];
 let filesTreeSignature = "";
+let filesOpenFolders = new Set();
 let operationRowsCache = [];
 let verificationRowsCache = new Map();
 let verificationTableCache = {};
@@ -1470,6 +1475,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.104":["Files no longer emits invalid summary markup and now renders folded folders lazily so large file browsers stay responsive."],
  "0.2.103":["Files now behaves like a true file browser without pagination, and Docker installs create a par2 compatibility command when only par2create is available."],
  "0.2.102":["SQLite connections now wait longer for busy locks and initialize the catalog database in WAL mode to reduce worker/UI lock contention."],
  "0.2.101":["Files now patches unchanged tree views in place, folder backup selection uses safe dataset-driven handlers, and PAR2 auto-resolution checks par2create when par2 is configured but unavailable."],
@@ -2076,7 +2082,6 @@ function dismissVersionNotice(){
 async function updateFilesPage(options={}){
  await refreshOperationProgress();
  if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Files")) return;
- const openFolders = new Set(Array.from(document.querySelectorAll("#filesTree details[data-path][open]")).map(item => item.dataset.path));
  const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
  const unbacked = !!document.getElementById("showUnbackedOnly")?.checked;
  const q = document.getElementById("filesSearch")?.value || "";
@@ -2095,15 +2100,29 @@ async function updateFilesPage(options={}){
   if(!target.querySelector(".tree") || filesTreeSignature !== nextSignature){
    target.innerHTML = nextHtml;
    filesTreeSignature = nextSignature;
-   target.querySelectorAll("details[data-path]").forEach(details => {
-    if(openFolders.has(details.dataset.path)) details.open = true;
-   });
   } else {
    patchFilesTree(target, nextHtml);
   }
   updateFolderCheckboxStates();
   updateFilesSelectionSummary();
  }
+}
+function renderFilesTreeFromCache(){
+ const target = document.getElementById("filesTree");
+ if(!target) return;
+ const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
+ const result = {rows:fileRowsCache, total:fileRowsCache.length};
+ target.innerHTML = holdTableMessage(result) + fileTree(fileRowsCache, showDeleted);
+ filesTreeSignature = filesTreeStructureSignature(fileRowsCache, result, showDeleted);
+ updateFolderCheckboxStates();
+ updateFilesSelectionSummary();
+}
+function toggleFolderOpen(path){
+ const key = String(path || "");
+ if(!key) return;
+ if(filesOpenFolders.has(key)) filesOpenFolders.delete(key);
+ else filesOpenFolders.add(key);
+ renderFilesTreeFromCache();
 }
 function filesTreeStructureSignature(rows, result, showDeleted){
  const folders = new Set();
@@ -2116,7 +2135,8 @@ function filesTreeStructureSignature(rows, result, showDeleted){
   deleted:!!showDeleted,
   sort:tableSorts.files || {},
   folders:Array.from(folders).sort(),
-  files:rows.map(row => [Number(row.id), row.relative_path || row.path || "", row.state === "deleted"]).sort((a,b)=>String(a[1]).localeCompare(String(b[1])))
+  files:rows.map(row => [Number(row.id), row.relative_path || row.path || "", row.state === "deleted"]).sort((a,b)=>String(a[1]).localeCompare(String(b[1]))),
+  open:Array.from(filesOpenFolders).sort()
  });
 }
 function patchFilesTree(target, nextHtml){
@@ -3188,7 +3208,7 @@ function fileTree(rows, showDeleted=false){
   }
   node.files.push({...row, display_name: parts[parts.length - 1] || row.path});
  }
- return `<div class="tree"><div class="tree-header"><span><input id="selectAllFiles" type="checkbox" title="Select page" onchange="toggleSelectAllFiles(this.checked)"></span><span></span>${fileSortHeader("relative_path", "Name")}${fileSortHeader("progress", "Progress")}${fileSortHeader("size", "Size")}${fileSortHeader("state", "State")}${fileSortHeader("last_verify_at", "Verification")}<span>Actions</span></div><ul>${treeNode(root, "", showDeleted)}</ul></div>`;
+ return `<div class="tree"><div class="tree-header"><span><input id="selectAllFiles" type="checkbox" title="Select all visible files" onchange="toggleSelectAllFiles(this.checked)"></span><span></span>${fileSortHeader("relative_path", "Name")}${fileSortHeader("progress", "Progress")}${fileSortHeader("size", "Size")}${fileSortHeader("state", "State")}${fileSortHeader("last_verify_at", "Verification")}<span>Actions</span></div><ul>${treeNode(root, "", showDeleted)}</ul></div>`;
 }
 function fileSortHeader(col, label){
  const sort = tableSorts.files || {};
@@ -3199,11 +3219,12 @@ function treeNode(node, prefix, showDeleted){
  const dirs = Object.keys(node.dirs).sort((a,b)=>a.localeCompare(b));
  const dirHtml = dirs.map(name => {
   const path = prefix ? prefix+"/"+name : name;
+  const open = filesOpenFolders.has(path);
   const state = folderState(node.dirs[name]);
   const canRestore = folderChunkCount(node.dirs[name]) > 0;
   const canPrioritize = folderCanPrioritize(node.dirs[name]);
   const ids = collectNodeFiles(node.dirs[name]).map(file => Number(file.id));
-  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row folder-row" data-folder-row-path="${esc(path)}"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span></span><span class="tree-meta">${countFiles(node.dirs[name])} files / ${formatBytes(node.dirs[name].total_size || 0)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span class="tree-actions">${canPrioritize ? `<button class="icon-btn" title="Select folder for backup" data-path="${esc(path)}" onclick="event.preventDefault();selectFolderForBackup(this.dataset.path)">&#10003;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
+  return `<li class="folder ${open ? "open" : ""}" data-folder-path="${esc(path)}"><div class="tree-row folder-row" data-folder-row-path="${esc(path)}"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="selectFolderFiles(this.dataset.fileIds, this.checked)"><button class="icon-btn folder-toggle" type="button" title="${open ? "Collapse folder" : "Expand folder"}" data-path="${esc(path)}" onclick="toggleFolderOpen(this.dataset.path)">&#9654;</button><span class="tree-name"><span class="ui-icon">&#128193;</span>${esc(name)}</span><span></span><span class="tree-meta">${countFiles(node.dirs[name])} files / ${formatBytes(node.dirs[name].total_size || 0)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span class="tree-actions">${canPrioritize ? `<button class="icon-btn" title="Select folder for backup" data-path="${esc(path)}" onclick="selectFolderForBackup(this.dataset.path)">&#10003;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></div><ul>${open ? treeNode(node.dirs[name], path, showDeleted) : ""}</ul></li>`;
  }).join("");
  const fileHtml = node.files.sort(compareFileRows).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
