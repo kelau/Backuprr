@@ -9,6 +9,8 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 SCHEMA_VERSION = 10
 STALE_POSTING_SECONDS = 15 * 60
+SQLITE_TIMEOUT_SECONDS = 30
+SQLITE_BUSY_TIMEOUT_MS = SQLITE_TIMEOUT_SECONDS * 1000
 
 
 def utcnow() -> str:
@@ -23,17 +25,24 @@ class Database:
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
+        conn = self._connect()
         try:
             yield conn
             conn.commit()
         finally:
             conn.close()
 
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.path, timeout=SQLITE_TIMEOUT_SECONDS)
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
     def init(self) -> None:
         with self.connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
             conn.executescript(SCHEMA)
             self._migrate(conn)
             conn.execute(
@@ -930,7 +939,7 @@ class Database:
 
     def vacuum_analyze(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
+        conn = self._connect()
         try:
             conn.execute("ANALYZE")
             conn.execute("VACUUM")

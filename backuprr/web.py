@@ -1469,6 +1469,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.102":["SQLite connections now wait longer for busy locks and initialize the catalog database in WAL mode to reduce worker/UI lock contention."],
  "0.2.101":["Files now patches unchanged tree views in place, folder backup selection uses safe dataset-driven handlers, and PAR2 auto-resolution checks par2create when par2 is configured but unavailable."],
  "0.2.100":["Docker Compose installs PAR2 tooling in the image, and Backuprr now invokes par2create-compatible binaries without the extra par2 wrapper subcommand."],
  "0.2.99":["Catalog scans now publish live progress, and automatic backup queueing only picks up files under explicitly selected include folders or patterns."],

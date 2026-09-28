@@ -199,7 +199,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.101")
+        self.assertEqual(__version__, "0.2.102")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -219,6 +219,13 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(scan_all(self.db), 1)
         rows = self.db.list_rows("files")
         self.assertEqual(rows[0]["relative_path"], "sample.bin")
+
+    def test_database_connections_use_busy_timeout_and_wal(self):
+        with self.db.connect() as conn:
+            busy_timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+            journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        self.assertGreaterEqual(busy_timeout, 30000)
+        self.assertEqual(journal_mode, "wal")
 
     def test_clear_worker_error_keeps_resume_state_fresh(self):
         self.db.save_worker_state("backup", "Backup", "", "", "", 1.0, "", "old auth failure", 1, 1)
