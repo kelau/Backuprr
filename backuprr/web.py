@@ -587,20 +587,23 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/events/stream":
             self.stream_changes()
         elif parsed.path == "/api/files":
-            page = max(1, int(query.get("page", ["1"])[0]))
-            page_size = max(1, min(500, int(query.get("page_size", query.get("limit", ["200"]))[0])))
             search = query.get("q", [""])[0]
             include_deleted = query.get("include_deleted", ["0"])[0] in {"1", "true", "yes"}
             unbacked_only = query.get("unbacked", ["0"])[0] in {"1", "true", "yes"}
             sort_by = query.get("sort", ["relative_path"])[0]
             sort_dir = query.get("dir", ["asc"])[0]
+            all_rows = query.get("all", ["0"])[0] in {"1", "true", "yes"}
+            total = self.db.file_count(search, include_deleted, unbacked_only)
+            page = 1 if all_rows else max(1, int(query.get("page", ["1"])[0]))
+            page_size = max(1, total) if all_rows else max(1, min(500, int(query.get("page_size", query.get("limit", ["200"]))[0])))
             offset = (page - 1) * page_size
             self.send_json(
                 {
                     "rows": rowdicts(self.db.list_files(page_size, offset, search, include_deleted, unbacked_only, sort_by, sort_dir)),
                     "page": page,
                     "page_size": page_size,
-                    "total": self.db.file_count(search, include_deleted, unbacked_only),
+                    "total": total,
+                    "all": all_rows,
                     "sort": sort_by,
                     "dir": sort_dir,
                 }
@@ -1442,8 +1445,6 @@ let lastChangeToken = null;
 let activeQueuePage = 1;
 let completedQueuePage = 1;
 let attentionQueuePage = 1;
-let filesPage = 1;
-let filesPageSize = 100;
 let queuePageSize = 10;
 let verificationMissingPage = 1;
 let verificationUnverifiedPage = 1;
@@ -1469,6 +1470,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.103":["Files now behaves like a true file browser without pagination, and Docker installs create a par2 compatibility command when only par2create is available."],
  "0.2.102":["SQLite connections now wait longer for busy locks and initialize the catalog database in WAL mode to reduce worker/UI lock contention."],
  "0.2.101":["Files now patches unchanged tree views in place, folder backup selection uses safe dataset-driven handlers, and PAR2 auto-resolution checks par2create when par2 is configured but unavailable."],
  "0.2.100":["Docker Compose installs PAR2 tooling in the image, and Backuprr now invokes par2create-compatible binaries without the extra par2 wrapper subcommand."],
@@ -1617,11 +1619,21 @@ function sortServerTable(scope, col, pageVar, updateFn){
  tableSorts[scope] = { col, dir: current.col === col && current.dir !== "desc" ? "desc" : "asc" };
  saveTableSorts();
  if(pageVar) setPageVar(pageVar, 1);
- if(updateFn && typeof window[updateFn] === "function") window[updateFn]();
+ runUpdateFn(updateFn);
+}
+function getPageVar(pageVar){
+ if(pageVar === "logPage") return logPage;
+ if(pageVar === "activeQueuePage") return activeQueuePage;
+ if(pageVar === "completedQueuePage") return completedQueuePage;
+ if(pageVar === "attentionQueuePage") return attentionQueuePage;
+ if(pageVar === "verificationMissingPage") return verificationMissingPage;
+ if(pageVar === "verificationUnverifiedPage") return verificationUnverifiedPage;
+ if(pageVar === "verificationVerifiedPage") return verificationVerifiedPage;
+ if(pageVar === "verificationNoChunksPage") return verificationNoChunksPage;
+ return 1;
 }
 function setPageVar(pageVar, value){
- if(pageVar === "filesPage") filesPage = value;
- else if(pageVar === "logPage") logPage = value;
+ if(pageVar === "logPage") logPage = value;
  else if(pageVar === "activeQueuePage") activeQueuePage = value;
  else if(pageVar === "completedQueuePage") completedQueuePage = value;
  else if(pageVar === "attentionQueuePage") attentionQueuePage = value;
@@ -1630,8 +1642,27 @@ function setPageVar(pageVar, value){
  else if(pageVar === "verificationVerifiedPage") verificationVerifiedPage = value;
  else if(pageVar === "verificationNoChunksPage") verificationNoChunksPage = value;
 }
+function setPageSizeVar(pageSizeVar, value){
+ if(pageSizeVar === "logPageSize") logPageSize = value;
+ else if(pageSizeVar === "queuePageSize") queuePageSize = value;
+ else if(pageSizeVar === "verificationPageSize") verificationPageSize = value;
+}
+function runUpdateFn(updateFn){
+ const functions = { updateFilesPage, updateLogPage, updateQueuePage, updateVerificationPage };
+ const fn = functions[updateFn] || window[updateFn];
+ if(typeof fn === "function") fn();
+}
+function changePage(pageVar, delta, updateFn){
+ setPageVar(pageVar, Math.max(1, getPageVar(pageVar) + Number(delta || 0)));
+ runUpdateFn(updateFn);
+}
+function changePageSize(pageVar, pageSizeVar, value, updateFn){
+ setPageSizeVar(pageSizeVar, Number(value));
+ setPageVar(pageVar, 1);
+ runUpdateFn(updateFn);
+}
 function sortFilesBy(col){
- sortServerTable("files", col, "filesPage", "updateFilesPage");
+ sortServerTable("files", col, "", "updateFilesPage");
 }
 function sortCellValue(col, value, row={}){
  if(col === "progress") return row.progress_percent ?? value ?? "";
@@ -1882,9 +1913,9 @@ async function render(){
  if(!isActiveRender(renderToken, requestedPage)) return;
  if(requestedPage==="Files"){
   c.innerHTML = `<div class="toolbar">
-   <input id="filesSearch" placeholder="Search files" oninput="filesPage=1;updateFilesPage()">
-   <label><input id="showUnbackedOnly" type="checkbox" onchange="filesPage=1;updateFilesPage()"> <span class="ui-icon">&#9888;</span>Only unbacked</label>
-   <label><input id="showDeletedFiles" type="checkbox" onchange="filesPage=1;updateFilesPage()"> <span class="ui-icon">&#128465;</span>Show deleted</label>
+   <input id="filesSearch" placeholder="Search files" oninput="updateFilesPage()">
+   <label><input id="showUnbackedOnly" type="checkbox" onchange="updateFilesPage()"> <span class="ui-icon">&#9888;</span>Only unbacked</label>
+   <label><input id="showDeletedFiles" type="checkbox" onchange="updateFilesPage()"> <span class="ui-icon">&#128465;</span>Show deleted</label>
    <button onclick="boostSelectedFiles()"><span class="ui-icon">&#8593;</span>Bump selected</button>
    ${selectedRestoreDropdown()}
    ${pushLabel()}
@@ -2049,7 +2080,7 @@ async function updateFilesPage(options={}){
  const showDeleted = !!document.getElementById("showDeletedFiles")?.checked;
  const unbacked = !!document.getElementById("showUnbackedOnly")?.checked;
  const q = document.getElementById("filesSearch")?.value || "";
- const result = await api(`/api/files?page=${filesPage}&page_size=${filesPageSize}&include_deleted=${showDeleted ? 1 : 0}&unbacked=${unbacked ? 1 : 0}&q=${encodeURIComponent(q)}${sortQuery("files")}`);
+ const result = await api(`/api/files?all=1&include_deleted=${showDeleted ? 1 : 0}&unbacked=${unbacked ? 1 : 0}&q=${encodeURIComponent(q)}${sortQuery("files")}`);
  if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Files")) return;
  const valid = validPagedResult(result);
  if(valid) fileRowsCache = result.rows || [];
@@ -2058,9 +2089,9 @@ async function updateFilesPage(options={}){
  }
  const target = document.getElementById("filesTree");
  if(target){
-  const pageResult = valid ? result : {rows:fileRowsCache, page:filesPage, page_size:filesPageSize, total:fileRowsCache.length};
-  const nextSignature = filesTreeStructureSignature(fileRowsCache, pageResult, showDeleted);
-  const nextHtml = holdTableMessage(valid ? pageResult : (fileRowsCache.length ? pageResult : null)) + fileTree(fileRowsCache, showDeleted) + paginationControls(pageResult, "filesPage", "updateFilesPage", "filesPageSize");
+  const filesResult = valid ? result : {rows:fileRowsCache, total:fileRowsCache.length};
+  const nextSignature = filesTreeStructureSignature(fileRowsCache, filesResult, showDeleted);
+  const nextHtml = holdTableMessage(valid ? filesResult : (fileRowsCache.length ? filesResult : null)) + fileTree(fileRowsCache, showDeleted);
   if(!target.querySelector(".tree") || filesTreeSignature !== nextSignature){
    target.innerHTML = nextHtml;
    filesTreeSignature = nextSignature;
@@ -2074,16 +2105,14 @@ async function updateFilesPage(options={}){
   updateFilesSelectionSummary();
  }
 }
-function filesTreeStructureSignature(rows, pageResult, showDeleted){
+function filesTreeStructureSignature(rows, result, showDeleted){
  const folders = new Set();
  for(const row of rows){
   const parts = String(row.relative_path || row.path || "").split(/[\\/]+/).filter(Boolean);
   for(let index=1; index<parts.length; index++) folders.add(parts.slice(0, index).join("/"));
  }
  return JSON.stringify({
-  page:Number(pageResult.page || 1),
-  pageSize:Number(pageResult.page_size || filesPageSize),
-  total:Number(pageResult.total || rows.length),
+  total:Number(result.total || rows.length),
   deleted:!!showDeleted,
   sort:tableSorts.files || {},
   folders:Array.from(folders).sort(),
@@ -2095,9 +2124,6 @@ function patchFilesTree(target, nextHtml){
  template.innerHTML = nextHtml;
  patchSelectorGroup(target, template.content, "[data-file-id]");
  patchSelectorGroup(target, template.content, "[data-folder-row-path]");
- const currentPagination = target.querySelector(".pagination");
- const nextPagination = template.content.querySelector(".pagination");
- if(currentPagination && nextPagination && currentPagination.outerHTML !== nextPagination.outerHTML) currentPagination.replaceWith(nextPagination);
  const currentHold = target.querySelector(".table-hold");
  const nextHold = template.content.querySelector(".table-hold");
  if(currentHold && nextHold && currentHold.outerHTML !== nextHold.outerHTML) currentHold.replaceWith(nextHold);
@@ -2425,8 +2451,8 @@ async function updateSecurityPage(options={}){
 function paginationControls(result, pageVar, updateFn, pageSizeVar="", label=""){
  const totalPages = Math.max(1, Math.ceil(Number(result.total || 0) / Number(result.page_size || 1)));
  const pageNo = Number(result.page || 1);
- const pageSize = pageSizeVar ? `<label class="muted">Rows <select onchange="${pageSizeVar}=Number(this.value);${pageVar}=1;${updateFn}()">${[10,25,50,100,250].map(size=>`<option value="${size}" ${Number(result.page_size || 0)===size ? "selected" : ""}>${size}</option>`).join("")}</select></label>` : "";
- return `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="${pageVar}=Math.max(1,${pageVar}-1);${updateFn}()">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${esc(label || `${Number(result.total || 0)} rows`)}</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="${pageVar}=${pageVar}+1;${updateFn}()">Next</button>${pageSize}</div>`;
+ const pageSize = pageSizeVar ? `<label class="muted">Rows <select onchange="changePageSize(${jsString(pageVar)}, ${jsString(pageSizeVar)}, this.value, ${jsString(updateFn)})">${[10,25,50,100,250].map(size=>`<option value="${size}" ${Number(result.page_size || 0)===size ? "selected" : ""}>${size}</option>`).join("")}</select></label>` : "";
+ return `<div class="pagination"><button ${pageNo <= 1 ? "disabled" : ""} onclick="changePage(${jsString(pageVar)}, -1, ${jsString(updateFn)})">Previous</button><span class="muted">Page ${pageNo} of ${totalPages} &middot; ${esc(label || `${Number(result.total || 0)} rows`)}</span><button ${pageNo >= totalPages ? "disabled" : ""} onclick="changePage(${jsString(pageVar)}, 1, ${jsString(updateFn)})">Next</button>${pageSize}</div>`;
 }
 function statusDashboard(status, tasks, speed, readiness={}){
  const stats = status.stats || {};

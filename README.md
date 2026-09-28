@@ -210,6 +210,7 @@ services:
             PYTHONUNBUFFERED=1
         RUN apt-get update \
             && (apt-get install -y --no-install-recommends par2cmdline || apt-get install -y --no-install-recommends par2) \
+            && if ! command -v par2 >/dev/null 2>&1 && command -v par2create >/dev/null 2>&1; then ln -s "$(command -v par2create)" /usr/local/bin/par2; fi \
             && rm -rf /var/lib/apt/lists/* \
             && pip install --no-cache-dir "https://x-access-token:$${GITHUB_TOKEN}@github.com/kelau/Backuprr/archive/$${BACKUPRR_REF}.zip" \
             && useradd --system --uid 10001 --home-dir /app backuprr \
