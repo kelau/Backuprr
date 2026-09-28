@@ -199,7 +199,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.100")
+        self.assertEqual(__version__, "0.2.101")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -1231,6 +1231,13 @@ class CoreTests(unittest.TestCase):
         self.config.base_dir = self.root
         with patch("backuprr.backup.shutil.which", return_value=None):
             self.assertEqual(resolve_par2_command("par2", self.config), str(bundled))
+
+    def test_resolve_par2_command_falls_back_to_par2create_when_par2_missing(self):
+        par2create = self.root / "usr" / "bin" / "par2create"
+        par2create.parent.mkdir(parents=True)
+        par2create.write_bytes(b"fake")
+        with patch("backuprr.backup.platform.system", return_value="Linux"), patch("backuprr.backup.shutil.which", side_effect=lambda name: str(par2create) if name == "par2create" else None):
+            self.assertEqual(resolve_par2_command("par2", self.config), str(par2create))
 
     def test_discover_par2_command_prefers_path_candidate(self):
         path_candidate = self.root / "tools" / "par2.exe"

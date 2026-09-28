@@ -236,7 +236,7 @@ def resolve_par2_command(command: str, config: Config) -> str | None:
     found = shutil.which(raw)
     if found:
         return found
-    if raw == "par2":
+    if raw in {"par2", "par2cmdline"}:
         discovered = discover_par2_command(config)
         if discovered["found"]:
             return str(discovered["command"])

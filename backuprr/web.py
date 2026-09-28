@@ -1415,6 +1415,7 @@ const csrfToken = "__CSRF_TOKEN__";
 let page = pageFromPath(location.pathname);
 let settingsCache = null;
 let fileRowsCache = [];
+let filesTreeSignature = "";
 let operationRowsCache = [];
 let verificationRowsCache = new Map();
 let verificationTableCache = {};
@@ -1468,6 +1469,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.101":["Files now patches unchanged tree views in place, folder backup selection uses safe dataset-driven handlers, and PAR2 auto-resolution checks par2create when par2 is configured but unavailable."],
  "0.2.100":["Docker Compose installs PAR2 tooling in the image, and Backuprr now invokes par2create-compatible binaries without the extra par2 wrapper subcommand."],
  "0.2.99":["Catalog scans now publish live progress, and automatic backup queueing only picks up files under explicitly selected include folders or patterns."],
  "0.2.98":["Backuprr now generates a default config file automatically when the configured path does not exist, simplifying fresh Docker deployments."],
@@ -1591,7 +1593,7 @@ function validPagedResult(result){
 function holdTableMessage(cached=null){
  if(cached) return "";
  const wait = Date.now() < apiRateLimitedUntil ? "Waiting for the internal API cooldown before loading this table..." : "Loading table data...";
- return `<p class='muted'>${esc(wait)}</p>`;
+ return `<p class='muted table-hold'>${esc(wait)}</p>`;
 }
 function isActiveRender(token, pageName){
  return token === renderSeq && page === pageName;
@@ -2056,13 +2058,62 @@ async function updateFilesPage(options={}){
  const target = document.getElementById("filesTree");
  if(target){
   const pageResult = valid ? result : {rows:fileRowsCache, page:filesPage, page_size:filesPageSize, total:fileRowsCache.length};
-  target.innerHTML = holdTableMessage(valid ? pageResult : (fileRowsCache.length ? pageResult : null)) + fileTree(fileRowsCache, showDeleted) + paginationControls(pageResult, "filesPage", "updateFilesPage", "filesPageSize");
-  target.querySelectorAll("details[data-path]").forEach(details => {
-   if(openFolders.has(details.dataset.path)) details.open = true;
-  });
+  const nextSignature = filesTreeStructureSignature(fileRowsCache, pageResult, showDeleted);
+  const nextHtml = holdTableMessage(valid ? pageResult : (fileRowsCache.length ? pageResult : null)) + fileTree(fileRowsCache, showDeleted) + paginationControls(pageResult, "filesPage", "updateFilesPage", "filesPageSize");
+  if(!target.querySelector(".tree") || filesTreeSignature !== nextSignature){
+   target.innerHTML = nextHtml;
+   filesTreeSignature = nextSignature;
+   target.querySelectorAll("details[data-path]").forEach(details => {
+    if(openFolders.has(details.dataset.path)) details.open = true;
+   });
+  } else {
+   patchFilesTree(target, nextHtml);
+  }
   updateFolderCheckboxStates();
   updateFilesSelectionSummary();
  }
+}
+function filesTreeStructureSignature(rows, pageResult, showDeleted){
+ const folders = new Set();
+ for(const row of rows){
+  const parts = String(row.relative_path || row.path || "").split(/[\\/]+/).filter(Boolean);
+  for(let index=1; index<parts.length; index++) folders.add(parts.slice(0, index).join("/"));
+ }
+ return JSON.stringify({
+  page:Number(pageResult.page || 1),
+  pageSize:Number(pageResult.page_size || filesPageSize),
+  total:Number(pageResult.total || rows.length),
+  deleted:!!showDeleted,
+  sort:tableSorts.files || {},
+  folders:Array.from(folders).sort(),
+  files:rows.map(row => [Number(row.id), row.relative_path || row.path || "", row.state === "deleted"]).sort((a,b)=>String(a[1]).localeCompare(String(b[1])))
+ });
+}
+function patchFilesTree(target, nextHtml){
+ const template = document.createElement("template");
+ template.innerHTML = nextHtml;
+ patchSelectorGroup(target, template.content, "[data-file-id]");
+ patchSelectorGroup(target, template.content, "[data-folder-row-path]");
+ const currentPagination = target.querySelector(".pagination");
+ const nextPagination = template.content.querySelector(".pagination");
+ if(currentPagination && nextPagination && currentPagination.outerHTML !== nextPagination.outerHTML) currentPagination.replaceWith(nextPagination);
+ const currentHold = target.querySelector(".table-hold");
+ const nextHold = template.content.querySelector(".table-hold");
+ if(currentHold && nextHold && currentHold.outerHTML !== nextHold.outerHTML) currentHold.replaceWith(nextHold);
+ else if(!currentHold && nextHold) target.prepend(nextHold);
+ else if(currentHold && !nextHold) currentHold.remove();
+}
+function patchSelectorGroup(target, source, selector){
+ source.querySelectorAll(selector).forEach(nextNode => {
+  const key = nextNode.dataset.fileId || nextNode.dataset.folderRowPath;
+  const attr = nextNode.dataset.fileId ? "file-id" : "folder-row-path";
+  const current = target.querySelector(`[data-${attr}="${cssEscapeValue(key)}"]`);
+  if(current && current.outerHTML !== nextNode.outerHTML) current.replaceWith(nextNode);
+ });
+}
+function cssEscapeValue(value){
+ if(window.CSS && CSS.escape) return CSS.escape(String(value));
+ return String(value).replace(/["\\]/g, "\\$&");
 }
 async function refreshOperationProgress(){
  const result = await api("/api/operations/progress");
@@ -3125,7 +3176,7 @@ function treeNode(node, prefix, showDeleted){
   const canRestore = folderChunkCount(node.dirs[name]) > 0;
   const canPrioritize = folderCanPrioritize(node.dirs[name]);
   const ids = collectNodeFiles(node.dirs[name]).map(file => Number(file.id));
-  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row folder-row"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span></span><span class="tree-meta">${countFiles(node.dirs[name])} files / ${formatBytes(node.dirs[name].total_size || 0)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span class="tree-actions">${canPrioritize ? `<button class="icon-btn" title="Select folder for backup" onclick="event.preventDefault();selectFolderForBackup(${jsString(path)})">&#10003;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
+  return `<li class="folder"><details data-path="${esc(path)}"><summary class="tree-row folder-row" data-folder-row-path="${esc(path)}"><input type="checkbox" class="folderSelect" data-file-ids="${esc(ids.join(","))}" onchange="event.stopPropagation();selectFolderFiles(this.dataset.fileIds, this.checked)"><span>&#128193;</span><span class="tree-name">${esc(name)}</span><span></span><span class="tree-meta">${countFiles(node.dirs[name])} files / ${formatBytes(node.dirs[name].total_size || 0)}</span>${statePill(state)}${folderVerifiedPill(node.dirs[name])}<span class="tree-actions">${canPrioritize ? `<button class="icon-btn" title="Select folder for backup" data-path="${esc(path)}" onclick="event.preventDefault();selectFolderForBackup(this.dataset.path)">&#10003;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></summary><ul>${treeNode(node.dirs[name], path, showDeleted)}</ul></details></li>`;
  }).join("");
  const fileHtml = node.files.sort(compareFileRows).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
@@ -3185,7 +3236,7 @@ function fileRow(file){
  const checked = selectedFiles.has(Number(file.id)) ? "checked" : "";
  const progress = fileProgress(file);
  const displayState = activeOperationFor("download", Number(file.id)) ? "downloading" : activeOperationFor("restore", Number(file.id)) ? "restoring" : file.state;
- return `<li><div class="tree-row file-row">
+ return `<li><div class="tree-row file-row" data-file-id="${Number(file.id)}">
   <input type="checkbox" class="fileSelect" value="${Number(file.id)}" ${checked} onchange="setFileSelected(${Number(file.id)}, this.checked)">
   <span>&#128196;</span>
   <span class="tree-name">${esc(file.display_name)}</span>

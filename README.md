@@ -201,15 +201,17 @@ services:
       context: .
       args:
         GITHUB_TOKEN: ${GITHUB_TOKEN:?GitHub token with read access is required while this repository is private}
+        BACKUPRR_REF: main
       dockerfile_inline: |
         FROM python:3.12-slim
         ARG GITHUB_TOKEN
+        ARG BACKUPRR_REF=main
         ENV PYTHONDONTWRITEBYTECODE=1 \
             PYTHONUNBUFFERED=1
         RUN apt-get update \
             && (apt-get install -y --no-install-recommends par2cmdline || apt-get install -y --no-install-recommends par2) \
             && rm -rf /var/lib/apt/lists/* \
-            && pip install --no-cache-dir "https://x-access-token:$${GITHUB_TOKEN}@github.com/kelau/Backuprr/archive/refs/heads/main.zip" \
+            && pip install --no-cache-dir "https://x-access-token:$${GITHUB_TOKEN}@github.com/kelau/Backuprr/archive/$${BACKUPRR_REF}.zip" \
             && useradd --system --uid 10001 --home-dir /app backuprr \
             && mkdir -p /app /data /media \
             && chown -R backuprr:backuprr /app /data /media
