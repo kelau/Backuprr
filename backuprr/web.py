@@ -183,6 +183,9 @@ class Handler(BaseHTTPRequestHandler):
     operations: dict[str, dict[str, Any]] = {}
     rate_limit_lock = threading.Lock()
     rate_limit_hits: dict[str, list[float]] = {}
+    dashboard_cache_lock = threading.Lock()
+    dashboard_cache_payload: dict[str, Any] | None = None
+    dashboard_cache_at = 0.0
 
     def log_message(self, fmt: str, *args: Any) -> None:
         if getattr(self.config, "log_web_access", False):
@@ -595,7 +598,7 @@ class Handler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/status":
             self.send_json(self.status_payload())
         elif parsed.path == "/api/dashboard":
-            self.send_json(self.dashboard_payload())
+            self.send_json(self.cached_dashboard_payload())
         elif parsed.path == "/api/speed":
             self.send_json(self.db.speed_samples(int(query.get("minutes", ["30"])[0]), int(query.get("bucket", ["60"])[0])))
         elif parsed.path == "/api/events/stream":
@@ -1036,6 +1039,17 @@ class Handler(BaseHTTPRequestHandler):
             "speed": self.db.speed_samples(10, 10),
             "readiness": backup_readiness_report(self.db, self.config),
         }
+
+    def cached_dashboard_payload(self) -> dict[str, Any]:
+        now = time.time()
+        with Handler.dashboard_cache_lock:
+            if Handler.dashboard_cache_payload is not None and now - Handler.dashboard_cache_at < 1.5:
+                return copy.deepcopy(Handler.dashboard_cache_payload)
+        payload = self.dashboard_payload()
+        with Handler.dashboard_cache_lock:
+            Handler.dashboard_cache_payload = copy.deepcopy(payload)
+            Handler.dashboard_cache_at = time.time()
+        return payload
 
     def queue_page_payload(self, status: str | None, page: int, page_size: int, sort_by: str = "", sort_dir: str = "asc") -> dict[str, Any]:
         offset = (max(1, page) - 1) * page_size
@@ -1558,6 +1572,7 @@ let performanceSamples = [];
 let healthBarFetchedAt = 0;
 let dashboardCache = null;
 let dashboardCacheAt = 0;
+let dashboardInFlight = null;
 let liveRefreshTimer = null;
 let pendingPreviousChange = null;
 let pendingChangeToken = null;
@@ -1604,6 +1619,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.113":["Dashboard live refreshes now coalesce in-flight requests and reuse short-lived server snapshots to avoid overlapping slow Status requests."],
  "0.2.112":["Added a Dockhand-inspired UI template and reduced page refresh connection bursts with bundled Queue and Operations snapshots."],
  "0.2.111":["Files now has explicit folder exclude actions and shows whether folders match include or exclude backup-selection rules."],
  "0.2.110":["Encryption settings now support a direct passphrase as well as an environment variable, and legacy passphrases entered in the env field are migrated automatically."],
@@ -1929,12 +1945,17 @@ function nav(){
 async function loadDashboard(force=false){
  const now = Date.now();
  if(!force && dashboardCache && now - dashboardCacheAt < 1500) return dashboardCache;
- const data = await api("/api/dashboard");
- if(data && !data.error){
-  dashboardCache = data;
-  dashboardCacheAt = Date.now();
- }
- return dashboardCache || data;
+ if(dashboardInFlight) return dashboardInFlight;
+ dashboardInFlight = api("/api/dashboard").then(data => {
+  if(data && !data.error){
+   dashboardCache = data;
+   dashboardCacheAt = Date.now();
+  }
+  return dashboardCache || data;
+ }).finally(() => {
+  dashboardInFlight = null;
+ });
+ return dashboardInFlight;
 }
 async function updateHealthBar(dashboard=null, force=false){
  const target = document.getElementById("healthBar");

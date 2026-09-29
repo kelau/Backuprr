@@ -201,7 +201,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.112")
+        self.assertEqual(__version__, "0.2.113")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -273,6 +273,29 @@ class CoreTests(unittest.TestCase):
         payload = handler.operations_payload()
         for key in ["operations", "tasks", "plan", "benchmark", "recovery", "health", "maintenance", "readiness", "history"]:
             self.assertIn(key, payload)
+
+    def test_dashboard_payload_uses_short_lived_cache(self):
+        handler = object.__new__(Handler)
+        calls = {"count": 0}
+
+        def fake_dashboard_payload():
+            calls["count"] += 1
+            return {"status": {"calls": calls["count"]}}
+
+        handler.dashboard_payload = fake_dashboard_payload
+        Handler.dashboard_cache_payload = None
+        Handler.dashboard_cache_at = 0.0
+        try:
+            first = handler.cached_dashboard_payload()
+            second = handler.cached_dashboard_payload()
+            self.assertEqual(first, second)
+            self.assertEqual(calls["count"], 1)
+            first["status"]["calls"] = 99
+            third = handler.cached_dashboard_payload()
+            self.assertEqual(third["status"]["calls"], 1)
+        finally:
+            Handler.dashboard_cache_payload = None
+            Handler.dashboard_cache_at = 0.0
 
     def test_mark_backup_tool_repaired_clears_error_and_resumes_worker(self):
         self.db.save_worker_state("backup", "Backup", "", "", "", 1.0, "", "PAR2 command not found", 1, 1)
