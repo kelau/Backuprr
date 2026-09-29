@@ -582,6 +582,8 @@ class Handler(BaseHTTPRequestHandler):
             self.forbidden("internal API token is required")
         elif parsed.path == "/api/status":
             self.send_json(self.status_payload())
+        elif parsed.path == "/api/dashboard":
+            self.send_json(self.dashboard_payload())
         elif parsed.path == "/api/speed":
             self.send_json(self.db.speed_samples(int(query.get("minutes", ["30"])[0]), int(query.get("bucket", ["60"])[0])))
         elif parsed.path == "/api/events/stream":
@@ -990,6 +992,14 @@ class Handler(BaseHTTPRequestHandler):
             "alerts": notification_alerts(self.db, self.config),
             "provider_confidence": provider_confidence_report(self.db),
             "scan_progress": self.scan_progress_payload(),
+        }
+
+    def dashboard_payload(self) -> dict[str, Any]:
+        return {
+            "status": self.status_payload(),
+            "tasks": self.all_tasks(),
+            "speed": self.db.speed_samples(10, 10),
+            "readiness": backup_readiness_report(self.db, self.config),
         }
 
     def scan_progress_payload(self) -> dict[str, Any]:
@@ -1453,6 +1463,11 @@ let verificationProgressFetchedAt = 0;
 let apiRateLimitedUntil = 0;
 let performanceSamples = [];
 let healthBarFetchedAt = 0;
+let dashboardCache = null;
+let dashboardCacheAt = 0;
+let liveRefreshTimer = null;
+let pendingPreviousChange = null;
+let pendingChangeToken = null;
 let renderSeq = 0;
 let appVersion = "";
 let logLevelSelection = ["error","warning","info"];
@@ -1496,6 +1511,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.107":["Status refreshes now use one combined dashboard request and live-change events are debounced to avoid internal API 429 bursts."],
  "0.2.106":["Files now loads folders incrementally, patches visible rows during live progress updates, adds UI timing samples, and creates indexes for large-library queries."],
  "0.2.105":["Catalog scans now record new files immediately without hashing content; file hashes are calculated later when a selected file is backed up."],
  "0.2.104":["Files no longer emits invalid summary markup and now renders folded folders lazily so large file browsers stay responsive."],
@@ -1812,14 +1828,26 @@ function nav(){
  const title = document.getElementById("pageTitle");
  if(title) title.textContent = page;
 }
-async function updateHealthBar(){
+async function loadDashboard(force=false){
+ const now = Date.now();
+ if(!force && dashboardCache && now - dashboardCacheAt < 1500) return dashboardCache;
+ const data = await api("/api/dashboard");
+ if(data && !data.error){
+  dashboardCache = data;
+  dashboardCacheAt = Date.now();
+ }
+ return dashboardCache || data;
+}
+async function updateHealthBar(dashboard=null, force=false){
  const target = document.getElementById("healthBar");
  if(!target) return;
  const now = Date.now();
- if(now - healthBarFetchedAt < 2500) return;
+ if(!dashboard && now - healthBarFetchedAt < 2500) return;
  healthBarFetchedAt = now;
  try{
-  const [status, readiness] = await Promise.all([api("/api/status"), api("/api/readiness")]);
+  const data = dashboard || await loadDashboard(force);
+  const status = data?.status || {};
+  const readiness = data?.readiness || {};
   const stats = status.stats || {};
   const paused = (status.paused_workers || []).length;
   const attention = Number(stats.queue_attention_count || 0);
@@ -1843,11 +1871,11 @@ function commandItems(){
   ["Queue", () => navigatePage("Queue")],
   ["Operations", () => navigatePage("Operations")],
   ["Settings", () => navigatePage("Settings")],
-  ["Backup now", () => post("/api/backup/run").then(updateHealthBar)],
-  ["Scan now", () => post("/api/scan").then(updateHealthBar)],
-  ["Verify chunks", () => post("/api/verify/start", {force:true}).then(updateHealthBar)],
-  ["Pause all workers", () => post("/api/worker/pause", {kind:"all"}).then(updateHealthBar)],
-  ["Resume all workers", () => post("/api/worker/resume", {kind:"all"}).then(updateHealthBar)]
+  ["Backup now", () => post("/api/backup/run").then(() => updateHealthBar(null, true))],
+  ["Scan now", () => post("/api/scan").then(() => updateHealthBar(null, true))],
+  ["Verify chunks", () => post("/api/verify/start", {force:true}).then(() => updateHealthBar(null, true))],
+  ["Pause all workers", () => post("/api/worker/pause", {kind:"all"}).then(() => updateHealthBar(null, true))],
+  ["Resume all workers", () => post("/api/worker/resume", {kind:"all"}).then(() => updateHealthBar(null, true))]
  ];
 }
 function openCommandPalette(){
@@ -1873,10 +1901,23 @@ function connectChanges(){
   const token = JSON.parse(event.data);
   const previous = lastChangeToken;
   lastChangeToken = token;
-  if(previous) refreshPageForChanges(previous, token);
-  else refreshCurrentLivePage();
+  queueLiveRefresh(previous, token);
  });
  eventSource.onerror = () => {};
+}
+function queueLiveRefresh(previous, token){
+ if(previous && !pendingPreviousChange) pendingPreviousChange = previous;
+ pendingChangeToken = token;
+ if(liveRefreshTimer) return;
+ liveRefreshTimer = setTimeout(async () => {
+  const start = pendingPreviousChange;
+  const latest = pendingChangeToken;
+  pendingPreviousChange = null;
+  pendingChangeToken = null;
+  liveRefreshTimer = null;
+  if(start && latest) await refreshPageForChanges(start, latest);
+  else await refreshCurrentLivePage();
+ }, 350);
 }
 function pushLabel(){
  return "";
@@ -1942,7 +1983,7 @@ async function render(){
  else applyTheme(settingsCache.ui_theme);
  if(!isActiveRender(renderToken, requestedPage)) return;
  await updateVersionPill();
- await updateHealthBar();
+ if(requestedPage !== "Status") await updateHealthBar();
  if(!isActiveRender(renderToken, requestedPage)) return;
  const c = document.getElementById("content");
  if(requestedPage==="Status"){
@@ -2036,7 +2077,11 @@ async function refreshPageForChanges(previous, token){
  const chunksChanged = previous.chunks_total !== token.chunks_total;
  const tasksChanged = previous.task_revision !== token.task_revision;
  const operationsChanged = previous.operation_revision !== token.operation_revision;
- if(page==="Status" && (filesChanged || queueChanged || chunksChanged || tasksChanged || transferChanged || operationsChanged)) await updateStatusPage();
+ let dashboardRefreshed = false;
+ if(page==="Status" && (filesChanged || queueChanged || chunksChanged || tasksChanged || transferChanged || operationsChanged)){
+  await updateStatusPage({force:true});
+  dashboardRefreshed = true;
+ }
  if(page==="Files" && filesChanged) await updateFilesPage();
  else if(page==="Files" && (queueChanged || transferChanged || operationsChanged)) await updateVisibleFileRows();
  if(page==="Log" && eventsChanged) await updateLogPage({incremental:true});
@@ -2046,15 +2091,14 @@ async function refreshPageForChanges(previous, token){
  if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged || transferChanged)) await updateStatisticsPage();
  if(page==="Operations" && (eventsChanged || tasksChanged || transferChanged)) await updateOperationsPage();
  if(page==="Security" && eventsChanged) await updateSecurityPage();
- if(filesChanged || queueChanged || eventsChanged || tasksChanged || transferChanged) await updateHealthBar();
+ if(!dashboardRefreshed && (filesChanged || queueChanged || eventsChanged || tasksChanged || transferChanged)) await updateHealthBar(null, true);
 }
 async function updateStatusPage(options={}){
- const [s, tasks, speed, readiness] = await Promise.all([
-  api("/api/status"),
-  api("/api/tasks"),
-  api("/api/speed?minutes=10&bucket=10"),
-  api("/api/readiness")
- ]);
+ const dashboard = await loadDashboard(options.force === true);
+ const s = dashboard?.status || {};
+ const tasks = dashboard?.tasks || [];
+ const speed = dashboard?.speed || [];
+ const readiness = dashboard?.readiness || {};
  if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Status")) return;
  if(s?.error || !Array.isArray(tasks)) return;
  appVersion = s.version;
@@ -2062,13 +2106,15 @@ async function updateStatusPage(options={}){
  maybeShowVersionNotice(appVersion);
  const panel = document.getElementById("statusPanel");
  if(panel) panel.innerHTML = statusDashboard(s, tasks, speed, readiness);
+ await updateHealthBar(dashboard);
  updateNextRunLabels();
 }
 async function updateVersionPill(){
  if(appVersion) return updateVersionPillText();
  const target = document.getElementById("version");
  if(!target) return;
- const s = await api("/api/status");
+ const dashboard = await loadDashboard();
+ const s = dashboard?.status || {};
  appVersion = s.version;
  updateVersionPillText();
  maybeShowVersionNotice(appVersion);
