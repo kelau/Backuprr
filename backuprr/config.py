@@ -203,7 +203,7 @@ class Config:
     manifest_export_encrypt: bool = False
     manifest_export_passphrase_env: str = "BACKUPRR_MANIFEST_EXPORT_SECRET"
     manifest_export_interval_seconds: int = 86400
-    ui_theme: str = "harbor_light"
+    ui_theme: str = "dockhand"
     ui_reduced_motion: bool = False
     update_check_enabled: bool = True
     update_github_repo: str = "kelau/Backuprr"
@@ -607,7 +607,7 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         config.manifest_export_interval_seconds = interval
     if "ui_theme" in data:
         theme = str(data["ui_theme"]).strip()
-        if theme not in {"harbor_light", "emerald_console", "slate_cinema", "graphite", "nordic_mint"}:
+        if theme not in {"dockhand", "harbor_light", "emerald_console", "slate_cinema", "graphite", "nordic_mint"}:
             raise ValueError("ui_theme is not a supported template")
         config.ui_theme = theme
     if "ui_reduced_motion" in data:

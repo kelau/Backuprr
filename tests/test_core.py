@@ -201,7 +201,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.111")
+        self.assertEqual(__version__, "0.2.112")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -244,6 +244,35 @@ class CoreTests(unittest.TestCase):
         self.assertIsNotNone(regex.search("Music/Albums"))
         self.assertIsNotNone(regex.search("Music/Albums/song.flac"))
         self.assertIsNone(regex.search("Music/Albumset/song.flac"))
+
+    def test_default_ui_theme_is_dockhand(self):
+        self.assertEqual(Config().ui_theme, "dockhand")
+
+    def test_queue_snapshot_payload_bundles_queue_tables(self):
+        media = self.root / "media"
+        media.mkdir()
+        (media / "movie.mkv").write_bytes(b"movie")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db, self.config)
+        handler = object.__new__(Handler)
+        handler.db = self.db
+        handler.config = self.config
+        payload = handler.queue_snapshot_payload({"page_size": ["10"]})
+        self.assertIn("attention", payload)
+        self.assertIn("active", payload)
+        self.assertIn("done", payload)
+        self.assertIn("operations", payload)
+        self.assertEqual(payload["active"]["total"], 1)
+
+    def test_operations_payload_bundles_dashboard_dependencies(self):
+        handler = object.__new__(Handler)
+        handler.db = self.db
+        handler.config = self.config
+        handler.all_tasks = lambda: []
+        payload = handler.operations_payload()
+        for key in ["operations", "tasks", "plan", "benchmark", "recovery", "health", "maintenance", "readiness", "history"]:
+            self.assertIn(key, payload)
 
     def test_mark_backup_tool_repaired_clears_error_and_resumes_worker(self):
         self.db.save_worker_state("backup", "Backup", "", "", "", 1.0, "", "PAR2 command not found", 1, 1)

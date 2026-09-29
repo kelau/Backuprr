@@ -769,6 +769,8 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif parsed.path == "/api/log/event-types":
             self.send_json(self.db.event_types())
+        elif parsed.path == "/api/queue/snapshot":
+            self.send_json(self.queue_snapshot_payload(query))
         elif parsed.path == "/api/queue":
             self.db.cleanup_completed_queue()
             page = max(1, int(query.get("page", ["1"])[0]))
@@ -787,6 +789,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"profile": self.config.public_dict(), "exported_at": datetime.now(timezone.utc).isoformat(), "version": __version__})
         elif parsed.path == "/api/operations/progress":
             self.send_json({"operations": self.operation_rows()})
+        elif parsed.path == "/api/operations/snapshot":
+            self.send_json(self.operations_payload())
         else:
             self.send_json({"error": "not found"}, 404)
 
@@ -1033,6 +1037,61 @@ class Handler(BaseHTTPRequestHandler):
             "readiness": backup_readiness_report(self.db, self.config),
         }
 
+    def queue_page_payload(self, status: str | None, page: int, page_size: int, sort_by: str = "", sort_dir: str = "asc") -> dict[str, Any]:
+        offset = (max(1, page) - 1) * page_size
+        rows = [
+            self.queue_row_payload(row)
+            for row in self.db.list_queue_sorted(status=status, limit=page_size, offset=offset, sort_by=sort_by, sort_dir=sort_dir)
+        ]
+        return {"rows": rows, "page": max(1, page), "page_size": page_size, "total": self.db.queue_count(status=status), "sort": sort_by, "dir": sort_dir}
+
+    def queue_snapshot_payload(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        self.db.cleanup_completed_queue()
+        page_size = max(1, min(100, int(query.get("page_size", ["10"])[0])))
+        return {
+            "attention": self.queue_page_payload(
+                "attention",
+                int(query.get("attention_page", ["1"])[0]),
+                page_size,
+                query.get("attention_sort", [""])[0],
+                query.get("attention_dir", ["asc"])[0],
+            ),
+            "active": self.queue_page_payload(
+                None,
+                int(query.get("active_page", ["1"])[0]),
+                page_size,
+                query.get("active_sort", [""])[0],
+                query.get("active_dir", ["asc"])[0],
+            ),
+            "done": self.queue_page_payload(
+                "done",
+                int(query.get("done_page", ["1"])[0]),
+                page_size,
+                query.get("done_sort", [""])[0],
+                query.get("done_dir", ["asc"])[0],
+            ),
+            "operations": self.operation_rows(),
+        }
+
+    def operations_payload(self) -> dict[str, Any]:
+        return {
+            "operations": self.operation_rows(),
+            "tasks": self.all_tasks(),
+            "plan": dry_run_plan(self.db, self.config),
+            "benchmark": synthetic_catalog_plan(50000, 1024 * 1024 * 1024, self.config.article_size, 1000),
+            "recovery": disaster_recovery_report(self.db, self.config),
+            "health": {"hosts": rowdicts(self.db.host_health_rows(50))},
+            "maintenance": rowdicts(self.db.maintenance_rows(50)),
+            "drills": rowdicts(self.db.restore_drill_rows(50)),
+            "runs": rowdicts(self.db.backup_run_rows(20)),
+            "setup": setup_health_check(self.db, self.config),
+            "alerts": {"alerts": notification_alerts(self.db, self.config)},
+            "failover": provider_failover_simulation(self.config, ""),
+            "readiness": backup_readiness_report(self.db, self.config),
+            "schedule": maintenance_schedule_report(self.db, self.config),
+            "history": {"rows": config_history_rows(self.db, 20)},
+        }
+
     def scan_progress_payload(self) -> dict[str, Any]:
         raw = self.db.get_meta("scan.progress")
         if not raw:
@@ -1273,6 +1332,7 @@ INDEX_HTML = r"""<!doctype html>
 <title>Backuprr</title>
 <style>
 :root { color-scheme: light; --ink:#243238; --muted:#687c81; --line:#d5e2e1; --bg:#edf5f4; --surface:#f7fbfa; --panel:#ffffff; --panel-2:#eef8f6; --accent:#0f9f90; --accent-2:#04776e; --warn:#b45309; --bad:#dc2626; --good:#059669; --shadow:0 12px 28px rgba(13,36,40,.10); --body-bg:linear-gradient(135deg,#edf7f5 0%,#f8fbfa 48%,#e2f2ef 100%); --header-bg:rgba(248,251,250,.92); --sidebar-bg:linear-gradient(180deg,#f9fcfb,#eaf5f3); --toolbar-bg:rgba(255,255,255,.88); --input-bg:#ffffff; --table-head-bg:#edf6f4; --track-bg:#dcebe8; --row-hover:rgba(15,159,144,.07); --nav-text:#365056; --nav-active-bg:linear-gradient(90deg,rgba(15,159,144,.18),rgba(15,159,144,.05)); --nav-hover-bg:rgba(15,159,144,.10); --brand-bg:linear-gradient(145deg,#dcf7f2,#1fb8a6); --brand-lock:#093a36; --hero-bg:radial-gradient(circle at top right,rgba(31,184,166,.20),transparent 34%), linear-gradient(180deg,#ffffff,#eef8f6); }
+html[data-theme="dockhand"] { color-scheme: dark; --ink:#e8f1f7; --muted:#9eb0bf; --line:#254563; --bg:#081522; --surface:#0b1d30; --panel:#102942; --panel-2:#143553; --accent:#24c6b1; --accent-2:#6ee7d8; --warn:#f2b84b; --bad:#ff6b6b; --good:#42d392; --shadow:0 18px 42px rgba(0,0,0,.32); --body-bg:#07131f; --header-bg:rgba(10,30,48,.96); --sidebar-bg:#08192a; --toolbar-bg:#0d253d; --input-bg:#0b2035; --table-head-bg:#0b2238; --track-bg:#0a1c2d; --row-hover:rgba(60,145,190,.13); --nav-text:#c6d5e0; --nav-active-bg:linear-gradient(90deg,rgba(36,198,177,.28),rgba(36,198,177,.08)); --nav-hover-bg:rgba(75,126,166,.20); --brand-bg:linear-gradient(145deg,#153c5c,#24c6b1); --brand-lock:#07131f; --hero-bg:radial-gradient(circle at top right,rgba(36,198,177,.18),transparent 34%), linear-gradient(180deg,#12314f,#0f2740); }
 html[data-theme="emerald_console"] { color-scheme: dark; --ink:#dce7e4; --muted:#8fa39f; --line:#2b3b3d; --bg:#0d1416; --surface:#121c1f; --panel:#182427; --panel-2:#1d2b2f; --accent:#18a999; --accent-2:#7dd3c7; --warn:#f59e0b; --bad:#ef4444; --good:#34d399; --shadow:0 14px 38px rgba(0,0,0,.28); --body-bg:linear-gradient(135deg,#0a1012 0%,#0f1b1d 48%,#102321 100%); --header-bg:rgba(13,20,22,.88); --sidebar-bg:linear-gradient(180deg,#111b1e,#0d1517); --toolbar-bg:rgba(18,28,31,.78); --input-bg:#0f181a; --table-head-bg:#111d20; --track-bg:#0d1517; --row-hover:rgba(125,211,199,.04); --nav-text:#b7c8c5; --nav-active-bg:linear-gradient(90deg,rgba(24,169,153,.20),rgba(24,169,153,.05)); --nav-hover-bg:rgba(125,211,199,.10); --brand-bg:linear-gradient(145deg,#143b39,#1eb7a5); --brand-lock:#d8fff9; --hero-bg:radial-gradient(circle at top right,rgba(24,169,153,.22),transparent 34%), linear-gradient(180deg,var(--panel-2),var(--panel)); }
 html[data-theme="slate_cinema"] { color-scheme: dark; --ink:#d9e2e8; --muted:#9aa8b2; --line:#33414a; --bg:#111820; --surface:#151f28; --panel:#1c2832; --panel-2:#22313d; --accent:#22c7aa; --accent-2:#82e6d8; --warn:#fbbf24; --bad:#fb7185; --good:#4ade80; --shadow:0 16px 36px rgba(0,0,0,.30); --body-bg:linear-gradient(135deg,#0d131a,#17212a 52%,#172d2c); --header-bg:rgba(15,22,30,.90); --sidebar-bg:linear-gradient(180deg,#151f28,#101820); --toolbar-bg:rgba(28,40,50,.82); --input-bg:#121c25; --table-head-bg:#16222c; --track-bg:#111820; --row-hover:rgba(34,199,170,.06); --nav-text:#c4d0d6; --nav-active-bg:linear-gradient(90deg,rgba(34,199,170,.18),rgba(34,199,170,.04)); --nav-hover-bg:rgba(130,230,216,.09); --brand-bg:linear-gradient(145deg,#182b36,#22c7aa); --brand-lock:#e6fffb; --hero-bg:radial-gradient(circle at top right,rgba(34,199,170,.18),transparent 34%), linear-gradient(180deg,#22313d,#1c2832); }
 html[data-theme="graphite"] { color-scheme: dark; --ink:#e2e8e5; --muted:#a3aca9; --line:#3b4140; --bg:#151716; --surface:#1a1d1c; --panel:#222625; --panel-2:#2b302f; --accent:#20b486; --accent-2:#9ee9c8; --warn:#f59e0b; --bad:#f87171; --good:#34d399; --shadow:0 14px 34px rgba(0,0,0,.27); --body-bg:linear-gradient(135deg,#101211,#1c201f 50%,#162620); --header-bg:rgba(22,24,23,.91); --sidebar-bg:linear-gradient(180deg,#1b1f1e,#141716); --toolbar-bg:rgba(34,38,37,.84); --input-bg:#191d1c; --table-head-bg:#1a1e1d; --track-bg:#121514; --row-hover:rgba(32,180,134,.06); --nav-text:#c3cbc8; --nav-active-bg:linear-gradient(90deg,rgba(32,180,134,.20),rgba(32,180,134,.04)); --nav-hover-bg:rgba(158,233,200,.08); --brand-bg:linear-gradient(145deg,#2b302f,#20b486); --brand-lock:#ecfff7; --hero-bg:radial-gradient(circle at top right,rgba(32,180,134,.18),transparent 34%), linear-gradient(180deg,#2b302f,#222625); }
@@ -1469,6 +1529,7 @@ const pageSlugs = {
 };
 const slugPages = Object.fromEntries(Object.entries(pageSlugs).map(([name, slug]) => [slug, name]));
 const themeTemplates = [
+ { id:"dockhand", name:"Dockhand" },
  { id:"harbor_light", name:"Harbor Light" },
  { id:"emerald_console", name:"Emerald Console" },
  { id:"slate_cinema", name:"Slate Cinema" },
@@ -1486,6 +1547,7 @@ let filesFolderCache = new Map();
 let filesFilterSignature = "";
 let filesLoadedFolders = new Set();
 let operationRowsCache = [];
+let operationProgressFetchedAt = 0;
 let verificationRowsCache = new Map();
 let verificationTableCache = {};
 let verificationRefreshSeq = 0;
@@ -1542,6 +1604,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.112":["Added a Dockhand-inspired UI template and reduced page refresh connection bursts with bundled Queue and Operations snapshots."],
  "0.2.111":["Files now has explicit folder exclude actions and shows whether folders match include or exclude backup-selection rules."],
  "0.2.110":["Encryption settings now support a direct passphrase as well as an environment variable, and legacy passphrases entered in the env field are migrated automatically."],
  "0.2.109":["Repairing PAR2 configuration now clears stale backup-worker errors, resumes the backup worker, and triggers a retry immediately."],
@@ -1665,7 +1728,7 @@ function themeOptions(selected){
  return themeTemplates.map(theme => `<option value="${theme.id}" ${theme.id===selected ? "selected" : ""}>${esc(theme.name)}</option>`).join("");
 }
 function applyTheme(theme){
- const selected = themeTemplates.some(item => item.id === theme) ? theme : "harbor_light";
+ const selected = themeTemplates.some(item => item.id === theme) ? theme : "dockhand";
  document.documentElement.dataset.theme = selected;
  document.documentElement.dataset.reducedMotion = settingsCache?.ui_reduced_motion ? "true" : "false";
  return selected;
@@ -2330,26 +2393,37 @@ function cssEscapeValue(value){
  if(window.CSS && CSS.escape) return CSS.escape(String(value));
  return String(value).replace(/["\\]/g, "\\$&");
 }
-async function refreshOperationProgress(){
+async function refreshOperationProgress(force=false){
+ const now = Date.now();
+ if(!force && now - operationProgressFetchedAt < 750) return;
  const result = await api("/api/operations/progress");
  if(result && !result.error && Array.isArray(result.operations)){
   operationRowsCache = result.operations;
+  operationProgressFetchedAt = Date.now();
  }
 }
 async function updateQueuePage(options={}){
- const attention = await api(`/api/queue?status=attention&page=${attentionQueuePage}&page_size=${queuePageSize}${sortQuery("queueAttention")}`);
- const active = await api(`/api/queue?page=${activeQueuePage}&page_size=${queuePageSize}${sortQuery("queueActive")}`);
- const done = await api(`/api/queue?status=done&page=${completedQueuePage}&page_size=${queuePageSize}${sortQuery("queueCompleted")}`);
+ const queueUrl = `/api/queue/snapshot?attention_page=${attentionQueuePage}&active_page=${activeQueuePage}&done_page=${completedQueuePage}&page_size=${queuePageSize}${snapshotSortQuery("attention", "queueAttention")}${snapshotSortQuery("active", "queueActive")}${snapshotSortQuery("done", "queueCompleted")}`;
+ const snapshot = await api(queueUrl);
  if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Queue")) return;
- queueResultCache.attention = validPagedResult(attention) ? attention : queueResultCache.attention;
- queueResultCache.active = validPagedResult(active) ? active : queueResultCache.active;
- queueResultCache.done = validPagedResult(done) ? done : queueResultCache.done;
+ if(snapshot && !snapshot.error && Array.isArray(snapshot.operations)) {
+  operationRowsCache = snapshot.operations;
+  operationProgressFetchedAt = Date.now();
+ }
+ queueResultCache.attention = validPagedResult(snapshot?.attention) ? snapshot.attention : queueResultCache.attention;
+ queueResultCache.active = validPagedResult(snapshot?.active) ? snapshot.active : queueResultCache.active;
+ queueResultCache.done = validPagedResult(snapshot?.done) ? snapshot.done : queueResultCache.done;
  const attentionTarget = document.getElementById("attentionQueueRows");
  const activeTarget = document.getElementById("activeQueueRows");
  const doneTarget = document.getElementById("completedQueueRows");
  if(attentionTarget) attentionTarget.innerHTML = pagedTable(queueResultCache.attention, "attentionQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"], "queueAttention");
  if(activeTarget) activeTarget.innerHTML = pagedTable(queueResultCache.active, "activeQueuePage", ["file_id","position","priority","status","reason","path","size","progress","state"], "queueActive");
  if(doneTarget) doneTarget.innerHTML = pagedTable(queueResultCache.done, "completedQueuePage", ["file_id","path","size","chunk_count","state"], "queueCompleted");
+}
+function snapshotSortQuery(prefix, scope){
+ const sort = tableSorts[scope] || {};
+ if(!sort.col) return "";
+ return `&${prefix}_sort=${encodeURIComponent(sort.col)}&${prefix}_dir=${encodeURIComponent(sort.dir || "asc")}`;
 }
 function pagedTable(result, pageVar, cols, scope){
  if(!validPagedResult(result)) return holdTableMessage(null);
@@ -2602,27 +2676,30 @@ async function updateStatisticsPage(options={}){
  if(target) target.innerHTML = statisticsDashboard(data);
 }
 async function updateOperationsPage(options={}){
- await refreshOperationProgress();
- const [tasks, plan, benchmark, recovery, health, maintenance, drills, runs, setup, alerts, failover, readiness, schedule, history] = await Promise.all([
-  api("/api/tasks"),
-  api("/api/dry-run"),
-  api("/api/benchmark?files=50000&size=1073741824&folders=1000"),
-  api("/api/disaster-recovery"),
-  api("/api/health"),
-  api("/api/maintenance"),
-  api("/api/restore-drills"),
-  api("/api/backup-runs?limit=20"),
-  api("/api/setup-health"),
-  api("/api/alerts"),
-  api("/api/provider-failover"),
-  api("/api/readiness"),
-  api("/api/maintenance/schedule"),
-  api("/api/config/history")
- ]);
+ const snapshot = await api("/api/operations/snapshot");
  if(options.renderToken && !isActiveRender(options.renderToken, options.pageName || "Operations")) return;
- if(!Array.isArray(tasks)) return;
+ if(snapshot?.error || !Array.isArray(snapshot.tasks)) return;
+ if(Array.isArray(snapshot.operations)){
+  operationRowsCache = snapshot.operations;
+  operationProgressFetchedAt = Date.now();
+ }
  const target = document.getElementById("operationsPanel");
- if(target) target.innerHTML = operationsDashboard(tasks, plan, benchmark, recovery, health.hosts || [], maintenance || [], drills || [], runs || [], setup, alerts.alerts || [], failover, readiness, schedule, history.rows || []);
+ if(target) target.innerHTML = operationsDashboard(
+  snapshot.tasks,
+  snapshot.plan,
+  snapshot.benchmark,
+  snapshot.recovery,
+  snapshot.health?.hosts || [],
+  snapshot.maintenance || [],
+  snapshot.drills || [],
+  snapshot.runs || [],
+  snapshot.setup,
+  snapshot.alerts?.alerts || [],
+  snapshot.failover,
+  snapshot.readiness,
+  snapshot.schedule,
+  snapshot.history?.rows || []
+ );
 }
 async function updateSecurityPage(options={}){
  const [model, setup, recovery, settings] = await Promise.all([
@@ -3816,7 +3893,7 @@ function settingsForm(s){
   ${["General","Usenet","Protection","Schedules","Endpoints","Logging","Security","Cloud"].map((name,index)=>`<button class="${index===0?"primary":""}" onclick="showSettingsTab('${name}', this)">${name}</button>`).join("")}
  </div><div class="toolbar-right"><label class="settings-help-toggle"><input id="showSettingsHelp" data-no-dirty="true" type="checkbox" onchange="toggleSettingsHelp(this.checked)"> Show field descriptions</label><button id="saveSettingsButton" class="primary" onclick="saveSettings()" disabled><span class="ui-icon">&#128190;</span>Save Settings</button><button id="resetSettingsButton" onclick="render()" disabled><span class="ui-icon">&#8635;</span>Reset</button></div></div>
  <div id="tabGeneral" class="tab-panel active"><h2 class="section-title"><span class="ui-icon">&#10003;</span>Basic</h2><div class="form-grid">
-  <label class="field"><span><span class="ui-icon">&#127912;</span>UI template</span><select id="setUiTheme" onchange="applyTheme(this.value)">${themeOptions(s.ui_theme || "harbor_light")}</select></label>
+  <label class="field"><span><span class="ui-icon">&#127912;</span>UI template</span><select id="setUiTheme" onchange="applyTheme(this.value)">${themeOptions(s.ui_theme || "dockhand")}</select></label>
   <label><input id="setReducedMotion" type="checkbox" ${s.ui_reduced_motion?"checked":""} onchange="document.documentElement.dataset.reducedMotion=this.checked ? 'true' : 'false'"> <span class="ui-icon">&#128065;</span>Reduce motion</label>
   <label class="field"><span><span class="ui-icon">&#128101;</span>Newsgroup</span><input id="setNewsgroup" value="${esc(s.newsgroup)}"></label>
   <label class="field"><span><span class="ui-icon">&#129513;</span>Article size</span><div class="range-field"><input id="setArticleSizeKib" type="range" min="100" max="5120" step="100" value="${esc(bytesToKib(s.article_size || 786432))}" oninput="setArticleSizeLabel.textContent=articleSizeLabel(this.value)"><span id="setArticleSizeLabel">${esc(articleSizeLabel(bytesToKib(s.article_size || 786432)))}</span></div></label>
@@ -4016,7 +4093,7 @@ const settingsHelpDescriptions = {
  "Command":"Command template for custom backup/export tools. Use placeholders shown by the target feature, such as {archive}, when supported."
 };
 const settingsHelpDefaults = {
- "UI template":"harbor_light",
+ "UI template":"dockhand",
  "Reduce motion":"Off",
  "Newsgroup":"alt.binaries.backup",
  "Article size":"768 KiB",
