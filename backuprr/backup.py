@@ -211,10 +211,12 @@ def par2_search_candidates(config: Config) -> list[tuple[str, Path]]:
         for root in [Path("/usr/bin"), Path("/usr/local/bin"), Path("/opt/homebrew/bin"), Path("/opt/local/bin")]:
             for name in names:
                 candidates.append((name, root / name))
+    path_candidates = []
     for name in names:
         found = shutil.which(name)
         if found:
-            candidates.insert(0, (f"PATH {name}", Path(found)))
+            path_candidates.append((f"PATH {name}", Path(found)))
+    candidates = path_candidates + candidates
     seen: set[str] = set()
     unique = []
     for label, path in candidates:
@@ -234,6 +236,16 @@ def discover_par2_command(config: Config) -> dict[str, Any]:
         if exists:
             return {"found": True, "command": str(candidate), "label": label, "checked": checked}
     return {"found": False, "command": "", "label": "", "checked": checked}
+
+
+def par2_command_status(command: str, config: Config) -> dict[str, Any]:
+    resolved = resolve_par2_command(command, config)
+    return {
+        "configured": str(command or "par2").strip() or "par2",
+        "found": bool(resolved),
+        "resolved": resolved or "",
+        "args_preview": par2_create_args(resolved, Path("payload.bin"), str((config.par2 or {}).get("redundancy_percent", 10))) if resolved else [],
+    }
 
 
 def resolve_par2_command(command: str, config: Config) -> str | None:

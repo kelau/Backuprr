@@ -22,6 +22,7 @@ from backuprr.backup import (
     encode_chunk,
     iter_compressed_chunks,
     par2_create_args,
+    par2_command_status,
     post_next,
     prepare_payload,
     resolve_par2_command,
@@ -199,7 +200,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.107")
+        self.assertEqual(__version__, "0.2.108")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -1289,6 +1290,33 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(result["found"])
         self.assertEqual(result["command"], str(path_candidate))
         self.assertIn("PATH", result["label"])
+
+    def test_discover_par2_command_prefers_par2_over_par2create_on_path(self):
+        par2 = self.root / "usr" / "bin" / "par2"
+        par2create = self.root / "usr" / "bin" / "par2create"
+        par2.parent.mkdir(parents=True)
+        par2.write_bytes(b"fake")
+        par2create.write_bytes(b"fake")
+
+        def fake_which(name):
+            return {"par2": str(par2), "par2create": str(par2create)}.get(name)
+
+        with patch("backuprr.backup.platform.system", return_value="Linux"), patch("backuprr.backup.shutil.which", side_effect=fake_which):
+            result = discover_par2_command(self.config)
+        self.assertTrue(result["found"])
+        self.assertEqual(result["command"], str(par2))
+        self.assertIn("PATH par2", result["label"])
+
+    def test_par2_command_status_resolves_configured_absolute_path(self):
+        par2 = self.root / "usr" / "bin" / "par2"
+        par2.parent.mkdir(parents=True)
+        par2.write_bytes(b"fake")
+        status = par2_command_status(str(par2), self.config)
+        self.assertTrue(status["found"])
+        self.assertEqual(status["configured"], str(par2))
+        self.assertEqual(status["resolved"], str(par2))
+        self.assertEqual(status["args_preview"][0], str(par2))
+        self.assertIn("create", status["args_preview"])
 
     def test_discover_par2_command_finds_multipar_candidate(self):
         multipar = self.root / "Program Files" / "MultiPar" / "par2j.exe"

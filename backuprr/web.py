@@ -18,7 +18,7 @@ from urllib.parse import parse_qs, quote, urlparse
 from zipfile import ZIP_DEFLATED, ZipFile
 
 from . import __version__
-from .backup import discover_par2_command, verify_due_chunks, verify_file_chunks
+from .backup import discover_par2_command, par2_command_status, verify_due_chunks, verify_file_chunks
 from .cloud_backup import backup_config_and_database
 from .config import Config, update_config
 from .db import Database
@@ -908,7 +908,12 @@ class Handler(BaseHTTPRequestHandler):
                     self.config.save(self.config_path)
                     record_config_history(self.db, self.config.web_ui_username, ["par2.command"])
                     self.db.log("info", "settings.par2", f"Detected PAR2 command: {result['command']}")
-                self.send_json({**result, "settings": self.config.public_dict() if data.get("apply") and result.get("found") else None})
+                selected_command = result["command"] if result.get("found") else (self.config.par2 or {}).get("command", "par2")
+                self.send_json({
+                    **result,
+                    "status": par2_command_status(selected_command, self.config),
+                    "settings": self.config.public_dict() if data.get("apply") and result.get("found") else None,
+                })
             elif parsed.path == "/api/maintenance/run":
                 self.send_json(run_maintenance(self.db, self.config, vacuum=bool(data.get("vacuum"))))
             elif parsed.path == "/api/restore-drill/run":
@@ -989,6 +994,7 @@ class Handler(BaseHTTPRequestHandler):
             "update_check": update_result(self.db),
             "paused_workers": self.db.paused_kinds(),
             "setup_health": setup_health_check(self.db, self.config),
+            "par2_status": par2_command_status((self.config.par2 or {}).get("command", "par2"), self.config),
             "alerts": notification_alerts(self.db, self.config),
             "provider_confidence": provider_confidence_report(self.db),
             "scan_progress": self.scan_progress_payload(),
@@ -1511,6 +1517,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.108":["PAR2 discovery now prefers the real par2 command over par2create compatibility links and reports the resolved command for diagnostics."],
  "0.2.107":["Status refreshes now use one combined dashboard request and live-change events are debounced to avoid internal API 429 bursts."],
  "0.2.106":["Files now loads folders incrementally, patches visible rows during live progress updates, adds UI timing samples, and creates indexes for large-library queries."],
  "0.2.105":["Catalog scans now record new files immediately without hashing content; file hashes are calculated later when a selected file is backed up."],
