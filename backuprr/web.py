@@ -54,7 +54,7 @@ from .operations import (
     test_post_host_article_size,
     threat_model_report,
 )
-from .queueing import enqueue_unbacked, move, prioritize
+from .queueing import enqueue_unbacked, move, prioritize, prune_excluded_queue
 from .restore import restore_file, restore_folder, restored_payloads
 from .update_checker import check_for_updates, update_result
 
@@ -879,8 +879,9 @@ class Handler(BaseHTTPRequestHandler):
                     self.config.auto_queue_exclude_patterns.append(pattern)
                     self.config.save(self.config_path)
                     record_config_history(self.db, self.config.web_ui_username, ["auto_queue_exclude_patterns"])
+                pruned = prune_excluded_queue(self.db, self.config)
                 self.db.log("info", "queue.selection", f"Excluded folder from automatic backup: {folder or '/'}")
-                self.send_json({"ok": True, "pattern": pattern, "settings": self.config.public_dict()})
+                self.send_json({"ok": True, "pattern": pattern, "pruned": pruned, "settings": self.config.public_dict()})
             elif parsed.path == "/api/post-next":
                 self.send_json({"file_id": self.backup_monitor.post_once()})
             elif parsed.path == "/api/backup/run":
@@ -981,15 +982,17 @@ class Handler(BaseHTTPRequestHandler):
                 profile = dict(data.get("profile") or data)
                 update_config(self.config, profile)
                 self.config.save(self.config_path)
+                pruned = prune_excluded_queue(self.db, self.config) if "auto_queue_exclude_patterns" in profile else 0
                 record_config_history(self.db, self.config.web_ui_username, sorted(profile.keys()))
                 self.db.log("info", "settings.profile", "Imported settings profile")
-                self.send_json({"ok": True, "settings": self.config.public_dict()})
+                self.send_json({"ok": True, "pruned": pruned, "settings": self.config.public_dict()})
             elif parsed.path == "/api/settings":
                 update_config(self.config, data)
                 self.config.save(self.config_path)
                 self.db.event_forwarder = LogForwarder(self.config.log_destinations)
                 for endpoint in self.config.endpoints:
                     self.db.add_endpoint(endpoint)
+                pruned = prune_excluded_queue(self.db, self.config) if "auto_queue_exclude_patterns" in data else 0
                 self.db.log("info", "settings", "Updated configuration from Web UI")
                 record_config_history(self.db, self.config.web_ui_username, sorted(data.keys()))
                 audit_event(self.db, self.config, self.config.web_ui_username, "settings.update", {"keys": sorted(data.keys())})
@@ -998,7 +1001,7 @@ class Handler(BaseHTTPRequestHandler):
                     if par2_command_status(command, self.config)["found"]:
                         self.mark_backup_tool_repaired(f"PAR2 command repaired: {command}")
                 self.monitor.trigger()
-                self.send_json({"ok": True, "settings": self.config.public_dict()})
+                self.send_json({"ok": True, "pruned": pruned, "settings": self.config.public_dict()})
             else:
                 self.send_json({"error": "not found"}, 404)
         except Exception as exc:
@@ -1619,6 +1622,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.114":["Queue entries that match newly added auto-queue exclude patterns are now pruned immediately instead of staying pending."],
  "0.2.113":["Dashboard live refreshes now coalesce in-flight requests and reuse short-lived server snapshots to avoid overlapping slow Status requests."],
  "0.2.112":["Added a Dockhand-inspired UI template and reduced page refresh connection bursts with bundled Queue and Operations snapshots."],
  "0.2.111":["Files now has explicit folder exclude actions and shows whether folders match include or exclude backup-selection rules."],

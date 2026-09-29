@@ -115,6 +115,46 @@ def enqueue_unbacked(db: Database, config: Optional[Config] = None) -> int:
     return count
 
 
+def prune_excluded_queue(db: Database, config: Config) -> int:
+    patterns = list(getattr(config, "auto_queue_exclude_patterns", []) or [])
+    if not patterns:
+        return 0
+    now = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime())
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT q.file_id, q.status, f.path, f.relative_path, f.state
+            FROM queue q
+            JOIN files f ON f.id = q.file_id
+            WHERE q.status NOT IN ('posting', 'done')
+              AND f.state NOT IN ('backed_up', 'deleted', 'posting')
+            """
+        ).fetchall()
+        matching = [
+            row
+            for row in rows
+            if excluded_by_auto_queue_filter(str(row["path"]), str(row["relative_path"]), patterns)
+        ]
+        for row in matching:
+            conn.execute("DELETE FROM queue WHERE file_id=? AND status NOT IN ('posting', 'done')", (row["file_id"],))
+            if str(row["state"]) == "queued":
+                conn.execute("UPDATE files SET state='discovered', updated_at=? WHERE id=?", (now, row["file_id"]))
+            conn.execute(
+                "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
+                (
+                    now,
+                    "info",
+                    "queue.prune",
+                    f"Removed excluded file from queue: {row['relative_path'] or row['path']}",
+                    row["file_id"],
+                    "",
+                ),
+            )
+    if matching:
+        db.log("info", "queue.prune", f"Removed {len(matching)} queued file(s) matching auto-queue exclude patterns")
+    return len(matching)
+
+
 def prioritize(db: Database, filter_name: str) -> int:
     if filter_name not in {"older-first", "larger-first", "smaller-first"}:
         raise ValueError("filter_name must be older-first, larger-first, or smaller-first")

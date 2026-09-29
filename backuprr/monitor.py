@@ -8,7 +8,7 @@ from .cloud_backup import backup_config_and_database_if_changed
 from .config import Config
 from .db import Database
 from .operations import restore_drill_due, run_maintenance, run_restore_drill
-from .queueing import enqueue_unbacked
+from .queueing import enqueue_unbacked, prune_excluded_queue
 from .scanner import scan_all
 from .update_checker import check_for_updates
 
@@ -244,8 +244,9 @@ class CatalogMonitor(ScheduledTask):
 
     def execute(self) -> str:
         count = scan_all(self.db)
+        pruned = prune_excluded_queue(self.db, self.config)
         queued = enqueue_unbacked(self.db, self.config)
-        result = f"{count} files scanned, {queued} queued"
+        result = f"{count} files scanned, {queued} queued, {pruned} pruned"
         self.db.log("debug", "monitor.scan", f"Automatic catalog scan completed: {result}")
         return result
 
@@ -271,15 +272,16 @@ class BackupMonitor(ScheduledTask):
         recovered = self.db.recover_stale_posting()
         recovered_mismatches = self.db.recover_queued_failed_mismatches()
         recovered_failed = self.db.recover_retryable_failed()
+        pruned = prune_excluded_queue(self.db, self.config)
         newly_queued = enqueue_unbacked(self.db, self.config)
         file_id = post_next(self.db, self.config)
         stats = self.db.stats()
         queued = int(stats.get("queue_queued", 0))
         posting = int(stats.get("queue_posting", 0))
         if file_id is None:
-            result = f"{recovered} stale recovered, {recovered_mismatches} queue mismatches recovered, {recovered_failed} failed recovered, {newly_queued} newly queued, {queued} queued, {posting} posting, no file posted"
+            result = f"{recovered} stale recovered, {recovered_mismatches} queue mismatches recovered, {recovered_failed} failed recovered, {pruned} excluded pruned, {newly_queued} newly queued, {queued} queued, {posting} posting, no file posted"
         else:
-            result = f"posted file id {file_id}, {recovered} stale recovered, {recovered_mismatches} queue mismatches recovered, {recovered_failed} failed recovered, {queued} queued, {posting} posting"
+            result = f"posted file id {file_id}, {recovered} stale recovered, {recovered_mismatches} queue mismatches recovered, {recovered_failed} failed recovered, {pruned} excluded pruned, {queued} queued, {posting} posting"
         self.db.log("debug", "monitor.backup", f"Automatic backup task completed: {result}")
         return result
 

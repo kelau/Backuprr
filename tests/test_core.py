@@ -65,7 +65,7 @@ from backuprr.operations import (
     synthetic_catalog_plan,
     test_post_host_article_size,
 )
-from backuprr.queueing import enqueue_unbacked, excluded_by_auto_queue_filter, prioritize
+from backuprr.queueing import enqueue_unbacked, excluded_by_auto_queue_filter, prioritize, prune_excluded_queue
 from backuprr.restore import restore_file, restore_sample, restored_payloads
 from backuprr.scanner import scan_all
 from backuprr.usenet import UsenetClient
@@ -201,7 +201,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.113")
+        self.assertEqual(__version__, "0.2.114")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -564,6 +564,32 @@ class CoreTests(unittest.TestCase):
                 """
             ).fetchall()
         self.assertEqual([row["relative_path"] for row in queued], ["movie.mkv"])
+
+    def test_auto_queue_exclude_patterns_prune_existing_queue_items(self):
+        media = self.root / "media"
+        music = media / "Music"
+        movies = media / "Movies"
+        music.mkdir(parents=True)
+        movies.mkdir()
+        (music / "song.flac").write_bytes(b"song")
+        (movies / "movie.mkv").write_bytes(b"movie")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        self.config.auto_queue_include_patterns = ["*"]
+        self.assertEqual(enqueue_unbacked(self.db, self.config), 2)
+        self.config.auto_queue_exclude_patterns = [r"regex:^Music([/\\]|$)"]
+        self.assertEqual(prune_excluded_queue(self.db, self.config), 1)
+        with self.db.connect() as conn:
+            queued = conn.execute(
+                """
+                SELECT f.relative_path, f.state FROM queue q
+                JOIN files f ON f.id=q.file_id
+                ORDER BY f.relative_path
+                """
+            ).fetchall()
+            music_row = conn.execute("SELECT state FROM files WHERE relative_path LIKE ?", (f"Music%{os.sep}song.flac",)).fetchone()
+        self.assertEqual([str(row["relative_path"]).replace("\\", "/") for row in queued], ["Movies/movie.mkv"])
+        self.assertEqual(music_row["state"], "discovered")
 
     def test_configured_auto_queue_requires_selected_include_patterns(self):
         media = self.root / "media"
