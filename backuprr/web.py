@@ -333,6 +333,13 @@ class Handler(BaseHTTPRequestHandler):
         scopes = getattr(self.config, "external_api_key_scopes", {}).get(key, [])
         return not scopes or "admin" in scopes or scope in scopes
 
+    def mark_backup_tool_repaired(self, reason: str) -> None:
+        """Clear stale backup-worker failure state after a posting helper is fixed."""
+        self.db.clear_worker_error("backup")
+        self.db.set_paused("backup", False)
+        self.db.log("info", "worker.repair", reason)
+        self.backup_monitor.trigger()
+
     def external_scope_for_path(self, suffix: str, method: str = "GET") -> str:
         if method == "GET":
             return "read"
@@ -908,6 +915,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.config.save(self.config_path)
                     record_config_history(self.db, self.config.web_ui_username, ["par2.command"])
                     self.db.log("info", "settings.par2", f"Detected PAR2 command: {result['command']}")
+                    self.mark_backup_tool_repaired(f"PAR2 command repaired: {result['command']}")
                 selected_command = result["command"] if result.get("found") else (self.config.par2 or {}).get("command", "par2")
                 self.send_json({
                     **result,
@@ -965,6 +973,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.db.log("info", "settings", "Updated configuration from Web UI")
                 record_config_history(self.db, self.config.web_ui_username, sorted(data.keys()))
                 audit_event(self.db, self.config, self.config.web_ui_username, "settings.update", {"keys": sorted(data.keys())})
+                if "par2" in data:
+                    command = (self.config.par2 or {}).get("command", "par2")
+                    if par2_command_status(command, self.config)["found"]:
+                        self.mark_backup_tool_repaired(f"PAR2 command repaired: {command}")
                 self.monitor.trigger()
                 self.send_json({"ok": True, "settings": self.config.public_dict()})
             else:
@@ -1517,6 +1529,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.109":["Repairing PAR2 configuration now clears stale backup-worker errors, resumes the backup worker, and triggers a retry immediately."],
  "0.2.108":["PAR2 discovery now prefers the real par2 command over par2create compatibility links and reports the resolved command for diagnostics."],
  "0.2.107":["Status refreshes now use one combined dashboard request and live-change events are debounced to avoid internal API 429 bursts."],
  "0.2.106":["Files now loads folders incrementally, patches visible rows during live progress updates, adds UI timing samples, and creates indexes for large-library queries."],

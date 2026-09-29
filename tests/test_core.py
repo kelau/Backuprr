@@ -200,7 +200,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.108")
+        self.assertEqual(__version__, "0.2.109")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -234,6 +234,19 @@ class CoreTests(unittest.TestCase):
         state = self.db.worker_state("backup")
         self.assertEqual(state["last_error"], "")
         self.assertEqual(state["revision"], 2)
+
+    def test_mark_backup_tool_repaired_clears_error_and_resumes_worker(self):
+        self.db.save_worker_state("backup", "Backup", "", "", "", 1.0, "", "PAR2 command not found", 1, 1)
+        self.db.set_paused("backup", True)
+        monitor = type("Monitor", (), {"triggered": False, "trigger": lambda self: setattr(self, "triggered", True)})()
+        handler = object.__new__(Handler)
+        handler.db = self.db
+        handler.backup_monitor = monitor
+        handler.mark_backup_tool_repaired("PAR2 command repaired: /usr/bin/par2")
+        state = self.db.worker_state("backup")
+        self.assertEqual(state["last_error"], "")
+        self.assertFalse(self.db.is_paused("backup"))
+        self.assertTrue(monitor.triggered)
 
     def test_synthetic_catalog_plan_estimates_chunk_rows(self):
         plan = synthetic_catalog_plan(50000, 1024 * 1024 * 1024, 2 * 1024 * 1024, 1000)
