@@ -2,6 +2,7 @@ import io
 import json
 import nntplib
 import os
+import re
 import email.message
 import hashlib
 import subprocess
@@ -69,7 +70,7 @@ from backuprr.restore import restore_file, restore_sample, restored_payloads
 from backuprr.scanner import scan_all
 from backuprr.usenet import UsenetClient
 from backuprr.update_checker import check_for_updates, compare_versions, update_result
-from backuprr.web import Handler, ResponseZipWriter, hourly_post_budget, thread_usage_summary, throughput_summary, totp_valid
+from backuprr.web import Handler, ResponseZipWriter, folder_backup_pattern, hourly_post_budget, thread_usage_summary, throughput_summary, totp_valid
 
 
 class FakePostClient:
@@ -200,7 +201,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.110")
+        self.assertEqual(__version__, "0.2.111")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -234,6 +235,15 @@ class CoreTests(unittest.TestCase):
         state = self.db.worker_state("backup")
         self.assertEqual(state["last_error"], "")
         self.assertEqual(state["revision"], 2)
+
+    def test_folder_backup_pattern_matches_folder_and_children(self):
+        self.assertEqual(folder_backup_pattern(""), "*")
+        pattern = folder_backup_pattern(r"Music\Albums")
+        self.assertEqual(pattern, r"regex:^Music/Albums([/\\]|$)")
+        regex = re.compile(pattern.split(":", 1)[1])
+        self.assertIsNotNone(regex.search("Music/Albums"))
+        self.assertIsNotNone(regex.search("Music/Albums/song.flac"))
+        self.assertIsNone(regex.search("Music/Albumset/song.flac"))
 
     def test_mark_backup_tool_repaired_clears_error_and_resumes_worker(self):
         self.db.save_worker_state("backup", "Backup", "", "", "", 1.0, "", "PAR2 command not found", 1, 1)

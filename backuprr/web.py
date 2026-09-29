@@ -78,6 +78,11 @@ def queue_reason_detail(reason: str, status: str = "") -> str:
     return details.get(reason, "")
 
 
+def folder_backup_pattern(folder: str) -> str:
+    normalized = str(folder or "").strip().strip("\\/").replace("\\", "/")
+    return "*" if not normalized else rf"regex:^{re.escape(normalized)}([/\\]|$)"
+
+
 def mbps_from_bps(value: float) -> float:
     return round((float(value or 0) * 8) / 1_000_000, 2)
 
@@ -852,8 +857,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_json({"changed": self.db.boost_folder_priority(data["path"], amount=int(data.get("amount", 10)))})
             elif parsed.path == "/api/folders/select-backup":
                 folder = str(data["path"]).strip().strip("\\/")
-                normalized = folder.replace("\\", "/")
-                pattern = "*" if not normalized else rf"regex:^{re.escape(normalized)}([/\\]|$)"
+                pattern = folder_backup_pattern(folder)
                 if pattern not in self.config.auto_queue_include_patterns:
                     self.config.auto_queue_include_patterns.append(pattern)
                     self.config.save(self.config_path)
@@ -861,6 +865,15 @@ class Handler(BaseHTTPRequestHandler):
                 changed = self.db.boost_folder_priority(folder, amount=int(data.get("amount", 10)))
                 self.db.log("info", "queue.selection", f"Selected folder for automatic backup: {folder or '/'}")
                 self.send_json({"ok": True, "changed": changed, "pattern": pattern, "settings": self.config.public_dict()})
+            elif parsed.path == "/api/folders/exclude-backup":
+                folder = str(data["path"]).strip().strip("\\/")
+                pattern = folder_backup_pattern(folder)
+                if pattern not in self.config.auto_queue_exclude_patterns:
+                    self.config.auto_queue_exclude_patterns.append(pattern)
+                    self.config.save(self.config_path)
+                    record_config_history(self.db, self.config.web_ui_username, ["auto_queue_exclude_patterns"])
+                self.db.log("info", "queue.selection", f"Excluded folder from automatic backup: {folder or '/'}")
+                self.send_json({"ok": True, "pattern": pattern, "settings": self.config.public_dict()})
             elif parsed.path == "/api/post-next":
                 self.send_json({"file_id": self.backup_monitor.post_once()})
             elif parsed.path == "/api/backup/run":
@@ -1529,6 +1542,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.111":["Files now has explicit folder exclude actions and shows whether folders match include or exclude backup-selection rules."],
  "0.2.110":["Encryption settings now support a direct passphrase as well as an environment variable, and legacy passphrases entered in the env field are migrated automatically."],
  "0.2.109":["Repairing PAR2 configuration now clears stale backup-worker errors, resumes the backup worker, and triggers a retry immediately."],
  "0.2.108":["PAR2 discovery now prefers the real par2 command over par2create compatibility links and reports the resolved command for diagnostics."],
@@ -2283,7 +2297,7 @@ async function updateVisibleFileRows(){
 function filesTreeStructureSignature(result, showDeleted){
  const folderParts = [];
  for(const [path, payload] of filesFolderCache.entries()){
-  folderParts.push([path, (payload.folders || []).map(row => [row.path, row.files, row.size, row.updated_at]), (payload.files || []).map(row => [Number(row.id), row.relative_path || row.path || "", row.state, row.queue_status, row.progress_chunks, row.progress_bytes, row.last_verify_at])]);
+  folderParts.push([path, (payload.folders || []).map(row => [row.path, row.files, row.size, row.updated_at, folderBackupRuleState(row.path || row.name || "").state]), (payload.files || []).map(row => [Number(row.id), row.relative_path || row.path || "", row.state, row.queue_status, row.progress_chunks, row.progress_bytes, row.last_verify_at])]);
  }
  return JSON.stringify({
   total:Number(result.total || 0),
@@ -3366,7 +3380,8 @@ function treeNode(result){
   const canRestore = Number(folder.restorable_files || 0) > 0;
   const canPrioritize = Number(folder.unbacked_files || 0) > 0;
   const loaded = filesLoadedFolders.has(path);
-  return `<li class="folder ${open ? "open" : ""}" data-folder-path="${esc(path)}"><div class="tree-row folder-row" data-folder-row-path="${esc(path)}"><input type="checkbox" class="folderSelect" data-folder-path="${esc(path)}" onchange="selectFolderFiles(this.dataset.folderPath, this.checked)"><button class="icon-btn folder-toggle" type="button" title="${open ? "Collapse folder" : "Expand folder"}" data-path="${esc(path)}" onclick="toggleFolderOpen(this.dataset.path)">&#9654;</button><span class="tree-name"><span class="ui-icon">&#128193;</span>${esc(folder.name || path)}</span><span></span><span class="tree-meta">${Number(folder.files || 0)} files / ${formatBytes(folder.size || 0)}${open && !loaded ? "<small>Loading...</small>" : ""}</span>${statePill(state)}${folderVerifiedPill(folder)}<span class="tree-actions">${canPrioritize ? `<button class="icon-btn" title="Select folder for backup" data-path="${esc(path)}" onclick="selectFolderForBackup(this.dataset.path)">&#10003;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></div><ul>${open ? treeNode(childResult) : ""}</ul></li>`;
+  const rule = folderBackupRuleState(path);
+  return `<li class="folder ${open ? "open" : ""}" data-folder-path="${esc(path)}"><div class="tree-row folder-row" data-folder-row-path="${esc(path)}"><input type="checkbox" class="folderSelect" data-folder-path="${esc(path)}" onchange="selectFolderFiles(this.dataset.folderPath, this.checked)"><button class="icon-btn folder-toggle" type="button" title="${open ? "Collapse folder" : "Expand folder"}" data-path="${esc(path)}" onclick="toggleFolderOpen(this.dataset.path)">&#9654;</button><span class="tree-name"><span class="ui-icon">&#128193;</span>${esc(folder.name || path)}</span>${folderBackupRulePill(rule)}<span class="tree-meta">${Number(folder.files || 0)} files / ${formatBytes(folder.size || 0)}${open && !loaded ? "<small>Loading...</small>" : ""}</span>${statePill(state)}${folderVerifiedPill(folder)}<span class="tree-actions"><button class="icon-btn" title="Select folder for backup" data-path="${esc(path)}" onclick="selectFolderForBackup(this.dataset.path)">&#10003;</button><button class="icon-btn danger" title="Exclude folder from backup" data-path="${esc(path)}" onclick="excludeFolderFromBackup(this.dataset.path)">&#128683;</button>${canPrioritize ? `<button class="icon-btn" title="Increase queue priority" data-path="${esc(path)}" onclick="boostFolderPriority(this.dataset.path)">&#8593;</button>` : ""}${canRestore ? folderRestoreDropdown(path) : ""}</span></div><ul>${open ? treeNode(childResult) : ""}</ul></li>`;
  }).join("");
  const fileHtml = (result.files || []).sort(compareFileRows).map(file => fileRow(file)).join("");
  return dirHtml + fileHtml;
@@ -3407,6 +3422,54 @@ function folderVerifiedPill(folder){
  if(verified === files) return `<span class="pill ok" title="All restorable files in this folder have been verified"><span class="ui-icon">&#10003;</span>Verified</span>`;
  if(verified > 0) return `<span class="pill warn" title="${verified} of ${files} restorable files verified"><span class="ui-icon">&#128269;</span>${verified}/${files}</span>`;
  return `<span class="pill warn" title="Files have chunks but have not been verified yet"><span class="ui-icon">&#128269;</span>Unverified</span>`;
+}
+function normalizeRulePath(path){
+ return String(path || "").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+}
+function regexFromFilter(pattern){
+ const raw = String(pattern || "").trim();
+ let expression = "";
+ if(raw.toLowerCase().startsWith("regex:") || raw.toLowerCase().startsWith("re:")) expression = raw.replace(/^[^:]+:/, "");
+ else if(raw.length >= 2 && raw.startsWith("/") && raw.endsWith("/")) expression = raw.slice(1, -1);
+ if(!expression) return null;
+ try { return new RegExp(expression, "i"); } catch { return null; }
+}
+function globRegex(pattern){
+ const escaped = String(pattern || "").replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+ return new RegExp(`^${escaped}$`, "i");
+}
+function globPatternsFromFilter(pattern){
+ const lowered = String(pattern || "").toLowerCase();
+ if(/[*?[\]]/.test(lowered)) return [lowered];
+ if(lowered.startsWith(".")) return [`*${lowered}`];
+ if(/^[a-z0-9]+$/.test(lowered)) return [`*.${lowered}`, lowered];
+ return [lowered];
+}
+function ruleMatchesPath(path, patterns){
+ const normalized = normalizeRulePath(path);
+ const names = [normalized, `${normalized}/`, path].filter(Boolean);
+ return (patterns || []).some(raw => {
+  const pattern = String(raw || "").trim();
+  if(!pattern) return false;
+  const regex = regexFromFilter(pattern);
+  if(regex && names.some(name => regex.test(name))) return true;
+  return globPatternsFromFilter(pattern).some(glob => {
+   const matcher = globRegex(glob);
+   return names.some(name => matcher.test(String(name).toLowerCase()));
+  });
+ });
+}
+function folderBackupRuleState(path){
+ const exclude = settingsCache?.auto_queue_exclude_patterns || [];
+ const include = settingsCache?.auto_queue_include_patterns || [];
+ if(ruleMatchesPath(path, exclude)) return {state:"excluded", label:"Excluded", title:"This folder matches an auto-queue exclude pattern."};
+ if(ruleMatchesPath(path, include)) return {state:"included", label:"Included", title:"This folder matches an auto-queue include pattern."};
+ return {state:"catalog", label:"Catalog only", title:"This folder is cataloged, but does not currently match an auto-queue include pattern."};
+}
+function folderBackupRulePill(rule){
+ const tone = rule.state === "excluded" ? "bad" : rule.state === "included" ? "ok" : "neutral";
+ const icon = rule.state === "excluded" ? "&#128683;" : rule.state === "included" ? "&#10003;" : "&#128269;";
+ return `<span class="pill ${tone}" title="${esc(rule.title)}"><span class="ui-icon">${icon}</span>${esc(rule.label)}</span>`;
 }
 function fileRow(file){
  const canQueue = !["backed_up", "deleted", "posting", "queued"].includes(file.state);
@@ -3602,6 +3665,17 @@ async function selectFolderForBackup(path){
  const out = await post("/api/folders/select-backup", { path:path, amount:10 });
  if(out.error) alert(out.error);
  if(out.settings) settingsCache = out.settings;
+ await updateFilesPage();
+}
+async function excludeFolderFromBackup(path){
+ const out = await post("/api/folders/exclude-backup", { path:path });
+ if(out.error) alert(out.error);
+ if(out.settings) settingsCache = out.settings;
+ await updateFilesPage();
+}
+async function boostFolderPriority(path){
+ const out = await post("/api/folders/priority", { path:path, amount:10 });
+ if(out.error) alert(out.error);
  await updateFilesPage();
 }
 async function boostSelectedFiles(){
