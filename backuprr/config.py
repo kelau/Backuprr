@@ -10,6 +10,11 @@ from typing import Any, Dict, List, Optional
 
 
 SECRET_PREFIX = "enc:v1:"
+DEFAULT_ENCRYPTION_PASSPHRASE_ENV = "BACKUPRR_ENCRYPTION_PASSPHRASE"
+
+
+def _valid_env_name(value: str) -> bool:
+    return bool(re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(value or "")))
 
 
 def _secret_stream(key: str, length: int) -> bytes:
@@ -211,7 +216,8 @@ class Config:
     compress_files: bool = False
     zip_subfolders: bool = False
     encrypt_bodies: bool = False
-    encryption_passphrase_env: str = "BACKUPRR_ENCRYPTION_PASSPHRASE"
+    encryption_passphrase_env: str = DEFAULT_ENCRYPTION_PASSPHRASE_ENV
+    encryption_passphrase_direct: str = ""
     par2: Dict[str, Any] = field(default_factory=lambda: {"enabled": False})
     base_dir: Path = field(default_factory=lambda: Path.cwd())
     source_path: Optional[Path] = None
@@ -229,10 +235,15 @@ class Config:
         hosts = [UsenetHost.from_dict(item) for item in data.pop("usenet_hosts", [])]
         cloud_backups = [CloudBackupTarget.from_dict(item) for item in data.pop("cloud_backups", [])]
         log_destinations = [LogDestination.from_dict(item) for item in data.pop("log_destinations", [])]
+        if "encryption_passphrase" in data and "encryption_passphrase_direct" not in data:
+            data["encryption_passphrase_direct"] = data.pop("encryption_passphrase")
         config = cls(**data)
         config.usenet_hosts = hosts
         config.cloud_backups = cloud_backups
         config.log_destinations = log_destinations
+        if config.encryption_passphrase_env and not _valid_env_name(config.encryption_passphrase_env) and not config.encryption_passphrase_direct:
+            config.encryption_passphrase_direct = config.encryption_passphrase_env
+            config.encryption_passphrase_env = DEFAULT_ENCRYPTION_PASSPHRASE_ENV
         if legacy_zip_subfolders:
             config.compress_files = True
         config.base_dir = config_path.resolve().parent
@@ -254,6 +265,8 @@ class Config:
         return path if path.is_absolute() else self.base_dir / path
 
     def encryption_passphrase(self) -> Optional[str]:
+        if self.encryption_passphrase_direct:
+            return self.encryption_passphrase_direct
         return os.getenv(self.encryption_passphrase_env)
 
     def hosts_for_mode(self, mode: str) -> List[UsenetHost]:
@@ -331,6 +344,7 @@ class Config:
             "zip_subfolders": self.zip_subfolders,
             "encrypt_bodies": self.encrypt_bodies,
             "encryption_passphrase_env": self.encryption_passphrase_env,
+            "encryption_passphrase_direct": self.encryption_passphrase_direct,
             "par2": self.par2,
         }
 
@@ -343,6 +357,9 @@ class Config:
         data["external_api_key_scopes"] = {key[:4] + "..." + key[-4:]: scopes for key, scopes in self.external_api_key_scopes.items()}
         data["has_web_ui_password"] = bool(self.web_ui_password)
         data["web_ui_password"] = ""
+        data["has_encryption_passphrase"] = bool(self.encryption_passphrase_direct)
+        data["encryption_passphrase"] = ""
+        data["encryption_passphrase_direct"] = ""
         data["totp_enabled"] = bool(os.getenv(self.web_ui_totp_secret_env))
         return data
 
@@ -622,7 +639,15 @@ def update_config(config: Config, data: Dict[str, Any]) -> None:
         env_name = str(data["encryption_passphrase_env"]).strip()
         if not env_name:
             raise ValueError("encryption_passphrase_env is required")
+        if not _valid_env_name(env_name):
+            raise ValueError("encryption_passphrase_env must be an environment variable name; use encryption_passphrase for a direct secret")
         config.encryption_passphrase_env = env_name
+    if data.get("encryption_passphrase"):
+        config.encryption_passphrase_direct = str(data["encryption_passphrase"])
+    elif data.get("encryption_passphrase_direct"):
+        config.encryption_passphrase_direct = str(data["encryption_passphrase_direct"])
+    elif data.get("clear_encryption_passphrase"):
+        config.encryption_passphrase_direct = ""
     if "endpoints" in data:
         config.endpoints = [str(item).strip() for item in data["endpoints"] if str(item).strip()]
     if "usenet_hosts" in data:
@@ -716,6 +741,8 @@ def _protect_config_data(data: Dict[str, Any], key: str) -> None:
         data["external_api_keys"] = [protect_secret(str(item), key) for item in data["external_api_keys"]]
     if data.get("web_ui_password"):
         data["web_ui_password"] = protect_secret(str(data["web_ui_password"]), key)
+    if data.get("encryption_passphrase_direct"):
+        data["encryption_passphrase_direct"] = protect_secret(str(data["encryption_passphrase_direct"]), key)
 
 
 def _unprotect_config_data(data: Dict[str, Any], key: str) -> None:
@@ -731,3 +758,5 @@ def _unprotect_config_data(data: Dict[str, Any], key: str) -> None:
         data["external_api_keys"] = [unprotect_secret(str(item), key) for item in data["external_api_keys"]]
     if data.get("web_ui_password"):
         data["web_ui_password"] = unprotect_secret(str(data["web_ui_password"]), key)
+    if data.get("encryption_passphrase_direct"):
+        data["encryption_passphrase_direct"] = unprotect_secret(str(data["encryption_passphrase_direct"]), key)

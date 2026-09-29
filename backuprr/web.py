@@ -1529,6 +1529,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.110":["Encryption settings now support a direct passphrase as well as an environment variable, and legacy passphrases entered in the env field are migrated automatically."],
  "0.2.109":["Repairing PAR2 configuration now clears stale backup-worker errors, resumes the backup worker, and triggers a retry immediately."],
  "0.2.108":["PAR2 discovery now prefers the real par2 command over par2create compatibility links and reports the resolved command for diagnostics."],
  "0.2.107":["Status refreshes now use one combined dashboard request and live-change events are debounced to avoid internal API 429 bursts."],
@@ -3769,7 +3770,8 @@ function settingsForm(s){
   <label class="field"><span><span class="ui-icon">&#9202;</span>File stability seconds before posting</span><input id="setFileStabilitySeconds" type="number" min="0" max="86400" value="${esc(s.file_stability_seconds ?? 300)}"></label>
  </div></div>
  <div id="tabProtection" class="tab-panel"><h2 class="section-title"><span class="ui-icon">&#10003;</span>Basic</h2><div class="form-grid">
-  <label class="field"><span><span class="ui-icon">&#128274;</span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}"></label>
+  <label class="field"><span><span class="ui-icon">&#128274;</span>Encryption passphrase</span><input id="setPassphrase" type="password" value="" autocomplete="new-password" placeholder="${s.has_encryption_passphrase ? "stored; leave blank to keep" : "optional direct passphrase"}"></label>
+  <label class="field"><span><span class="ui-icon">&#128278;</span>Encryption passphrase env</span><input id="setPassEnv" value="${esc(s.encryption_passphrase_env)}" placeholder="BACKUPRR_ENCRYPTION_PASSPHRASE"></label>
   <label><input id="setCompressFiles" type="checkbox" ${s.compress_files?"checked":""}> <span class="ui-icon">&#128451;</span>Compress files</label>
   <label class="field"><span><span class="ui-icon">&#128300;</span>Compression sample bytes</span><input id="setCompressionSampleBytes" type="number" min="0" max="${64 * 1024 * 1024}" value="${esc(s.compression_sample_bytes ?? 2097152)}"></label>
   <label class="field"><span><span class="ui-icon">&#128200;</span>Minimum compression gain percent</span><input id="setCompressionMinGainPercent" type="number" min="0" max="95" value="${esc(s.compression_min_gain_percent ?? 5)}"></label>
@@ -3871,7 +3873,8 @@ const settingsHelpDescriptions = {
  "Restore drill task interval seconds":"How often the restore-drill scheduler wakes up. Lower values make test drills happen sooner; production systems can keep this infrequent.",
  "Update check interval seconds":"How often Backuprr checks GitHub for a newer version. Daily is a good balance between awareness and network noise.",
  "File stability seconds before posting":"A file must remain unchanged for this long before it can be posted. Increase for large files still being copied; decrease only for controlled test folders.",
- "Encryption passphrase env":"Environment variable containing the encryption passphrase. Use a strong secret managed outside the config file; changing it affects future encrypted posts.",
+ "Encryption passphrase":"Optional direct passphrase used to encrypt article bodies before posting. This is convenient for containers and lab installs; use a long unique value and keep it backed up because restores require the same passphrase. Leave blank to keep the stored value.",
+ "Encryption passphrase env":"Environment variable name containing the encryption passphrase. Use this instead of the direct field when you manage secrets outside Backuprr. Default is BACKUPRR_ENCRYPTION_PASSPHRASE; valid names use letters, numbers, and underscores and must not contain the passphrase itself.",
  "Compress files":"Compresses eligible files before posting when sampling predicts a useful gain. Enable for documents/raw files; many media archives are already compressed and may be skipped automatically.",
  "Compression sample bytes":"Bytes sampled to estimate compression benefit. Larger samples improve decisions on mixed files but add pre-post work.",
  "Minimum compression gain percent":"Minimum expected size reduction before compression is used. Raise to avoid spending CPU on small savings; lower if storage/post volume is more important than CPU.",
@@ -4299,6 +4302,7 @@ async function saveSettings(){
   compress_files: setCompressFiles.checked,
   encrypt_bodies: setEncrypt.checked,
   encryption_passphrase_env: setPassEnv.value,
+  encryption_passphrase: setPassphrase.value,
   endpoints: setEndpoints.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   auto_queue_include_patterns: setAutoQueueIncludePatterns.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),
   auto_queue_exclude_patterns: setAutoQueueExcludePatterns.value.split(/\r?\n/).map(v => v.trim()).filter(Boolean),

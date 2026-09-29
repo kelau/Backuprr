@@ -200,7 +200,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.109")
+        self.assertEqual(__version__, "0.2.110")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -1398,6 +1398,22 @@ class CoreTests(unittest.TestCase):
         body = encode_chunk(b"payload", self.config, salt)
         self.assertEqual(decode_chunk(body, "secret"), b"payload")
 
+    def test_direct_encryption_passphrase_round_trip(self):
+        self.config.encrypt_bodies = True
+        self.config.encryption_passphrase_direct = "direct-secret"
+        body = encode_chunk(b"payload", self.config, b"1234567890abcdef")
+        self.assertEqual(decode_chunk(body, "direct-secret"), b"payload")
+
+    def test_load_migrates_passphrase_entered_in_env_field(self):
+        config_path = self.root / "config.json"
+        config_path.write_text(
+            json.dumps({"database": "test.sqlite3", "encryption_passphrase_env": "direct-secret!"}),
+            encoding="utf-8",
+        )
+        loaded = Config.load(str(config_path))
+        self.assertEqual(loaded.encryption_passphrase_direct, "direct-secret!")
+        self.assertEqual(loaded.encryption_passphrase_env, "BACKUPRR_ENCRYPTION_PASSPHRASE")
+
     def test_missing_chunk_marks_file_and_requeues(self):
         media = self.root / "media"
         media.mkdir()
@@ -1874,6 +1890,7 @@ class CoreTests(unittest.TestCase):
                 "zip_subfolders": True,
                 "encrypt_bodies": True,
                 "encryption_passphrase_env": "BACKUPRR_SECRET",
+                "encryption_passphrase": "direct-secret",
                 "endpoints": [str(self.root / "media"), ""],
                 "usenet_hosts": [
                     {
@@ -1963,6 +1980,7 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(self.config.manifest_export_enabled)
         self.assertFalse(self.config.manifest_export_encrypt)
         self.assertEqual(self.config.manifest_export_interval_seconds, 7200)
+        self.assertEqual(self.config.encryption_passphrase_direct, "direct-secret")
         self.assertTrue(self.config.zip_subfolders)
         self.assertTrue(self.config.compress_files)
         self.assertTrue(self.config.encrypt_bodies)
@@ -2009,18 +2027,21 @@ class CoreTests(unittest.TestCase):
         self.config.usenet_hosts = [UsenetHost(name="post", mode="post", host="example.test", port=563, password="provider-secret")]
         self.config.external_api_keys = ["external-secret"]
         self.config.web_ui_password = "ui-secret"
+        self.config.encryption_passphrase_direct = "body-secret"
         try:
             self.config.save(str(config_path))
             raw = config_path.read_text(encoding="utf-8")
             self.assertIn("enc:v1:", raw)
             self.assertNotIn("provider-secret", raw)
             self.assertNotIn("external-secret", raw)
+            self.assertNotIn("body-secret", raw)
             loaded = Config.load(str(config_path))
         finally:
             os.environ.pop("BACKUPRR_TEST_CONFIG_SECRET", None)
         self.assertEqual(loaded.usenet_hosts[0].password, "provider-secret")
         self.assertEqual(loaded.external_api_keys, ["external-secret"])
         self.assertEqual(loaded.web_ui_password, "ui-secret")
+        self.assertEqual(loaded.encryption_passphrase_direct, "body-secret")
 
     def test_setup_health_alerts_and_diagnostics_are_redacted(self):
         media = self.root / "media"

@@ -329,7 +329,7 @@ def encode_chunk(chunk: bytes, config: Config, salt: bytes) -> bytes:
         return chunk
     passphrase = config.encryption_passphrase()
     if not passphrase:
-        raise RuntimeError("Encryption enabled but passphrase env var is not set")
+        raise RuntimeError("Encryption enabled but no passphrase is configured")
     return b"BACKUPRR-ENC1" + salt + xor_crypt(chunk, passphrase, salt)
 
 
