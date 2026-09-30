@@ -1167,6 +1167,12 @@ class Handler(BaseHTTPRequestHandler):
         posted = int(payload.get("posted_chunks") or 0)
         payload["expected_chunks"] = expected
         payload["chunk_count"] = posted
+        if payload.get("status") == "preparing_par2":
+            percent = max(0, min(100, int(payload.get("prepare_progress_percent") or 0)))
+            payload["progress_percent"] = percent
+            payload["progress"] = f"PAR2 {percent}%"
+            payload["reason_detail"] = "Creating PAR2 recovery data before posting."
+            return payload
         if payload.get("status") == "done":
             payload["progress_percent"] = 100
             payload["progress"] = f"{posted} chunks stored"
@@ -1624,6 +1630,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.118":["Preparing PAR2 queue rows now show live creation progress, and posting waits for the first preparing row instead of skipping ahead."],
  "0.2.117":["Queue rows now show a Preparing PAR2 status while current or prefetched PAR2 payloads are being created."],
  "0.2.116":["Posting now stays queued while large payloads are prepared, and PAR2 payloads for the next queued files are prepared in the background during uploads."],
  "0.2.115":["Large queue-exclude pruning now writes one summary event instead of thousands, and PAR2 recovery-file detection handles filenames with brackets."],

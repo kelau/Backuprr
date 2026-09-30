@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 STALE_POSTING_SECONDS = 15 * 60
 SQLITE_TIMEOUT_SECONDS = 30
 SQLITE_BUSY_TIMEOUT_MS = SQLITE_TIMEOUT_SECONDS * 1000
@@ -68,6 +68,8 @@ class Database:
             conn.execute("ALTER TABLE queue ADD COLUMN progress_chunks INTEGER NOT NULL DEFAULT 0")
         if "progress_bytes" not in queue_columns:
             conn.execute("ALTER TABLE queue ADD COLUMN progress_bytes INTEGER NOT NULL DEFAULT 0")
+        if "prepare_progress_percent" not in queue_columns:
+            conn.execute("ALTER TABLE queue ADD COLUMN prepare_progress_percent INTEGER NOT NULL DEFAULT 0")
         chunk_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
         if "article_size" not in chunk_columns:
             conn.execute("ALTER TABLE chunks ADD COLUMN article_size INTEGER")
@@ -540,7 +542,7 @@ class Database:
                 VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(file_id) DO UPDATE SET
                   priority=excluded.priority, status='queued', reason=excluded.reason,
-                  progress_chunks=0, progress_bytes=0, updated_at=excluded.updated_at
+                  progress_chunks=0, progress_bytes=0, prepare_progress_percent=0, updated_at=excluded.updated_at
                 """,
                 (file_id, priority, row["next_pos"], "queued", reason, now, now),
             )
@@ -552,7 +554,7 @@ class Database:
                 """
                 SELECT q.*, f.path, f.size, f.mtime_ns, f.sha256, f.state FROM queue q
                 JOIN files f ON f.id = q.file_id
-                WHERE q.status='queued'
+                WHERE q.status IN ('queued', 'preparing_par2')
                   AND f.state NOT IN ('backed_up', 'deleted', 'posting', 'unreadable')
                 ORDER BY q.priority ASC, q.position ASC
                 LIMIT 1
@@ -774,15 +776,22 @@ class Database:
     def complete_queue_preparation(self, file_id: int, reason: str = "prepared-payload") -> None:
         with self.connect() as conn:
             conn.execute(
-                "UPDATE queue SET status='queued', reason=?, updated_at=? WHERE file_id=? AND status='preparing_par2'",
+                "UPDATE queue SET status='queued', reason=?, prepare_progress_percent=100, updated_at=? WHERE file_id=? AND status='preparing_par2'",
                 (reason, utcnow(), file_id),
+            )
+
+    def set_queue_preparation_progress(self, file_id: int, percent: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE queue SET prepare_progress_percent=?, updated_at=? WHERE file_id=? AND status='preparing_par2'",
+                (max(0, min(100, int(percent))), utcnow(), file_id),
             )
 
     def requeue_file(self, file_id: int, reason: str) -> None:
         now = utcnow()
         with self.connect() as conn:
             conn.execute(
-                "UPDATE queue SET status='queued', reason=?, updated_at=? WHERE file_id=?",
+                "UPDATE queue SET status='queued', reason=?, prepare_progress_percent=0, updated_at=? WHERE file_id=?",
                 (reason, now, file_id),
             )
             conn.execute("UPDATE files SET state='queued', updated_at=? WHERE id=?", (now, file_id))
@@ -2132,6 +2141,7 @@ CREATE TABLE IF NOT EXISTS queue (
   reason TEXT NOT NULL,
   progress_chunks INTEGER NOT NULL DEFAULT 0,
   progress_bytes INTEGER NOT NULL DEFAULT 0,
+  prepare_progress_percent INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

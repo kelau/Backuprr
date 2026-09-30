@@ -4,6 +4,7 @@ import math
 import nntplib
 import os
 import platform
+import re
 import shutil
 import socket
 import subprocess
@@ -280,17 +281,47 @@ def par2_create_args(command: str, payload: Path, redundancy: str) -> list[str]:
     return [command, "create", f"-r{redundancy}", str(par_file), str(payload)]
 
 
-def run_par2_create(command: str, payload: Path, redundancy: str) -> None:
+def parse_par2_progress_line(line: str) -> int | None:
+    matches = re.findall(r"(\d+(?:\.\d+)?)\s*%", line or "")
+    if not matches:
+        return None
+    return max(0, min(100, int(float(matches[-1]))))
+
+
+def run_par2_create(command: str, payload: Path, redundancy: str, progress: Optional[Callable[[int], None]] = None) -> None:
     args = par2_create_args(command, payload, redundancy)
-    result = subprocess.run(
-        args,
-        cwd=str(payload.parent),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
+    if progress is None:
+        result = subprocess.run(
+            args,
+            cwd=str(payload.parent),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part and part.strip())
+    else:
+        process = subprocess.Popen(
+            args,
+            cwd=str(payload.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        output_parts: list[str] = []
+        assert process.stdout is not None
+        for line in process.stdout:
+            stripped = line.strip()
+            if stripped:
+                output_parts.append(stripped)
+            percent = parse_par2_progress_line(line)
+            if percent is not None:
+                progress(percent)
+        returncode = process.wait()
+        result = subprocess.CompletedProcess(args, returncode)
+        output = "\n".join(output_parts)
     if result.returncode != 0:
         raise RuntimeError(
             f"PAR2 command failed with exit code {result.returncode}: {args}. "
@@ -301,11 +332,13 @@ def run_par2_create(command: str, payload: Path, redundancy: str) -> None:
         for child in payload.parent.iterdir()
         if child.is_file() and child.name.startswith(payload.name) and child.name.lower().endswith(".par2")
     ]
+    if progress is not None:
+        progress(100)
     if not recovery_files:
         raise RuntimeError(f"PAR2 command completed but did not create recovery files for {payload.name}. Output: {output or '(no output)'}")
 
 
-def prepare_payload(path: Path, config: Config) -> Path:
+def prepare_payload(path: Path, config: Config, progress: Optional[Callable[[int], None]] = None) -> Path:
     if not config.par2.get("enabled"):
         return path
     payload = create_compressed_payload(path) if compression_enabled_for(path, config) else path
@@ -323,7 +356,7 @@ def prepare_payload(path: Path, config: Config) -> Path:
                 f"PAR2 command not found: {command}. Install PAR2, place a bundled par2 executable in backuprr/bin or ./bin, "
                 "or disable PAR2 recovery files in Settings."
             )
-        run_par2_create(resolved_command, payload, redundancy)
+        run_par2_create(resolved_command, payload, redundancy, progress=progress)
     return payload
 
 
@@ -437,10 +470,14 @@ def schedule_payload_prefetches(db: Database, config: Config, current_file_id: i
                     continue
                 if future.done() and future.exception() is None:
                     cleanup_payload(future.result(), existing["original"])
-            config_snapshot = copy.deepcopy(config)
-            future = executor.submit(prepare_payload, original, config_snapshot)
-            _payload_prefetches[file_id] = {"future": future, "key": key, "original": original, "created_at": time.time()}
             db.set_queue_status(file_id, preparation_status(config))
+            db.set_queue_preparation_progress(file_id, 0)
+            config_snapshot = copy.deepcopy(config)
+            def prefetch_progress(percent: int, queued_file_id: int = file_id) -> None:
+                db.set_queue_preparation_progress(queued_file_id, percent)
+
+            future = executor.submit(prepare_payload, original, config_snapshot, prefetch_progress)
+            _payload_prefetches[file_id] = {"future": future, "key": key, "original": original, "created_at": time.time()}
             future.add_done_callback(
                 lambda done, queued_file_id=file_id: db.complete_queue_preparation(
                     queued_file_id,
@@ -515,6 +552,9 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         return None
     file_id = int(item["file_id"])
     original = Path(item["path"])
+    if str(item["status"] or "") == "preparing_par2":
+        db.log("debug", "post.prepare", f"Waiting for PAR2 preparation before posting: {original}", file_id)
+        return None
     hourly_limit = int(getattr(config, "hourly_post_limit_bytes", 0) or 0)
     if hourly_limit > 0:
         cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).replace(microsecond=0).isoformat()
@@ -565,8 +605,9 @@ def post_next(db: Database, config: Config) -> Optional[int]:
             prefetched_payload = take_prefetched_payload(file_id, original, int(item["size"]), int(item["mtime_ns"]), config)
             if prefetched_payload is None:
                 db.set_queue_status(file_id, preparation_status(config))
+                db.set_queue_preparation_progress(file_id, 0)
                 db.log("debug", "post.prepare", f"Preparing payload before posting: {original}", file_id)
-                payload = prepare_payload(original, config)
+                payload = prepare_payload(original, config, progress=lambda percent: db.set_queue_preparation_progress(file_id, percent))
             else:
                 payload = prefetched_payload
                 db.log("debug", "post.prepare", f"Using prefetched payload for posting: {original}", file_id)

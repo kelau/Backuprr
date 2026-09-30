@@ -5,6 +5,7 @@ import os
 import re
 import email.message
 import hashlib
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -26,6 +27,7 @@ from backuprr.backup import (
     iter_compressed_chunks,
     par2_create_args,
     par2_command_status,
+    parse_par2_progress_line,
     post_next,
     prepare_payload,
     resolve_par2_command,
@@ -206,7 +208,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.117")
+        self.assertEqual(__version__, "0.2.118")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -416,6 +418,7 @@ class CoreTests(unittest.TestCase):
             columns = {row["name"] for row in conn.execute("PRAGMA table_info(queue)").fetchall()}
         self.assertIn("progress_chunks", columns)
         self.assertIn("progress_bytes", columns)
+        self.assertIn("prepare_progress_percent", columns)
 
     def test_chunk_schema_tracks_article_size_for_resume(self):
         with self.db.connect() as conn:
@@ -1375,6 +1378,10 @@ class CoreTests(unittest.TestCase):
         with patch("backuprr.backup.subprocess.run", side_effect=fake_run):
             run_par2_create("fake-par2", payload, "10")
 
+    def test_par2_progress_parser_reads_latest_percent(self):
+        self.assertEqual(parse_par2_progress_line("Constructing: 10.4% Constructing: 11.0%"), 11)
+        self.assertIsNone(parse_par2_progress_line("Computing Reed Solomon matrix"))
+
     def test_payload_prefetch_prepares_next_par2_file(self):
         media = self.root / "media"
         media.mkdir()
@@ -1398,24 +1405,34 @@ class CoreTests(unittest.TestCase):
             ).fetchall()
 
         started = threading.Event()
+        progressed = threading.Event()
         release = threading.Event()
 
-        def fake_run(args, **kwargs):
+        def fake_prepare(payload_path, config, progress=None):
             started.set()
+            if progress:
+                progress(37)
+                progressed.set()
             release.wait(5)
-            payload = Path(args[-1])
-            Path(kwargs["cwd"], f"{payload.name}.par2").write_bytes(b"par2")
-            return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
+            tempdir = Path(tempfile.mkdtemp(prefix="backuprr-test-"))
+            copied = tempdir / Path(payload_path).name
+            shutil.copy2(payload_path, copied)
+            Path(tempdir, f"{copied.name}.par2").write_bytes(b"par2")
+            return copied
 
-        with patch("backuprr.backup.shutil.which", return_value="fake-par2"), patch("backuprr.backup.subprocess.run", side_effect=fake_run):
-            self.assertEqual(schedule_payload_prefetches(self.db, self.config, int(rows[0]["file_id"])), 1)
-            self.assertTrue(started.wait(5))
-            with self.db.connect() as conn:
-                status_row = conn.execute("SELECT status FROM queue WHERE file_id=?", (rows[1]["file_id"],)).fetchone()
-            self.assertEqual(status_row["status"], "preparing_par2")
-            self.assertEqual(self.db.stats()["queue_queued"], 2)
-            release.set()
+        with patch("backuprr.backup.prepare_payload", side_effect=fake_prepare):
             payload = None
+            try:
+                self.assertEqual(schedule_payload_prefetches(self.db, self.config, int(rows[0]["file_id"])), 1)
+                self.assertTrue(started.wait(5))
+                self.assertTrue(progressed.wait(5))
+                with self.db.connect() as conn:
+                    status_row = conn.execute("SELECT status, prepare_progress_percent FROM queue WHERE file_id=?", (rows[1]["file_id"],)).fetchone()
+                self.assertEqual(status_row["status"], "preparing_par2")
+                self.assertEqual(status_row["prepare_progress_percent"], 37)
+                self.assertEqual(self.db.stats()["queue_queued"], 2)
+            finally:
+                release.set()
             deadline = time.time() + 5
             while time.time() < deadline and payload is None:
                 payload = take_prefetched_payload(
@@ -1445,18 +1462,33 @@ class CoreTests(unittest.TestCase):
         scan_all(self.db)
         enqueue_unbacked(self.db)
         self.config.par2 = {"enabled": True, "command": "fake-par2", "redundancy_percent": 10}
-        seen_status = []
+        seen = []
 
-        def fake_prepare(payload_path, config):
+        def fake_prepare(payload_path, config, progress=None):
+            if progress:
+                progress(42)
             with self.db.connect() as conn:
-                row = conn.execute("SELECT status FROM queue").fetchone()
-            seen_status.append(row["status"])
+                row = conn.execute("SELECT status, prepare_progress_percent FROM queue").fetchone()
+            seen.append((row["status"], row["prepare_progress_percent"]))
             return payload_path
 
         with patch("backuprr.backup.prepare_payload", side_effect=fake_prepare):
             with patch("backuprr.backup.UsenetClient", FakePostClient):
                 self.assertIsNotNone(post_next(self.db, self.config))
-        self.assertEqual(seen_status, ["preparing_par2"])
+        self.assertEqual(seen, [("preparing_par2", 42)])
+
+    def test_post_next_waits_for_first_preparing_par2_queue_item(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.set_queue_status(file_id, "preparing_par2")
+        self.assertIsNone(post_next(self.db, self.config))
 
     def test_par2_create_args_support_multipar_par2j(self):
         payload = self.root / "payload.iso"
