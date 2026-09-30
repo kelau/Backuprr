@@ -634,7 +634,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         if reusable_chunks:
             db.log("info", "post.resume", f"Resuming {original}: {posted_count}/{expected_chunks} chunks already cataloged", file_id)
 
-        def post_chunk(chunk_index: int, chunk: bytes) -> tuple[int, str, int, str, str]:
+        def post_chunk(chunk_index: int, chunk: bytes) -> tuple[int, str, int, str, str, str]:
             salt = os.urandom(16)
             body = encode_chunk(chunk, config, salt)
             digest = hashlib.sha256(body).hexdigest()
@@ -650,9 +650,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                     try:
                         with UsenetClient(host) as client:
                             message_id = client.post(config.newsgroup, subject, body)
-                        if run_id is not None:
-                            db.update_backup_run(run_id, posted_count, posted_bytes, host.name)
-                        return chunk_index, message_id, len(body), digest, subject
+                        return chunk_index, message_id, len(body), digest, subject, host.name
                     except Exception as exc:
                         last_error = exc
                         db.record_host_check(host.name, host.mode, "failed", str(exc))
@@ -695,18 +693,39 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                     file_id,
                 )
                 return None
+            last_progress_flush_at = time.monotonic()
+            last_progress_flush_chunks = posted_count
+            last_progress_host = ""
+
+            def flush_post_progress(force: bool = False, host: str = "") -> None:
+                nonlocal last_progress_flush_at, last_progress_flush_chunks, last_progress_host
+                if host:
+                    last_progress_host = host
+                now_monotonic = time.monotonic()
+                if (
+                    not force
+                    and posted_count < expected_chunks
+                    and posted_count - last_progress_flush_chunks < 25
+                    and now_monotonic - last_progress_flush_at < 3.0
+                ):
+                    return
+                db.set_queue_progress(file_id, posted_count, posted_bytes)
+                if run_id is not None:
+                    db.update_backup_run(run_id, posted_count, posted_bytes, last_progress_host)
+                last_progress_flush_at = now_monotonic
+                last_progress_flush_chunks = posted_count
+
             for future in as_completed(futures):
-                chunk_index, message_id, body_size, digest, subject = future.result()
+                chunk_index, message_id, body_size, digest, subject, host_name = future.result()
                 stored_digest = "" if getattr(config, "compact_chunk_metadata", True) else digest
                 stored_subject = "" if getattr(config, "compact_chunk_metadata", True) else subject
                 db.add_chunk(file_id, chunk_index, message_id, body_size, stored_digest, stored_subject, article_size=article_size)
                 posted_count += 1
                 posted_bytes += body_size
-                db.set_queue_progress(file_id, posted_count, posted_bytes)
-                if run_id is not None:
-                    db.update_backup_run(run_id, posted_count, posted_bytes)
+                flush_post_progress(host=host_name)
                 if getattr(config, "log_chunk_events", False):
                     db.log("debug", "post.chunk", f"Posted chunk {chunk_index} for {original}", file_id)
+            flush_post_progress(force=True)
         final_chunks = db.chunk_count_for_file(file_id)
         if streaming_compressed:
             expected_chunks = max(1, final_chunks)

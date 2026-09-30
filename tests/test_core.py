@@ -208,7 +208,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.118")
+        self.assertEqual(__version__, "0.2.119")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"

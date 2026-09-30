@@ -1630,6 +1630,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.119":["Posting now coalesces live progress writes and uses a longer SQLite busy window so catalog scans can coexist with large uploads."],
  "0.2.118":["Preparing PAR2 queue rows now show live creation progress, and posting waits for the first preparing row instead of skipping ahead."],
  "0.2.117":["Queue rows now show a Preparing PAR2 status while current or prefetched PAR2 payloads are being created."],
  "0.2.116":["Posting now stays queued while large payloads are prepared, and PAR2 payloads for the next queued files are prepared in the background during uploads."],

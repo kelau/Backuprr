@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 SCHEMA_VERSION = 11
 STALE_POSTING_SECONDS = 15 * 60
-SQLITE_TIMEOUT_SECONDS = 30
+SQLITE_TIMEOUT_SECONDS = 120
 SQLITE_BUSY_TIMEOUT_MS = SQLITE_TIMEOUT_SECONDS * 1000
 
 
@@ -41,6 +41,8 @@ class Database:
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA temp_store = MEMORY")
         return conn
 
     def init(self) -> None:
