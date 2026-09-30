@@ -130,28 +130,33 @@ def prune_excluded_queue(db: Database, config: Config) -> int:
               AND f.state NOT IN ('backed_up', 'deleted', 'posting')
             """
         ).fetchall()
-        matching = [
-            row
-            for row in rows
-            if excluded_by_auto_queue_filter(str(row["path"]), str(row["relative_path"]), patterns)
-        ]
-        for row in matching:
-            conn.execute("DELETE FROM queue WHERE file_id=? AND status NOT IN ('posting', 'done')", (row["file_id"],))
-            if str(row["state"]) == "queued":
-                conn.execute("UPDATE files SET state='discovered', updated_at=? WHERE id=?", (now, row["file_id"]))
+        matching = [row for row in rows if excluded_by_auto_queue_filter(str(row["path"]), str(row["relative_path"]), patterns)]
+        matching_ids = [int(row["file_id"]) for row in matching]
+        queued_ids = [int(row["file_id"]) for row in matching if str(row["state"]) == "queued"]
+        if matching_ids:
+            conn.executemany(
+                "DELETE FROM queue WHERE file_id=? AND status NOT IN ('posting', 'done')",
+                [(file_id,) for file_id in matching_ids],
+            )
+        if queued_ids:
+            conn.executemany(
+                "UPDATE files SET state='discovered', updated_at=? WHERE id=?",
+                [(now, file_id) for file_id in queued_ids],
+            )
+        if matching:
+            examples = ", ".join(str(row["relative_path"] or row["path"]) for row in matching[:5])
+            suffix = f" Examples: {examples}" if examples else ""
             conn.execute(
                 "INSERT INTO events(ts, level, event_type, message, file_id, data) VALUES(?,?,?,?,?,?)",
                 (
                     now,
                     "info",
                     "queue.prune",
-                    f"Removed excluded file from queue: {row['relative_path'] or row['path']}",
-                    row["file_id"],
+                    f"Removed {len(matching)} queued file(s) matching auto-queue exclude patterns.{suffix}",
+                    None,
                     "",
                 ),
             )
-    if matching:
-        db.log("info", "queue.prune", f"Removed {len(matching)} queued file(s) matching auto-queue exclude patterns")
     return len(matching)
 
 

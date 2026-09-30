@@ -289,7 +289,12 @@ def run_par2_create(command: str, payload: Path, redundancy: str) -> None:
             f"PAR2 command failed with exit code {result.returncode}: {args}. "
             f"Output: {output or '(no output)'}"
         )
-    if not list(payload.parent.glob(f"{payload.name}*.par2")):
+    recovery_files = [
+        child
+        for child in payload.parent.iterdir()
+        if child.is_file() and child.name.startswith(payload.name) and child.name.lower().endswith(".par2")
+    ]
+    if not recovery_files:
         raise RuntimeError(f"PAR2 command completed but did not create recovery files for {payload.name}. Output: {output or '(no output)'}")
 
 

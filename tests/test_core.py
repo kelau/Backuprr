@@ -27,6 +27,7 @@ from backuprr.backup import (
     post_next,
     prepare_payload,
     resolve_par2_command,
+    run_par2_create,
     verify_due_chunks,
     verify_file_chunks,
 )
@@ -201,7 +202,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.114")
+        self.assertEqual(__version__, "0.2.115")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -588,8 +589,10 @@ class CoreTests(unittest.TestCase):
                 """
             ).fetchall()
             music_row = conn.execute("SELECT state FROM files WHERE relative_path LIKE ?", (f"Music%{os.sep}song.flac",)).fetchone()
+            prune_events = conn.execute("SELECT COUNT(*) FROM events WHERE event_type='queue.prune'").fetchone()[0]
         self.assertEqual([str(row["relative_path"]).replace("\\", "/") for row in queued], ["Movies/movie.mkv"])
         self.assertEqual(music_row["state"], "discovered")
+        self.assertEqual(prune_events, 1)
 
     def test_configured_auto_queue_requires_selected_include_patterns(self):
         media = self.root / "media"
@@ -1356,6 +1359,17 @@ class CoreTests(unittest.TestCase):
             self.assertTrue(Path(cwd, "movie.mkv.par2").exists())
         finally:
             cleanup_payload(payload, path)
+
+    def test_par2_success_detection_handles_glob_special_characters(self):
+        payload = self.root / "Movie [2026].mkv"
+        payload.write_bytes(b"payload")
+
+        def fake_run(args, **kwargs):
+            Path(kwargs["cwd"], "Movie [2026].mkv.par2").write_bytes(b"par2")
+            return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
+
+        with patch("backuprr.backup.subprocess.run", side_effect=fake_run):
+            run_par2_create("fake-par2", payload, "10")
 
     def test_par2_create_args_support_multipar_par2j(self):
         payload = self.root / "payload.iso"

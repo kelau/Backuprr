@@ -1622,6 +1622,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.115":["Large queue-exclude pruning now writes one summary event instead of thousands, and PAR2 recovery-file detection handles filenames with brackets."],
  "0.2.114":["Queue entries that match newly added auto-queue exclude patterns are now pruned immediately instead of staying pending."],
  "0.2.113":["Dashboard live refreshes now coalesce in-flight requests and reuse short-lived server snapshots to avoid overlapping slow Status requests."],
  "0.2.112":["Added a Dockhand-inspired UI template and reduced page refresh connection bursts with bundled Queue and Operations snapshots."],
