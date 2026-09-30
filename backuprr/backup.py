@@ -1,3 +1,4 @@
+import copy
 import hashlib
 import math
 import nntplib
@@ -7,9 +8,10 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 import zlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Optional
@@ -58,6 +60,11 @@ COMPRESSED_EXTENSIONS = {
     ".zip",
     ".zst",
 }
+PAYLOAD_PREFETCH_LIMIT = 2
+PAYLOAD_PREFETCH_MAX_AGE_SECONDS = 6 * 60 * 60
+_payload_prefetch_lock = threading.Lock()
+_payload_prefetch_executor: ThreadPoolExecutor | None = None
+_payload_prefetches: dict[int, dict[str, Any]] = {}
 
 
 class PostNetworkBlockedError(RuntimeError):
@@ -320,6 +327,119 @@ def prepare_payload(path: Path, config: Config) -> Path:
     return payload
 
 
+def payload_preparation_enabled(config: Config) -> bool:
+    return bool((config.par2 or {}).get("enabled"))
+
+
+def payload_preparation_key(path: Path, size: int, mtime_ns: int, config: Config) -> tuple[Any, ...]:
+    par2 = dict(config.par2 or {})
+    return (
+        str(path),
+        int(size),
+        int(mtime_ns),
+        bool(par2.get("enabled")),
+        str(par2.get("command", "par2")),
+        int(par2.get("redundancy_percent", 10)),
+        bool(getattr(config, "compress_files", False)),
+        int(getattr(config, "compression_sample_bytes", 0) or 0),
+        int(getattr(config, "compression_min_gain_percent", 0) or 0),
+    )
+
+
+def payload_prefetch_executor() -> ThreadPoolExecutor:
+    global _payload_prefetch_executor
+    with _payload_prefetch_lock:
+        if _payload_prefetch_executor is None:
+            _payload_prefetch_executor = ThreadPoolExecutor(max_workers=PAYLOAD_PREFETCH_LIMIT, thread_name_prefix="backuprr-prepare")
+        return _payload_prefetch_executor
+
+
+def cleanup_stale_payload_prefetches(max_age_seconds: int = PAYLOAD_PREFETCH_MAX_AGE_SECONDS) -> None:
+    now = time.time()
+    expired: list[dict[str, Any]] = []
+    with _payload_prefetch_lock:
+        for file_id, entry in list(_payload_prefetches.items()):
+            future: Future[Path] = entry["future"]
+            if future.done() and future.exception() is not None:
+                expired.append(_payload_prefetches.pop(file_id))
+            elif now - float(entry.get("created_at", now)) > max_age_seconds:
+                expired.append(_payload_prefetches.pop(file_id))
+    for entry in expired:
+        future = entry["future"]
+        if future.done() and future.exception() is None:
+            cleanup_payload(future.result(), entry["original"])
+
+
+def take_prefetched_payload(file_id: int, original: Path, size: int, mtime_ns: int, config: Config) -> Path | None:
+    key = payload_preparation_key(original, size, mtime_ns, config)
+    with _payload_prefetch_lock:
+        entry = _payload_prefetches.get(file_id)
+        if not entry:
+            return None
+        if entry.get("key") != key:
+            future: Future[Path] = entry["future"]
+            if not future.done():
+                return None
+            entry = _payload_prefetches.pop(file_id)
+        else:
+            future: Future[Path] = entry["future"]
+            if not future.done():
+                return None
+            _payload_prefetches.pop(file_id, None)
+    future = entry["future"]
+    if not future.done() or future.cancelled():
+        return None
+    try:
+        payload = future.result()
+    except Exception:
+        return None
+    if entry.get("key") != key:
+        cleanup_payload(payload, original)
+        return None
+    return payload
+
+
+def schedule_payload_prefetches(db: Database, config: Config, current_file_id: int) -> int:
+    if not payload_preparation_enabled(config):
+        return 0
+    cleanup_stale_payload_prefetches()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT q.file_id, f.path, f.size, f.mtime_ns
+            FROM queue q
+            JOIN files f ON f.id = q.file_id
+            WHERE q.status='queued'
+              AND q.file_id != ?
+              AND f.state NOT IN ('backed_up', 'deleted', 'posting', 'unreadable')
+            ORDER BY q.priority ASC, q.position ASC
+            LIMIT ?
+            """,
+            (current_file_id, PAYLOAD_PREFETCH_LIMIT),
+        ).fetchall()
+    scheduled = 0
+    for row in rows:
+        file_id = int(row["file_id"])
+        original = Path(row["path"])
+        key = payload_preparation_key(original, int(row["size"]), int(row["mtime_ns"]), config)
+        executor = payload_prefetch_executor()
+        with _payload_prefetch_lock:
+            existing = _payload_prefetches.get(file_id)
+            if existing and existing.get("key") == key:
+                continue
+            if existing:
+                future = existing["future"]
+                if not future.done():
+                    continue
+                if future.done() and future.exception() is None:
+                    cleanup_payload(future.result(), existing["original"])
+            config_snapshot = copy.deepcopy(config)
+            future = executor.submit(prepare_payload, original, config_snapshot)
+            _payload_prefetches[file_id] = {"future": future, "key": key, "original": original, "created_at": time.time()}
+            scheduled += 1
+    return scheduled
+
+
 def cleanup_payload(payload: Path, original: Path) -> None:
     if payload == original:
         return
@@ -420,8 +540,6 @@ def post_next(db: Database, config: Config) -> Optional[int]:
             db.log("warning", "post.stability", f"File changed while hashing; waiting before posting: {original}", file_id)
             return None
         db.update_file_hash(file_id, int(after_hash.st_size), int(after_hash.st_mtime_ns), file_sha256)
-    db.set_queue_status(file_id, "posting")
-    db.update_file_state(file_id, "posting")
     payload = original
     run_id: Optional[int] = None
     streaming_compressed = False
@@ -430,8 +548,22 @@ def post_next(db: Database, config: Config) -> Optional[int]:
     try:
         article_size = max(1, int(config.article_size))
         streaming_compressed = compression_enabled_for(original, config) and not config.par2.get("enabled")
-        payload = original if streaming_compressed else prepare_payload(original, config)
+        if streaming_compressed:
+            payload = original
+        else:
+            prefetched_payload = take_prefetched_payload(file_id, original, int(item["size"]), int(item["mtime_ns"]), config)
+            if prefetched_payload is None:
+                db.log("debug", "post.prepare", f"Preparing payload before posting: {original}", file_id)
+                payload = prepare_payload(original, config)
+            else:
+                payload = prefetched_payload
+                db.log("debug", "post.prepare", f"Using prefetched payload for posting: {original}", file_id)
         payload_size = int(payload.stat().st_size)
+        db.set_queue_status(file_id, "posting")
+        db.update_file_state(file_id, "posting")
+        prefetched = schedule_payload_prefetches(db, config, file_id)
+        if prefetched:
+            db.log("debug", "post.prepare", f"Started background payload preparation for {prefetched} queued file(s)", file_id)
         expected_chunks = max(1, math.ceil(payload_size / article_size))
         run_id = db.start_backup_run(file_id, str(original), expected_chunks, payload_size, str(item["reason"] or ""))
         can_reuse_chunks = payload == original and str(item["reason"] or "") in {

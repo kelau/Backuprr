@@ -7,6 +7,7 @@ import email.message
 import hashlib
 import subprocess
 import tempfile
+import time
 import unittest
 import zipfile
 import zlib
@@ -28,6 +29,8 @@ from backuprr.backup import (
     prepare_payload,
     resolve_par2_command,
     run_par2_create,
+    schedule_payload_prefetches,
+    take_prefetched_payload,
     verify_due_chunks,
     verify_file_chunks,
 )
@@ -202,7 +205,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.115")
+        self.assertEqual(__version__, "0.2.116")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -1370,6 +1373,56 @@ class CoreTests(unittest.TestCase):
 
         with patch("backuprr.backup.subprocess.run", side_effect=fake_run):
             run_par2_create("fake-par2", payload, "10")
+
+    def test_payload_prefetch_prepares_next_par2_file(self):
+        media = self.root / "media"
+        media.mkdir()
+        first = media / "first.mkv"
+        second = media / "second.mkv"
+        first.write_bytes(b"first")
+        second.write_bytes(b"second")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        self.config.auto_queue_include_patterns = ["*"]
+        self.config.par2 = {"enabled": True, "command": "fake-par2", "redundancy_percent": 10}
+        self.assertEqual(enqueue_unbacked(self.db, self.config), 2)
+        with self.db.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT q.file_id, f.path, f.size, f.mtime_ns
+                FROM queue q
+                JOIN files f ON f.id=q.file_id
+                ORDER BY f.relative_path
+                """
+            ).fetchall()
+
+        def fake_run(args, **kwargs):
+            payload = Path(args[-1])
+            Path(kwargs["cwd"], f"{payload.name}.par2").write_bytes(b"par2")
+            return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
+
+        with patch("backuprr.backup.shutil.which", return_value="fake-par2"), patch("backuprr.backup.subprocess.run", side_effect=fake_run):
+            self.assertEqual(schedule_payload_prefetches(self.db, self.config, int(rows[0]["file_id"])), 1)
+            payload = None
+            deadline = time.time() + 5
+            while time.time() < deadline and payload is None:
+                payload = take_prefetched_payload(
+                    int(rows[1]["file_id"]),
+                    Path(rows[1]["path"]),
+                    int(rows[1]["size"]),
+                    int(rows[1]["mtime_ns"]),
+                    self.config,
+                )
+                if payload is None:
+                    time.sleep(0.05)
+        try:
+            self.assertIsNotNone(payload)
+            self.assertNotEqual(payload, Path(rows[1]["path"]))
+            self.assertTrue(Path(payload).exists())
+            self.assertTrue(Path(payload).with_name(f"{Path(payload).name}.par2").exists())
+        finally:
+            if payload is not None:
+                cleanup_payload(Path(payload), Path(rows[1]["path"]))
 
     def test_par2_create_args_support_multipar_par2j(self):
         payload = self.root / "payload.iso"
