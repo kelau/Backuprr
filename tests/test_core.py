@@ -209,7 +209,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.121")
+        self.assertEqual(__version__, "0.2.122")
 
     def test_sqlite_lock_detection_is_narrow(self):
         self.assertTrue(is_sqlite_lock_error(sqlite3.OperationalError("database is locked")))
@@ -1495,6 +1495,29 @@ class CoreTests(unittest.TestCase):
             file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
         self.db.set_queue_status(file_id, "preparing_par2")
         self.assertIsNone(post_next(self.db, self.config))
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT status, reason FROM queue WHERE file_id=?", (file_id,)).fetchone()
+        self.assertEqual(row["status"], "queued")
+        self.assertEqual(row["reason"], "interrupted-payload-prepare")
+
+    def test_failed_queue_preparation_resets_progress(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.set_queue_status(file_id, "preparing_par2")
+        self.db.set_queue_preparation_progress(file_id, 73)
+        self.db.complete_queue_preparation(file_id, "payload-prepare-failed")
+        with self.db.connect() as conn:
+            row = conn.execute("SELECT status, reason, prepare_progress_percent FROM queue WHERE file_id=?", (file_id,)).fetchone()
+        self.assertEqual(row["status"], "queued")
+        self.assertEqual(row["reason"], "payload-prepare-failed")
+        self.assertEqual(row["prepare_progress_percent"], 0)
 
     def test_par2_create_args_support_multipar_par2j(self):
         payload = self.root / "payload.iso"

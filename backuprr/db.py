@@ -810,10 +810,11 @@ class Database:
             conn.execute("UPDATE queue SET status=?, updated_at=? WHERE file_id=?", (status, utcnow(), file_id))
 
     def complete_queue_preparation(self, file_id: int, reason: str = "prepared-payload") -> None:
+        progress = 0 if reason != "prepared-payload" else 100
         with self.connect() as conn:
             conn.execute(
-                "UPDATE queue SET status='queued', reason=?, prepare_progress_percent=100, updated_at=? WHERE file_id=? AND status='preparing_par2'",
-                (reason, utcnow(), file_id),
+                "UPDATE queue SET status='queued', reason=?, prepare_progress_percent=?, updated_at=? WHERE file_id=? AND status='preparing_par2'",
+                (reason, progress, utcnow(), file_id),
             )
 
     def set_queue_preparation_progress(self, file_id: int, percent: int) -> None:

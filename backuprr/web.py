@@ -1632,6 +1632,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.122":["Backup now recovers interrupted PAR2 preparation rows after restart instead of waiting forever on stale Preparing PAR2 status."],
  "0.2.121":["Queue progress now refreshes while workers run and posting progress uses prepared payload size for PAR2/compressed files."],
  "0.2.120":["SQLite operations now retry brief database-lock failures so worker state, catalog, and posting updates do not fail during short write contention."],
  "0.2.119":["Posting now coalesces live progress writes and uses a longer SQLite busy window so catalog scans can coexist with large uploads."],

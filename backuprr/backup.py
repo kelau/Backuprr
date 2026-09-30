@@ -436,6 +436,38 @@ def take_prefetched_payload(file_id: int, original: Path, size: int, mtime_ns: i
     return payload
 
 
+def reconcile_payload_preparation(db: Database, file_id: int, original: Path, config: Config) -> str:
+    with _payload_prefetch_lock:
+        entry = _payload_prefetches.get(file_id)
+        if not entry:
+            db.requeue_file(file_id, "interrupted-payload-prepare")
+            db.log("warning", "post.prepare", f"Recovered interrupted PAR2 preparation for {original}; it will be prepared again", file_id)
+            return "requeued"
+        future: Future[Path] = entry["future"]
+        if not future.done():
+            return "waiting"
+        _payload_prefetches.pop(file_id, None)
+    try:
+        payload = future.result()
+    except Exception as exc:
+        db.requeue_file(file_id, "payload-prepare-failed")
+        db.log("warning", "post.prepare", f"Background PAR2 preparation failed for {original}: {exc}", file_id)
+        return "failed"
+    db.complete_queue_preparation(file_id)
+    db.log("debug", "post.prepare", f"Background PAR2 preparation completed for {original}", file_id)
+    with _payload_prefetch_lock:
+        _payload_prefetches[file_id] = {
+            "future": future,
+            "key": payload_preparation_key(original, int(original.stat().st_size), int(original.stat().st_mtime_ns), config),
+            "original": original,
+            "created_at": time.time(),
+        }
+    if not payload.exists():
+        db.requeue_file(file_id, "payload-prepare-failed")
+        return "failed"
+    return "ready"
+
+
 def schedule_payload_prefetches(db: Database, config: Config, current_file_id: int) -> int:
     if not payload_preparation_enabled(config):
         return 0
@@ -553,7 +585,9 @@ def post_next(db: Database, config: Config) -> Optional[int]:
     file_id = int(item["file_id"])
     original = Path(item["path"])
     if str(item["status"] or "") == "preparing_par2":
-        db.log("debug", "post.prepare", f"Waiting for PAR2 preparation before posting: {original}", file_id)
+        state = reconcile_payload_preparation(db, file_id, original, config)
+        if state == "waiting":
+            db.log("debug", "post.prepare", f"Waiting for PAR2 preparation before posting: {original}", file_id)
         return None
     hourly_limit = int(getattr(config, "hourly_post_limit_bytes", 0) or 0)
     if hourly_limit > 0:
