@@ -612,6 +612,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
                 payload = prefetched_payload
                 db.log("debug", "post.prepare", f"Using prefetched payload for posting: {original}", file_id)
         payload_size = int(payload.stat().st_size)
+        db.set_queue_payload_size(file_id, payload_size)
         db.set_queue_status(file_id, "posting")
         db.update_file_state(file_id, "posting")
         prefetched = schedule_payload_prefetches(db, config, file_id)

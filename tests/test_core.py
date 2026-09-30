@@ -209,7 +209,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.120")
+        self.assertEqual(__version__, "0.2.121")
 
     def test_sqlite_lock_detection_is_narrow(self):
         self.assertTrue(is_sqlite_lock_error(sqlite3.OperationalError("database is locked")))
@@ -424,6 +424,7 @@ class CoreTests(unittest.TestCase):
         self.assertIn("progress_chunks", columns)
         self.assertIn("progress_bytes", columns)
         self.assertIn("prepare_progress_percent", columns)
+        self.assertIn("payload_size", columns)
 
     def test_chunk_schema_tracks_article_size_for_resume(self):
         with self.db.connect() as conn:
@@ -1757,6 +1758,44 @@ class CoreTests(unittest.TestCase):
         row = self.db.list_queue()[0]
         self.assertEqual(row["posted_chunks"], 1)
         self.assertEqual(row["posted_bytes"], 8)
+
+    def test_change_token_tracks_queue_progress_revision(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        before = self.db.change_token()["queue_progress_revision"]
+        self.db.set_queue_status(file_id, "posting")
+        self.db.set_queue_payload_size(file_id, 64)
+        self.db.set_queue_progress(file_id, 1, 8)
+        after = self.db.change_token()["queue_progress_revision"]
+        self.assertGreater(after, before)
+
+    def test_queue_payload_uses_prepared_payload_size_for_active_posting_progress(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.config.article_size = 8
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        with self.db.connect() as conn:
+            file_id = conn.execute("SELECT id FROM files").fetchone()["id"]
+        self.db.set_queue_status(file_id, "posting")
+        self.db.set_queue_payload_size(file_id, 32)
+        self.db.set_queue_progress(file_id, 1, 8)
+        row = self.db.list_queue()[0]
+        handler = object.__new__(Handler)
+        handler.config = self.config
+        payload = handler.queue_row_payload(row)
+        self.assertEqual(payload["expected_chunks"], 4)
+        self.assertEqual(payload["progress"], "1/4 chunks (25%)")
 
     def test_queue_pause_patterns_keep_matching_files_out_of_auto_queue(self):
         media = self.root / "media"

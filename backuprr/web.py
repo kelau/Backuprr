@@ -1163,7 +1163,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def queue_row_payload(self, row: Any) -> dict:
         payload = dict(row)
-        expected = max(1, (int(payload["size"]) + self.config.article_size - 1) // self.config.article_size)
+        payload_size = int(payload.get("payload_size") or 0)
+        size_for_progress = payload_size if payload_size > 0 and payload.get("status") == "posting" else int(payload["size"])
+        expected = max(1, (size_for_progress + self.config.article_size - 1) // self.config.article_size)
         posted = int(payload.get("posted_chunks") or 0)
         payload["expected_chunks"] = expected
         payload["chunk_count"] = posted
@@ -1630,6 +1632,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.121":["Queue progress now refreshes while workers run and posting progress uses prepared payload size for PAR2/compressed files."],
  "0.2.120":["SQLite operations now retry brief database-lock failures so worker state, catalog, and posting updates do not fail during short write contention."],
  "0.2.119":["Posting now coalesces live progress writes and uses a longer SQLite busy window so catalog scans can coexist with large uploads."],
  "0.2.118":["Preparing PAR2 queue rows now show live creation progress, and posting waits for the first preparing row instead of skipping ahead."],
@@ -2208,7 +2211,7 @@ async function refreshCurrentLivePage(){
 }
 async function refreshPageForChanges(previous, token){
  const filesChanged = previous.files_updated !== token.files_updated || previous.files_total !== token.files_total;
- const queueChanged = previous.queue_updated !== token.queue_updated || previous.queue_total !== token.queue_total;
+ const queueChanged = previous.queue_updated !== token.queue_updated || previous.queue_total !== token.queue_total || previous.queue_progress_revision !== token.queue_progress_revision;
  const eventsChanged = previous.event_id !== token.event_id;
  const transferChanged = previous.transfer_id !== token.transfer_id;
  const chunksChanged = previous.chunks_total !== token.chunks_total;
@@ -2222,7 +2225,7 @@ async function refreshPageForChanges(previous, token){
  if(page==="Files" && filesChanged) await updateFilesPage();
  else if(page==="Files" && (queueChanged || transferChanged || operationsChanged)) await updateVisibleFileRows();
  if(page==="Log" && eventsChanged) await updateLogPage({incremental:true});
- if(page==="Queue" && (queueChanged || filesChanged || transferChanged)) await updateQueuePage();
+ if(page==="Queue" && (queueChanged || filesChanged || transferChanged || previous.running_task_tick !== token.running_task_tick)) await updateQueuePage();
  if(page==="Tasks" && (eventsChanged || tasksChanged)) await updateTasksPage();
  if(page==="Verification" && (chunksChanged || filesChanged || tasksChanged || operationsChanged)) await updateVerificationPage({invalidate:chunksChanged || filesChanged});
  if(page==="Statistics" && (filesChanged || queueChanged || chunksChanged || tasksChanged || eventsChanged || transferChanged)) await updateStatisticsPage();

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 STALE_POSTING_SECONDS = 15 * 60
 SQLITE_TIMEOUT_SECONDS = 120
 SQLITE_BUSY_TIMEOUT_MS = SQLITE_TIMEOUT_SECONDS * 1000
@@ -103,6 +103,8 @@ class Database:
             conn.execute("ALTER TABLE queue ADD COLUMN progress_bytes INTEGER NOT NULL DEFAULT 0")
         if "prepare_progress_percent" not in queue_columns:
             conn.execute("ALTER TABLE queue ADD COLUMN prepare_progress_percent INTEGER NOT NULL DEFAULT 0")
+        if "payload_size" not in queue_columns:
+            conn.execute("ALTER TABLE queue ADD COLUMN payload_size INTEGER NOT NULL DEFAULT 0")
         chunk_columns = {row["name"] for row in conn.execute("PRAGMA table_info(chunks)").fetchall()}
         if "article_size" not in chunk_columns:
             conn.execute("ALTER TABLE chunks ADD COLUMN article_size INTEGER")
@@ -575,7 +577,7 @@ class Database:
                 VALUES(?,?,?,?,?,?,?)
                 ON CONFLICT(file_id) DO UPDATE SET
                   priority=excluded.priority, status='queued', reason=excluded.reason,
-                  progress_chunks=0, progress_bytes=0, prepare_progress_percent=0, updated_at=excluded.updated_at
+                  progress_chunks=0, progress_bytes=0, prepare_progress_percent=0, payload_size=0, updated_at=excluded.updated_at
                 """,
                 (file_id, priority, row["next_pos"], "queued", reason, now, now),
             )
@@ -646,6 +648,7 @@ class Database:
             return conn.execute(
                 f"""
                 SELECT q.*, f.path, f.relative_path, f.size, f.state,
+                       q.payload_size AS payload_size,
                        CASE WHEN q.status='posting' THEN q.progress_chunks ELSE COUNT(c.id) + COALESCE(cm.chunk_count, 0) END AS posted_chunks,
                        CASE WHEN q.status='posting' THEN q.progress_bytes ELSE COALESCE(SUM(c.size), 0) + COALESCE(cm.bytes_total, 0) END AS posted_bytes
                 FROM queue q
@@ -834,6 +837,13 @@ class Database:
             conn.execute(
                 "UPDATE queue SET progress_chunks=?, progress_bytes=?, updated_at=? WHERE file_id=?",
                 (max(0, int(chunks)), max(0, int(bytes_posted)), utcnow(), file_id),
+            )
+
+    def set_queue_payload_size(self, file_id: int, payload_size: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE queue SET payload_size=?, updated_at=? WHERE file_id=?",
+                (max(0, int(payload_size)), utcnow(), file_id),
             )
 
     def record_transfer_sample(self, direction: str, size: int) -> None:
@@ -2034,6 +2044,7 @@ class Database:
                   (SELECT COALESCE(MAX(updated_at), '') FROM queue) AS queue_updated,
                   (SELECT COALESCE(MAX(id), 0) FROM events WHERE event_type != 'web.access') AS event_id,
                   (SELECT COALESCE(MAX(id), 0) FROM transfer_samples) AS transfer_id,
+                  (SELECT COALESCE(SUM(progress_chunks + progress_bytes + prepare_progress_percent + payload_size), 0) FROM queue) AS queue_progress_revision,
                   ((SELECT COUNT(*) FROM chunks) + (SELECT COALESCE(SUM(chunk_count), 0) FROM chunk_manifests)) AS chunks_total,
                   (SELECT COUNT(*) FROM files WHERE state != 'deleted') AS files_total,
                   (SELECT COUNT(*) FROM queue) AS queue_total
@@ -2175,6 +2186,7 @@ CREATE TABLE IF NOT EXISTS queue (
   progress_chunks INTEGER NOT NULL DEFAULT 0,
   progress_bytes INTEGER NOT NULL DEFAULT 0,
   prepare_progress_percent INTEGER NOT NULL DEFAULT 0,
+  payload_size INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
