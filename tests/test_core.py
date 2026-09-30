@@ -7,6 +7,7 @@ import email.message
 import hashlib
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
@@ -205,7 +206,7 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.116")
+        self.assertEqual(__version__, "0.2.117")
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
@@ -1396,13 +1397,24 @@ class CoreTests(unittest.TestCase):
                 """
             ).fetchall()
 
+        started = threading.Event()
+        release = threading.Event()
+
         def fake_run(args, **kwargs):
+            started.set()
+            release.wait(5)
             payload = Path(args[-1])
             Path(kwargs["cwd"], f"{payload.name}.par2").write_bytes(b"par2")
             return subprocess.CompletedProcess(args, 0, stdout="ok", stderr="")
 
         with patch("backuprr.backup.shutil.which", return_value="fake-par2"), patch("backuprr.backup.subprocess.run", side_effect=fake_run):
             self.assertEqual(schedule_payload_prefetches(self.db, self.config, int(rows[0]["file_id"])), 1)
+            self.assertTrue(started.wait(5))
+            with self.db.connect() as conn:
+                status_row = conn.execute("SELECT status FROM queue WHERE file_id=?", (rows[1]["file_id"],)).fetchone()
+            self.assertEqual(status_row["status"], "preparing_par2")
+            self.assertEqual(self.db.stats()["queue_queued"], 2)
+            release.set()
             payload = None
             deadline = time.time() + 5
             while time.time() < deadline and payload is None:
@@ -1423,6 +1435,28 @@ class CoreTests(unittest.TestCase):
         finally:
             if payload is not None:
                 cleanup_payload(Path(payload), Path(rows[1]["path"]))
+
+    def test_post_next_marks_current_file_preparing_par2_before_upload(self):
+        media = self.root / "media"
+        media.mkdir()
+        path = media / "movie.mkv"
+        path.write_bytes(b"0123456789abcdef")
+        self.db.add_endpoint(str(media))
+        scan_all(self.db)
+        enqueue_unbacked(self.db)
+        self.config.par2 = {"enabled": True, "command": "fake-par2", "redundancy_percent": 10}
+        seen_status = []
+
+        def fake_prepare(payload_path, config):
+            with self.db.connect() as conn:
+                row = conn.execute("SELECT status FROM queue").fetchone()
+            seen_status.append(row["status"])
+            return payload_path
+
+        with patch("backuprr.backup.prepare_payload", side_effect=fake_prepare):
+            with patch("backuprr.backup.UsenetClient", FakePostClient):
+                self.assertIsNotNone(post_next(self.db, self.config))
+        self.assertEqual(seen_status, ["preparing_par2"])
 
     def test_par2_create_args_support_multipar_par2j(self):
         payload = self.root / "payload.iso"

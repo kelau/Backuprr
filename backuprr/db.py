@@ -771,6 +771,13 @@ class Database:
         with self.connect() as conn:
             conn.execute("UPDATE queue SET status=?, updated_at=? WHERE file_id=?", (status, utcnow(), file_id))
 
+    def complete_queue_preparation(self, file_id: int, reason: str = "prepared-payload") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE queue SET status='queued', reason=?, updated_at=? WHERE file_id=? AND status='preparing_par2'",
+                (reason, utcnow(), file_id),
+            )
+
     def requeue_file(self, file_id: int, reason: str) -> None:
         now = utcnow()
         with self.connect() as conn:
@@ -2038,6 +2045,7 @@ class Database:
             return {
                 **{f"files_{row['state']}": row["count"] for row in states},
                 **{f"queue_{row['status']}": row["count"] for row in queue},
+                "queue_queued": conn.execute("SELECT COUNT(*) FROM queue WHERE status IN ('queued','preparing_par2')").fetchone()[0],
                 "files_total": conn.execute("SELECT COUNT(*) FROM files WHERE state != 'deleted'").fetchone()[0],
                 "files_all_total": conn.execute("SELECT COUNT(*) FROM files").fetchone()[0],
                 "files_bytes_total": conn.execute("SELECT COALESCE(SUM(size), 0) FROM files WHERE state != 'deleted'").fetchone()[0],

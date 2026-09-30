@@ -71,6 +71,8 @@ def queue_reason_detail(reason: str, status: str = "") -> str:
         "file-changing": "The file is still changing or locked; Backuprr will retry after the stability window.",
         "hourly-limit": "The hourly posting limit paused this file; it will continue when budget is available.",
         "startup-posting-retry": "Posting was interrupted by restart; existing chunks will be reused where safe.",
+        "prepared-payload": "PAR2 recovery data has already been prepared; posting can start immediately.",
+        "payload-prepare-failed": "Background PAR2 preparation failed; Backuprr will prepare again when this file is selected.",
         "manual": "Manually queued by the user.",
     }
     if status == "failed":
@@ -1622,6 +1624,7 @@ const defaultTableSorts = {
 };
 let tableSorts = loadTableSorts();
 const releaseNotes = {
+ "0.2.117":["Queue rows now show a Preparing PAR2 status while current or prefetched PAR2 payloads are being created."],
  "0.2.116":["Posting now stays queued while large payloads are prepared, and PAR2 payloads for the next queued files are prepared in the background during uploads."],
  "0.2.115":["Large queue-exclude pruning now writes one summary event instead of thousands, and PAR2 recovery-file detection handles filenames with brackets."],
  "0.2.114":["Queue entries that match newly added auto-queue exclude patterns are now pruned immediately instead of staying pending."],
@@ -1913,10 +1916,10 @@ function navigatePage(name){
  render();
 }
 function stateIcon(value){
- return ({backed_up:"&#10003;",queued:"&#9203;",posting:"&#9658;",downloading:"&#11015;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",unreadable:"&#128274;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;",unverified:"&#128269;",no_chunks:"&#128230;"}[String(value || "")] || "&#8226;");
+ return ({backed_up:"&#10003;",queued:"&#9203;",preparing_par2:"&#128737;",posting:"&#9658;",downloading:"&#11015;",failed:"&#9888;",deleted:"&#128465;",discovered:"&#128269;",changed:"&#9998;",missing_chunks:"&#9888;",unreadable:"&#128274;",restored:"&#8635;",done:"&#10003;",running:"&#9658;",scheduled:"&#9202;",verified:"&#10003;",missing:"&#9888;",unverified:"&#128269;",no_chunks:"&#128230;"}[String(value || "")] || "&#8226;");
 }
 function stateTone(value){
- return ({backed_up:"ok",done:"ok",restored:"ok",verified:"ok",queued:"warn",posting:"warn",running:"warn",verifying:"warn",restoring:"warn",downloading:"warn",unverified:"warn",no_chunks:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad",missing:"bad",unreadable:"bad"}[String(value || "")] || "");
+ return ({backed_up:"ok",done:"ok",restored:"ok",verified:"ok",queued:"warn",preparing_par2:"warn",posting:"warn",running:"warn",verifying:"warn",restoring:"warn",downloading:"warn",unverified:"warn",no_chunks:"warn",failed:"bad",deleted:"bad",missing_chunks:"bad",missing:"bad",unreadable:"bad"}[String(value || "")] || "");
 }
 function statePill(value){
  const tone = stateTone(value);

@@ -331,6 +331,10 @@ def payload_preparation_enabled(config: Config) -> bool:
     return bool((config.par2 or {}).get("enabled"))
 
 
+def preparation_status(config: Config) -> str:
+    return "preparing_par2" if payload_preparation_enabled(config) else "queued"
+
+
 def payload_preparation_key(path: Path, size: int, mtime_ns: int, config: Config) -> tuple[Any, ...]:
     par2 = dict(config.par2 or {})
     return (
@@ -436,6 +440,13 @@ def schedule_payload_prefetches(db: Database, config: Config, current_file_id: i
             config_snapshot = copy.deepcopy(config)
             future = executor.submit(prepare_payload, original, config_snapshot)
             _payload_prefetches[file_id] = {"future": future, "key": key, "original": original, "created_at": time.time()}
+            db.set_queue_status(file_id, preparation_status(config))
+            future.add_done_callback(
+                lambda done, queued_file_id=file_id: db.complete_queue_preparation(
+                    queued_file_id,
+                    "payload-prepare-failed" if done.exception() is not None else "prepared-payload",
+                )
+            )
             scheduled += 1
     return scheduled
 
@@ -553,6 +564,7 @@ def post_next(db: Database, config: Config) -> Optional[int]:
         else:
             prefetched_payload = take_prefetched_payload(file_id, original, int(item["size"]), int(item["mtime_ns"]), config)
             if prefetched_payload is None:
+                db.set_queue_status(file_id, preparation_status(config))
                 db.log("debug", "post.prepare", f"Preparing payload before posting: {original}", file_id)
                 payload = prepare_payload(original, config)
             else:
