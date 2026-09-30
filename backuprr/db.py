@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import gzip
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +12,8 @@ SCHEMA_VERSION = 11
 STALE_POSTING_SECONDS = 15 * 60
 SQLITE_TIMEOUT_SECONDS = 120
 SQLITE_BUSY_TIMEOUT_MS = SQLITE_TIMEOUT_SECONDS * 1000
+SQLITE_LOCK_RETRY_INTERVAL_SECONDS = 0.25
+SQLITE_LOCK_RETRY_ATTEMPTS = 8
 
 
 def utcnow() -> str:
@@ -19,6 +22,34 @@ def utcnow() -> str:
 
 def normalize_folder_path(folder: str) -> str:
     return str(folder or "").replace("\\", "/").strip("/")
+
+
+def is_sqlite_lock_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc).lower()
+
+
+class RetryingConnection(sqlite3.Connection):
+    def _retry_locked(self, operation: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        for attempt in range(SQLITE_LOCK_RETRY_ATTEMPTS + 1):
+            try:
+                return operation(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if not is_sqlite_lock_error(exc) or attempt >= SQLITE_LOCK_RETRY_ATTEMPTS:
+                    raise
+                time.sleep(SQLITE_LOCK_RETRY_INTERVAL_SECONDS * (attempt + 1))
+        raise RuntimeError("unreachable SQLite retry state")
+
+    def execute(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        return self._retry_locked(super().execute, *args, **kwargs)
+
+    def executemany(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        return self._retry_locked(super().executemany, *args, **kwargs)
+
+    def executescript(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        return self._retry_locked(super().executescript, *args, **kwargs)
+
+    def commit(self) -> None:
+        self._retry_locked(super().commit)
 
 
 class Database:
@@ -37,7 +68,7 @@ class Database:
             conn.close()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.path, timeout=SQLITE_TIMEOUT_SECONDS)
+        conn = sqlite3.connect(self.path, timeout=SQLITE_TIMEOUT_SECONDS, factory=RetryingConnection)
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
         conn.execute("PRAGMA foreign_keys = ON")

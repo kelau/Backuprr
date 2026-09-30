@@ -6,6 +6,7 @@ import re
 import email.message
 import hashlib
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -41,7 +42,7 @@ from backuprr.cloud_backup import backup_config_and_database, backup_config_and_
 from backuprr.cli import sync_config_endpoints
 from backuprr.config import Config, LogDestination, UsenetHost, update_config
 from backuprr.crypto import xor_crypt
-from backuprr.db import Database
+from backuprr.db import Database, is_sqlite_lock_error
 from backuprr.log_forwarding import build_payload
 from backuprr.monitor import BackupMonitor, CatalogMonitor, VerificationMonitor, CloudBackupMonitor, format_duration
 from backuprr.operations import (
@@ -208,7 +209,11 @@ class CoreTests(unittest.TestCase):
         self.temp.cleanup()
 
     def test_version_is_incremented_for_changes(self):
-        self.assertEqual(__version__, "0.2.119")
+        self.assertEqual(__version__, "0.2.120")
+
+    def test_sqlite_lock_detection_is_narrow(self):
+        self.assertTrue(is_sqlite_lock_error(sqlite3.OperationalError("database is locked")))
+        self.assertFalse(is_sqlite_lock_error(sqlite3.OperationalError("no such table: files")))
 
     def test_config_load_creates_missing_default_config(self):
         config_path = self.root / "new" / "config.json"
